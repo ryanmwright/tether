@@ -582,9 +582,10 @@ enter toggle · a add forward · g gpg · d doctor · r reload · l log · ? hel
 | Key | Action |
 |---|---|
 | `↑`/`k`, `↓`/`j` | Move |
-| `enter`, `space` | Toggle: connect/disconnect a host, activate/deactivate a profile, remove an ad-hoc forward or mount |
+| `enter`, `space` | Toggle: connect/disconnect a host, activate/deactivate a profile, remove an ad-hoc forward or mount. The footer says which |
 | `u` | Bring the selection up now; on a failed host, retry without waiting |
-| `x` | Take the selection down |
+| `x` | Take the selection down; on an ad-hoc host that's already down, forget it |
+| `c` | Connect to a host that isn't in the config: `NAME [SSH-DEST]` |
 | `a` | Add an ad-hoc forward to the selected host (any spec, or `gpg-agent`/`gpg-ssh`) |
 | `m` | Add an ad-hoc mount on the selected host: `SRC DST`, one side `remote:PATH` |
 | `g` | Toggle ad-hoc gpg-agent forwarding to the selected host |
@@ -604,6 +605,8 @@ tether up NAME...                 connect hosts / activate profiles, wait for th
   --host | --profile              say which, if a host and profile share a name
   --no-wait, --timeout 45s
 tether down NAME...               deactivate profiles / disconnect hosts
+tether host add NAME [SSH-DEST]   connect to a host that isn't in the config (ad hoc)
+tether host rm NAME...            disconnect ad-hoc hosts and forget them
 tether fwd add HOST SPEC...       add ad-hoc forwards (connects the host if needed)
 tether fwd rm HOST SPEC...        remove ad-hoc forwards
 tether gpg on HOST [--ssh]        forward gpg-agent (and its SSH socket) ad hoc
@@ -663,7 +666,16 @@ States:
 
 `up` and `fwd add` exit non-zero unless everything they asked for is `up`.
 Ad-hoc forwards last until you remove them, take their host down, or stop the
-daemon. For permanent ones, use a profile. Besides specs, `fwd add` accepts the
+daemon. For permanent ones, use a profile.
+
+**Ad-hoc hosts** work the same way for hosts that aren't in the config:
+`tether host add devbox2` connects to the ssh alias `devbox2`, and
+`tether host add scratch me@10.0.0.5` names a destination. You can then add
+forwards, mounts and gpg to them, and run `doctor`. `tether down` disconnects
+an ad-hoc host but keeps it listed; `tether host rm` forgets it along with its
+forwards and mounts. They don't survive a daemon restart; add them to the
+config to keep them. If the config later defines the same name, the config's
+entry wins. Besides specs, `fwd add` accepts the
 names `gpg-agent` and `gpg-ssh`, which is what `tether gpg on` uses.
 
 `tether status -w --json` prints one JSON object per change, which works

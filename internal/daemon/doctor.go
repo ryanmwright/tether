@@ -40,7 +40,7 @@ func (d *Daemon) handleDoctor(ctx context.Context, params json.RawMessage) (any,
 		return nil, err
 	}
 	d.mu.Lock()
-	host, ok := d.cfg.Hosts[p.Host]
+	host, ok := d.host(p.Host)
 	var s *session
 	dr := &doctor{host: p.Host, dest: host.SSH}
 	if ok {

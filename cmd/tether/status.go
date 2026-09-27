@@ -97,7 +97,11 @@ func printStatus(out io.Writer, st *api.Status) {
 		if h.RetryAt != nil {
 			detail += fmt.Sprintf(" (retry in %s)", untilRounded(*h.RetryAt))
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", h.Name, h.SSH, yesNo(h.Autoconnect), h.State, detail)
+		ssh := h.SSH
+		if h.AdHoc {
+			ssh += " (ad-hoc)"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", h.Name, ssh, yesNo(h.Autoconnect), h.State, detail)
 		forwards = forwards || len(h.Forwards) > 0
 	}
 

@@ -77,37 +77,43 @@ func newUpCmd(g *globalFlags) *cobra.Command {
 				return nil
 			}
 
-			wctx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			gen := results[len(results)-1].Generation
-			st, err := waitUntil(wctx, next, gen, func(st api.Status) bool {
-				for _, r := range results {
-					if !settled(targetState(st, r)) {
-						return false
-					}
-				}
-				return true
-			})
-			if errors.Is(err, context.DeadlineExceeded) {
-				return fmt.Errorf("still not up after %s; check `tether status`", timeout)
-			}
-			if err != nil {
-				return err
-			}
-			healthy := true
-			for _, r := range results {
-				healthy = printTarget(cmd.OutOrStdout(), st, r) && healthy
-			}
-			if !healthy {
-				return errNotHealthy
-			}
-			return nil
+			return waitTargets(cmd, next, results, timeout)
 		},
 	}
 	tf.register(cmd)
 	cmd.Flags().BoolVar(&noWait, "no-wait", false, "return without waiting for the result")
 	cmd.Flags().DurationVar(&timeout, "timeout", 45*time.Second, "how long to wait")
 	return cmd
+}
+
+// waitTargets waits until each target is up or has failed its first
+// attempt, and reports how each ended.
+func waitTargets(cmd *cobra.Command, next nextFunc, results []api.TargetResult, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
+	defer cancel()
+	gen := results[len(results)-1].Generation
+	st, err := waitUntil(ctx, next, gen, func(st api.Status) bool {
+		for _, r := range results {
+			if !settled(targetState(st, r)) {
+				return false
+			}
+		}
+		return true
+	})
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("still not up after %s; check `tether status`", timeout)
+	}
+	if err != nil {
+		return err
+	}
+	healthy := true
+	for _, r := range results {
+		healthy = printTarget(cmd.OutOrStdout(), st, r) && healthy
+	}
+	if !healthy {
+		return errNotHealthy
+	}
+	return nil
 }
 
 func newDownCmd(g *globalFlags) *cobra.Command {

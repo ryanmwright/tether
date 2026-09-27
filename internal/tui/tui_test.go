@@ -64,6 +64,7 @@ var sampleStatus = api.Status{
 			{Key: "/home/me/proj -> remote:~/proj", Direction: "local-to-remote", Remote: "~/proj", Local: "/home/me/proj", Profiles: []string{"work"}, State: api.StateError, Error: "sshfs not found on the remote"},
 		}},
 		{Name: "lab", SSH: "lab", State: api.StateDown, Forwards: []api.ForwardStatus{}},
+		{Name: "scratch", SSH: "me@10.0.0.5", AdHoc: true, State: api.StateDown},
 	},
 	Profiles: []api.ProfileStatus{
 		{Name: "work", Host: "dev", Active: true, State: api.StateUp},
@@ -191,6 +192,8 @@ func TestActions(t *testing.T) {
 		{"dev", "g", call{api.MethodForwardRemove, api.ForwardParams{Host: "dev", Spec: "gpg-agent"}}},
 		{"lab", "g", call{api.MethodForwardAdd, api.ForwardParams{Host: "lab", Spec: "gpg-agent"}}},
 		{"lab", "r", call{api.MethodReload, nil}},
+		{"scratch", "x", call{api.MethodHostRemove, api.HostParams{Name: "scratch"}}},
+		{"lab", "x", call{api.MethodDown, api.TargetParams{Name: "lab", Kind: api.TargetHost}}},
 		{"remote:~/src -> /home/me/mnt/src", "x", call{api.MethodMountRemove, api.MountParams{Host: "dev", Direction: "remote-to-local", Remote: "~/src", Local: "/home/me/mnt/src"}}},
 	}
 	for _, tt := range tests {
@@ -352,5 +355,47 @@ func TestMounts(t *testing.T) {
 	m = press(t, m, "enter")
 	if !m.flashErr || !strings.Contains(m.flash, "remote:") {
 		t.Errorf("bad mount input: flash %q", m.flash)
+	}
+}
+
+func TestConnectPrompt(t *testing.T) {
+	m, fc := newModel(t)
+	m = press(t, m, "c")
+	if !strings.Contains(screen(m), "connect to a host that isn't in the config") {
+		t.Fatalf("connect prompt not shown:\n%s", screen(m))
+	}
+	for _, r := range "box me@10.0.0.9" {
+		m = press(t, m, string(r))
+	}
+	m = press(t, m, "enter")
+	want := call{api.MethodHostAdd, api.HostParams{Name: "box", SSH: "me@10.0.0.9"}}
+	if got := fc.last(); !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+
+	// Works with nothing configured, too.
+	empty := New(fc, nil)
+	empty = update(t, empty, statusMsg(api.Status{Version: "test"}))
+	if !strings.Contains(screen(empty), "press c to connect") {
+		t.Errorf("empty screen:\n%s", screen(empty))
+	}
+	if empty = press(t, empty, "c"); empty.mode != modeInput {
+		t.Error("c doesn't open the prompt when there are no hosts")
+	}
+}
+
+func TestEnterHint(t *testing.T) {
+	m, _ := newModel(t)
+	for row, want := range map[string]string{
+		"dev": "enter disconnect", "lab": "enter connect", "work": "enter deactivate",
+		"old": "enter activate", "D:1080": "enter remove", "L:5432:db:5432": "enter —",
+		"remote:~/src -> /home/me/mnt/src": "enter unmount",
+	} {
+		if s := screen(moveTo(t, m, row)); !strings.Contains(s, want+" ·") {
+			t.Errorf("%s: footer lacks %q", row, want)
+		}
+	}
+	if !strings.Contains(screen(moveTo(t, m, "scratch")), "ad-hoc") {
+		t.Error("ad-hoc host not marked")
 	}
 }

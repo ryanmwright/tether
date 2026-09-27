@@ -145,21 +145,29 @@ func Parse(data []byte) (*Config, error) {
 
 var namePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
+// ValidateHost checks one host's name and ssh destination.
+func ValidateHost(name string, h Host) error {
+	var errs []error
+	if !namePattern.MatchString(name) {
+		errs = append(errs, fmt.Errorf("hosts.%s: name must match %s", name, namePattern))
+	}
+	// The destination is passed to ssh as an argument, so it must not be
+	// mistaken for an option.
+	if h.SSH == "" || strings.HasPrefix(h.SSH, "-") || strings.ContainsFunc(h.SSH, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}) {
+		errs = append(errs, fmt.Errorf("hosts.%s.ssh: invalid destination %q", name, h.SSH))
+	}
+	return errors.Join(errs...)
+}
+
 // Validate reports every problem found, not just the first.
 func (c *Config) Validate() error {
 	home, _ := os.UserHomeDir()
 	var errs []error
 	for _, name := range slices.Sorted(maps.Keys(c.Hosts)) {
-		h := c.Hosts[name]
-		if !namePattern.MatchString(name) {
-			errs = append(errs, fmt.Errorf("hosts.%s: name must match %s", name, namePattern))
-		}
-		// The destination is passed to ssh as an argument, so it must not be
-		// mistaken for an option.
-		if strings.HasPrefix(h.SSH, "-") || strings.ContainsFunc(h.SSH, func(r rune) bool {
-			return unicode.IsSpace(r) || unicode.IsControl(r)
-		}) {
-			errs = append(errs, fmt.Errorf("hosts.%s.ssh: invalid destination %q", name, h.SSH))
+		if err := ValidateHost(name, c.Hosts[name]); err != nil {
+			errs = append(errs, err)
 		}
 	}
 	for _, name := range slices.Sorted(maps.Keys(c.Profiles)) {

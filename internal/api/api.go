@@ -18,6 +18,8 @@ const (
 	MethodForwardRemove = "forward.remove"
 	MethodMountAdd      = "mount.add"
 	MethodMountRemove   = "mount.remove"
+	MethodHostAdd       = "host.add"
+	MethodHostRemove    = "host.remove"
 	MethodDoctor        = "host.doctor"
 	MethodLogs          = "daemon.logs"
 
@@ -33,7 +35,7 @@ const (
 // method or field that clients rely on is added or changed, so a client can
 // tell it's talking to an older daemon left running across an upgrade.
 // Daemons from before it existed report 0.
-const ProtocolVersion = 2
+const ProtocolVersion = 3
 
 // Application error codes (outside the range reserved by JSON-RPC).
 const (
@@ -70,6 +72,7 @@ type HostStatus struct {
 	Name        string          `json:"name"`
 	SSH         string          `json:"ssh"`
 	Autoconnect bool            `json:"autoconnect"`
+	AdHoc       bool            `json:"adhoc,omitempty"` // added with host.add, not in the config
 	State       State           `json:"state"`
 	Error       string          `json:"error,omitempty"`
 	RetryAt     *time.Time      `json:"retry_at,omitempty"` // next reconnect attempt
@@ -228,4 +231,11 @@ type MountResult struct {
 	Host       string `json:"host"`
 	Key        string `json:"key"`
 	Generation uint64 `json:"generation"`
+}
+
+// HostParams names an ad-hoc host for host.add (which also connects it) and
+// host.remove. SSH defaults to Name.
+type HostParams struct {
+	Name string `json:"name"`
+	SSH  string `json:"ssh,omitempty"`
 }

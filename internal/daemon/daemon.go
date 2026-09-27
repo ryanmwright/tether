@@ -49,16 +49,17 @@ type Daemon struct {
 	ctx     context.Context // lifetime of sessions
 	wg      sync.WaitGroup
 
-	mu       sync.Mutex
-	cfg      *config.Config
-	cfgErr   error                             // last reload failure; cfg keeps the last good config
-	active   map[string]bool                   // active profiles
-	upHosts  map[string]bool                   // hosts brought up directly
-	adhoc    map[string]map[string]wantForward // host -> forward key -> forward
-	adhocMnt map[string]map[string]wantMount   // host -> mount key -> mount
-	home     string                            // for ~ in local mount paths
-	autoSeen map[string]bool                   // "host/x", "profile/x" -> autoconnect as last applied
-	sessions map[string]*sessionHandle
+	mu         sync.Mutex
+	cfg        *config.Config
+	cfgErr     error                             // last reload failure; cfg keeps the last good config
+	active     map[string]bool                   // active profiles
+	upHosts    map[string]bool                   // hosts brought up directly
+	adhoc      map[string]map[string]wantForward // host -> forward key -> forward
+	adhocMnt   map[string]map[string]wantMount   // host -> mount key -> mount
+	adhocHosts map[string]config.Host            // hosts added at runtime, not in the config
+	home       string                            // for ~ in local mount paths
+	autoSeen   map[string]bool                   // "host/x", "profile/x" -> autoconnect as last applied
+	sessions   map[string]*sessionHandle
 
 	gen    atomic.Uint64 // see api.Status.Generation
 	logs   *logRing
@@ -82,17 +83,18 @@ func Run(ctx context.Context, opts Options) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	d := &Daemon{
-		opts:     opts,
-		started:  time.Now(),
-		ctx:      ctx,
-		cfg:      config.Default(),
-		active:   map[string]bool{},
-		upHosts:  map[string]bool{},
-		adhoc:    map[string]map[string]wantForward{},
-		adhocMnt: map[string]map[string]wantMount{},
-		autoSeen: map[string]bool{},
-		sessions: map[string]*sessionHandle{},
-		subs:     map[*subscriber]struct{}{},
+		opts:       opts,
+		started:    time.Now(),
+		ctx:        ctx,
+		cfg:        config.Default(),
+		active:     map[string]bool{},
+		upHosts:    map[string]bool{},
+		adhoc:      map[string]map[string]wantForward{},
+		adhocMnt:   map[string]map[string]wantMount{},
+		adhocHosts: map[string]config.Host{},
+		autoSeen:   map[string]bool{},
+		sessions:   map[string]*sessionHandle{},
+		subs:       map[*subscriber]struct{}{},
 	}
 	d.home, _ = os.UserHomeDir()
 	d.logs = &logRing{publish: d.publishLog}
@@ -139,6 +141,8 @@ func Run(ctx context.Context, opts Options) error {
 	srv.Handle(api.MethodSubscribe, d.handleSubscribe)
 	srv.Handle(api.MethodDoctor, d.handleDoctor)
 	srv.Handle(api.MethodMountAdd, d.handleMountAdd)
+	srv.Handle(api.MethodHostAdd, d.handleHostAdd)
+	srv.Handle(api.MethodHostRemove, d.handleHostRemove)
 	srv.Handle(api.MethodMountRemove, d.handleMountRemove)
 	srv.Handle(api.MethodLogs, func(_ context.Context, params json.RawMessage) (any, error) {
 		p, err := decode[api.LogsParams](orEmpty(params))
@@ -230,8 +234,11 @@ func (d *Daemon) reload() error {
 // Callers hold d.mu.
 func (d *Daemon) applyConfig(cfg *config.Config) {
 	d.cfg = cfg
+	for name := range cfg.Hosts {
+		delete(d.adhocHosts, name) // the config now defines it
+	}
 	for name, h := range d.sessions {
-		if _, ok := cfg.Hosts[name]; !ok {
+		if _, ok := d.host(name); !ok {
 			h.cancel()
 			<-h.done
 			delete(d.sessions, name)
@@ -263,12 +270,32 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	}
 	d.autoSeen = seen
 
-	for name := range cfg.Hosts {
+	for _, name := range d.hostNames() {
 		if _, ok := d.sessions[name]; !ok {
 			d.startSession(name)
 		}
 	}
 	d.recompute()
+}
+
+// host looks up a host in the config or among ad-hoc hosts. Callers hold
+// d.mu.
+func (d *Daemon) host(name string) (config.Host, bool) {
+	if h, ok := d.cfg.Hosts[name]; ok {
+		return h, true
+	}
+	h, ok := d.adhocHosts[name]
+	return h, ok
+}
+
+// hostNames lists configured and ad-hoc hosts, sorted. Callers hold d.mu.
+func (d *Daemon) hostNames() []string {
+	names := slices.Collect(maps.Keys(d.cfg.Hosts))
+	for name := range d.adhocHosts {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
 }
 
 func (d *Daemon) startSession(name string) {
@@ -287,7 +314,7 @@ func (d *Daemon) startSession(name string) {
 // Callers hold d.mu.
 func (d *Daemon) recompute() {
 	for name, h := range d.sessions {
-		host := d.cfg.Hosts[name]
+		host, _ := d.host(name)
 		w := want{backoff: d.cfg.Defaults.ReconnectBackoff, forwards: map[string]wantForward{}, mounts: map[string]wantMount{}}
 		wanted := d.upHosts[name]
 		for _, pname := range slices.Sorted(maps.Keys(d.active)) {
@@ -378,7 +405,7 @@ func profileMounts(p config.Profile, home string) map[string]wantMount {
 // resolve finds the host or profile a request names. Callers hold d.mu.
 func (d *Daemon) resolve(p api.TargetParams) (api.TargetResult, error) {
 	prof, isProfile := d.cfg.Profiles[p.Name]
-	_, isHost := d.cfg.Hosts[p.Name]
+	_, isHost := d.host(p.Name)
 	kind := p.Kind
 	switch {
 	case kind == "" && isProfile && isHost:
@@ -394,7 +421,8 @@ func (d *Daemon) resolve(p api.TargetParams) (api.TargetResult, error) {
 	case kind == api.TargetHost && isHost:
 		return api.TargetResult{Name: p.Name, Kind: kind, Host: p.Name}, nil
 	case kind == "":
-		return api.TargetResult{}, rpc.Errorf(api.CodeNotFound, "no host or profile named %q", p.Name)
+		return api.TargetResult{}, rpc.Errorf(api.CodeNotFound,
+			"no host or profile named %q (to connect to a host that isn't in the config: tether host add %s [SSH-DEST])", p.Name, p.Name)
 	default:
 		return api.TargetResult{}, rpc.Errorf(api.CodeNotFound, "no %s named %q", kind, p.Name)
 	}
@@ -465,7 +493,7 @@ func (d *Daemon) forwardParams(params json.RawMessage) (p api.ForwardParams, key
 	if p, err = decode[api.ForwardParams](params); err != nil {
 		return
 	}
-	if _, ok := d.cfg.Hosts[p.Host]; !ok {
+	if _, ok := d.host(p.Host); !ok {
 		err = rpc.Errorf(api.CodeNotFound, "no host named %q", p.Host)
 		return
 	}
@@ -514,7 +542,7 @@ func (d *Daemon) mountParams(params json.RawMessage) (api.MountParams, mount.Spe
 	if err != nil {
 		return p, mount.Spec{}, err
 	}
-	if _, ok := d.cfg.Hosts[p.Host]; !ok {
+	if _, ok := d.host(p.Host); !ok {
 		return p, mount.Spec{}, rpc.Errorf(api.CodeNotFound, "no host named %q", p.Host)
 	}
 	spec, err := mount.Normalize(mount.Spec{Direction: mount.Direction(p.Direction), Remote: p.Remote, Local: p.Local, Options: p.Options}, d.home)
@@ -556,6 +584,66 @@ func (d *Daemon) handleMountRemove(_ context.Context, params json.RawMessage) (a
 	d.recompute()
 	d.log.Info("ad-hoc mount removed", "host", p.Host, "mount", spec.Key())
 	return api.MountResult{Host: p.Host, Key: spec.Key(), Generation: d.gen.Load()}, nil
+}
+
+func (d *Daemon) handleHostAdd(_ context.Context, params json.RawMessage) (any, error) {
+	p, err := decode[api.HostParams](params)
+	if err != nil {
+		return nil, err
+	}
+	if p.SSH == "" {
+		p.SSH = p.Name
+	}
+	if err := config.ValidateHost(p.Name, config.Host{SSH: p.SSH}); err != nil {
+		return nil, rpc.Errorf(rpc.CodeInvalidParams, "%v", err)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, ok := d.cfg.Hosts[p.Name]; ok {
+		return nil, rpc.Errorf(api.CodeInvalidConfig, "%q is already in the config; use `tether up %s`", p.Name, p.Name)
+	}
+	if _, ok := d.cfg.Profiles[p.Name]; ok {
+		return nil, rpc.Errorf(api.CodeAmbiguous, "%q is a profile name; pick another name for the host", p.Name)
+	}
+	if h, ok := d.adhocHosts[p.Name]; ok && h.SSH != p.SSH {
+		return nil, rpc.Errorf(api.CodeInvalidConfig, "ad-hoc host %q already connects to %s", p.Name, h.SSH)
+	}
+	d.adhocHosts[p.Name] = config.Host{SSH: p.SSH}
+	if _, ok := d.sessions[p.Name]; !ok {
+		d.startSession(p.Name)
+	}
+	d.upHosts[p.Name] = true
+	d.recompute()
+	d.sessions[p.Name].s.retryNow()
+	d.log.Info("ad-hoc host added", "host", p.Name, "ssh", p.SSH)
+	return api.TargetResult{Name: p.Name, Kind: api.TargetHost, Host: p.Name, Generation: d.gen.Load()}, nil
+}
+
+func (d *Daemon) handleHostRemove(_ context.Context, params json.RawMessage) (any, error) {
+	p, err := decode[api.HostParams](params)
+	if err != nil {
+		return nil, err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, ok := d.adhocHosts[p.Name]; !ok {
+		if _, inConfig := d.cfg.Hosts[p.Name]; inConfig {
+			return nil, rpc.Errorf(api.CodeNotFound, "%q is in the config, not ad hoc; use `tether down %s`", p.Name, p.Name)
+		}
+		return nil, rpc.Errorf(api.CodeNotFound, "no ad-hoc host named %q", p.Name)
+	}
+	delete(d.adhocHosts, p.Name)
+	delete(d.upHosts, p.Name)
+	delete(d.adhoc, p.Name)
+	delete(d.adhocMnt, p.Name)
+	h := d.sessions[p.Name]
+	h.cancel() // disconnects, unmounting first
+	<-h.done
+	delete(d.sessions, p.Name)
+	d.recompute()
+	d.log.Info("ad-hoc host removed", "host", p.Name)
+	d.notify()
+	return api.TargetResult{Name: p.Name, Kind: api.TargetHost, Host: p.Name, Generation: d.gen.Load()}, nil
 }
 
 func (d *Daemon) handleReload(context.Context, json.RawMessage) (any, error) {
@@ -659,8 +747,10 @@ func (d *Daemon) status() api.Status {
 		st.ConfigError = d.cfgErr.Error()
 	}
 	hosts := map[string]api.HostStatus{}
-	for _, name := range slices.Sorted(maps.Keys(d.cfg.Hosts)) {
-		hs := d.sessions[name].s.status(d.cfg.Hosts[name])
+	for _, name := range d.hostNames() {
+		h, _ := d.host(name)
+		hs := d.sessions[name].s.status(h)
+		_, hs.AdHoc = d.adhocHosts[name]
 		hosts[name] = hs
 		st.Hosts = append(st.Hosts, hs)
 	}

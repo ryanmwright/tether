@@ -72,10 +72,10 @@ type Model struct {
 	width    int
 	height   int
 
-	mode       mode
-	input      textinput.Model
-	inputHost  string
-	inputMount bool // the prompt is for a mount rather than a forward
+	mode      mode
+	input     textinput.Model
+	inputHost string
+	inputKind inputKind
 
 	doctorHost    string
 	doctor        *api.DoctorResult
@@ -95,10 +95,20 @@ func New(c Client, logs []api.LogEntry) Model {
 	return Model{client: c, logs: logs, input: in, showLogs: true, width: 80, height: 24}
 }
 
+// inputKind is what the prompt is asking for.
+type inputKind int
+
 const (
-	forwardPlaceholder = "L:8080:localhost:80   R:0:localhost:3000   D:1080   gpg-agent"
-	mountPlaceholder   = "remote:~/src ~/mnt/src   or   ~/proj remote:~/proj"
+	inputForward inputKind = iota
+	inputMount
+	inputConnect
 )
+
+var prompts = map[inputKind]struct{ prompt, placeholder, title string }{
+	inputForward: {"forward> ", "L:8080:localhost:80   R:0:localhost:3000   D:1080   gpg-agent", "add a forward to %s"},
+	inputMount:   {"mount> ", "remote:~/src ~/mnt/src   or   ~/proj remote:~/proj", "add a mount on %s"},
+	inputConnect: {"connect> ", "NAME [SSH-DEST]   e.g. devbox2   or   scratch me@10.0.0.5", "connect to a host that isn't in the config"},
+}
 
 type (
 	statusMsg       api.Status
@@ -242,8 +252,11 @@ func (m Model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			if value == "" {
 				return m, nil
 			}
-			if m.inputMount {
+			switch m.inputKind {
+			case inputMount:
 				return m.addMount(value)
+			case inputConnect:
+				return m.addHost(value)
 			}
 			return m, m.call("added "+value+" on "+m.inputHost, api.MethodForwardAdd, api.ForwardParams{Host: m.inputHost, Spec: value})
 		}
@@ -285,14 +298,16 @@ func (m Model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	case "a", "m":
 		if ok {
-			m.mode, m.inputHost, m.inputMount = modeInput, sel.host, k == "m"
-			m.input.Reset()
-			m.input.Prompt, m.input.Placeholder = "forward> ", forwardPlaceholder
-			if m.inputMount {
-				m.input.Prompt, m.input.Placeholder = "mount> ", mountPlaceholder
+			kind := inputForward
+			if k == "m" {
+				kind = inputMount
 			}
-			return m, m.input.Focus()
+			cmd := m.prompt(kind, sel.host)
+			return m, cmd
 		}
+	case "c":
+		cmd := m.prompt(inputConnect, "")
+		return m, cmd
 	case "g":
 		if ok {
 			return m, m.toggleGPG(sel.host)
@@ -304,6 +319,15 @@ func (m Model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// prompt opens the input line. It changes m, so call it before returning m
+// (not in the same return statement: the evaluation order isn't defined).
+func (m *Model) prompt(kind inputKind, host string) tea.Cmd {
+	m.mode, m.inputKind, m.inputHost = modeInput, kind, host
+	m.input.Reset()
+	m.input.Prompt, m.input.Placeholder = prompts[kind].prompt, prompts[kind].placeholder
+	return m.input.Focus()
 }
 
 func (m Model) selected() (row, bool) {
@@ -356,6 +380,12 @@ func (m Model) remove(r row) (tea.Model, tea.Cmd) {
 		}
 		return m, m.call("unmounted "+r.name, api.MethodMountRemove, api.MountParams{Host: r.host, Direction: mt.Direction, Remote: mt.Remote, Local: mt.Local})
 	}
+	if r.kind == rowHost {
+		// An ad-hoc host that's already down is forgotten.
+		if h := m.hostStatus(r.host); h.AdHoc && h.State == api.StateDown {
+			return m, m.call("removed "+r.host, api.MethodHostRemove, api.HostParams{Name: r.host})
+		}
+	}
 	if r.kind != rowForward {
 		return m, m.down(r)
 	}
@@ -365,6 +395,20 @@ func (m Model) remove(r row) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	return m, m.call("removed "+r.name, api.MethodForwardRemove, api.ForwardParams{Host: r.host, Spec: r.name})
+}
+
+// addHost parses "NAME [SSH-DEST]" from the prompt and connects to it.
+func (m Model) addHost(value string) (tea.Model, tea.Cmd) {
+	fields := strings.Fields(value)
+	if len(fields) > 2 {
+		m.flash, m.flashErr = "enter NAME, or NAME SSH-DEST", true
+		return m, nil
+	}
+	p := api.HostParams{Name: fields[0]}
+	if len(fields) == 2 {
+		p.SSH = fields[1]
+	}
+	return m, m.call("connecting "+p.Name, api.MethodHostAdd, p)
 }
 
 // addMount parses "SRC DST" from the prompt, one side marked remote:.
@@ -500,11 +544,11 @@ func (m Model) render() string {
 
 	var bottom []string
 	if m.mode == modeInput {
-		what := "a forward to"
-		if m.inputMount {
-			what = "a mount on"
+		title := prompts[m.inputKind].title
+		if strings.Contains(title, "%s") {
+			title = fmt.Sprintf(title, m.inputHost)
 		}
-		bottom = append(bottom, fmt.Sprintf("add %s %s (enter to add, esc to cancel)", what, m.inputHost), m.input.View())
+		bottom = append(bottom, title+" (enter to confirm, esc to cancel)", m.input.View())
 	} else if detail := m.detail(); detail != "" {
 		bottom = append(bottom, detail)
 	}
@@ -559,14 +603,43 @@ func (m Model) footer() string {
 	case modeHelp:
 		return "any key to go back"
 	}
-	return "enter toggle · a forward · m mount · g gpg · d doctor · r reload · l log · ? help · q quit"
+	return m.enterHint() + " · c connect to… · a forward · m mount · g gpg · d doctor · ? help · q quit"
+}
+
+// enterHint says what enter does on the selected row.
+func (m Model) enterHint() string {
+	r, ok := m.selected()
+	if !ok {
+		return "enter —"
+	}
+	switch r.kind {
+	case rowHost:
+		if m.hostStatus(r.host).State == api.StateDown {
+			return "enter connect"
+		}
+		return "enter disconnect"
+	case rowProfile:
+		if m.profileStatus(r.name).Active {
+			return "enter deactivate"
+		}
+		return "enter activate"
+	case rowForward:
+		if m.forwardStatus(r.host, r.name).AdHoc {
+			return "enter remove"
+		}
+	case rowMount:
+		if m.mountStatus(r.host, r.name).AdHoc {
+			return "enter unmount"
+		}
+	}
+	return "enter —"
 }
 
 // rowLines renders the host/forward/profile list, scrolled to keep the
 // cursor in view.
 func (m Model) rowLines(height int) []string {
 	if len(m.status.Hosts) == 0 {
-		return []string{"no hosts configured — add some to " + m.status.ConfigPath + " and press r"}
+		return []string{"no hosts yet — press c to connect to one, or add hosts to " + m.status.ConfigPath + " and press r"}
 	}
 	nameW := 0
 	for _, r := range m.rows {
@@ -615,6 +688,9 @@ func (m Model) rowLine(r row, selected bool, nameW int) string {
 		state, name, info = h.State, h.Name, "ssh "+h.SSH
 		if h.Autoconnect {
 			info += " · auto"
+		}
+		if h.AdHoc {
+			info += " · ad-hoc"
 		}
 		extra = hostProblem(h)
 	case rowForward:
@@ -764,7 +840,8 @@ var helpLines = []string{
 	"  enter/space  toggle: connect/disconnect a host, activate/deactivate a profile,",
 	"               remove an ad-hoc forward or mount",
 	"  u            bring up the selection now (also retries a failed connection)",
-	"  x            take down the selection",
+	"  x            take down the selection; on an ad-hoc host that's down, forget it",
+	"  c            connect to a host that isn't in the config (NAME [SSH-DEST])",
 	"  a            add an ad-hoc forward to the selected host",
 	"  m            add an ad-hoc mount on the selected host (SRC DST, one side remote:PATH)",
 	"  g            toggle ad-hoc gpg-agent forwarding to the selected host",
