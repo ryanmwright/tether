@@ -5,8 +5,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"tether/internal/api"
-	"tether/internal/config"
+	"github.com/ryanmwright/tether/internal/api"
+	"github.com/ryanmwright/tether/internal/config"
 )
 
 func newConfigCmd(g *globalFlags) *cobra.Command {

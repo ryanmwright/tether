@@ -6,12 +6,14 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"tether/internal/api"
-	"tether/internal/daemon"
+	"github.com/ryanmwright/tether/internal/api"
+	"github.com/ryanmwright/tether/internal/daemon"
+	"github.com/ryanmwright/tether/internal/openssh"
 )
 
 func newDaemonCmd(g *globalFlags) *cobra.Command {
 	var logLevel slog.Level
+	var sshConfig string
 	cmd := &cobra.Command{
 		Use:   "daemon",
 		Short: "Run the tether daemon in the foreground",
@@ -25,10 +27,12 @@ func newDaemonCmd(g *globalFlags) *cobra.Command {
 				ConfigPath: g.config,
 				Version:    version,
 				Logger:     log,
+				SSH:        openssh.Options{ConfigFile: sshConfig},
 			})
 		},
 	}
 	cmd.Flags().TextVar(&logLevel, "log-level", slog.LevelInfo, "log level: debug, info, warn, error")
+	cmd.Flags().StringVar(&sshConfig, "ssh-config", "", "ssh config file to use instead of ~/.ssh/config (ssh -F)")
 
 	cmd.AddCommand(&cobra.Command{
 		Use:   "stop",
@@ -36,7 +40,7 @@ func newDaemonCmd(g *globalFlags) *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			g.noAutostart = true
-			c, err := g.connect(cmd.Context())
+			c, err := g.connectAny(cmd.Context())
 			if err != nil {
 				return err
 			}

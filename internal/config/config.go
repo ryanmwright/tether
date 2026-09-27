@@ -14,6 +14,9 @@ import (
 	"unicode"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/ryanmwright/tether/internal/forward"
+	"github.com/ryanmwright/tether/internal/mount"
 )
 
 type Config struct {
@@ -37,16 +40,17 @@ type Host struct {
 type Profile struct {
 	Host        string   `toml:"host"`
 	Autoconnect bool     `toml:"autoconnect"`
-	GPG         bool     `toml:"gpg"`
+	GPG         bool     `toml:"gpg"`     // forward gpg-agent
+	GPGSSH      bool     `toml:"gpg_ssh"` // forward gpg-agent's SSH socket
 	Forwards    []string `toml:"forwards"`
 	Mounts      []Mount  `toml:"mounts"`
 }
 
-type Direction string
+type Direction = mount.Direction
 
 const (
-	RemoteToLocal Direction = "remote-to-local"
-	LocalToRemote Direction = "local-to-remote"
+	RemoteToLocal = mount.RemoteToLocal
+	LocalToRemote = mount.LocalToRemote
 )
 
 type Mount struct {
@@ -54,6 +58,11 @@ type Mount struct {
 	Remote    string    `toml:"remote"`
 	Local     string    `toml:"local"`
 	Options   []string  `toml:"options"`
+}
+
+// Spec is the mount as the mount package describes it, not yet normalized.
+func (m Mount) Spec() mount.Spec {
+	return mount.Spec{Direction: m.Direction, Remote: m.Remote, Local: m.Local, Options: m.Options}
 }
 
 // Backoff is a reconnect delay range, written as "1s..60s" or a single
@@ -138,6 +147,7 @@ var namePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 // Validate reports every problem found, not just the first.
 func (c *Config) Validate() error {
+	home, _ := os.UserHomeDir()
 	var errs []error
 	for _, name := range slices.Sorted(maps.Keys(c.Hosts)) {
 		h := c.Hosts[name]
@@ -163,16 +173,15 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("profiles.%s.host: unknown host %q", name, p.Host))
 		}
 		for i, f := range p.Forwards {
-			if strings.TrimSpace(f) == "" {
-				errs = append(errs, fmt.Errorf("profiles.%s.forwards[%d]: empty", name, i))
+			if _, err := forward.Parse(f); err != nil {
+				errs = append(errs, fmt.Errorf("profiles.%s.forwards[%d]: %w", name, i, err))
 			}
 		}
 		for i, m := range p.Mounts {
-			if m.Direction != RemoteToLocal && m.Direction != LocalToRemote {
-				errs = append(errs, fmt.Errorf("profiles.%s.mounts[%d].direction: must be %q or %q", name, i, RemoteToLocal, LocalToRemote))
-			}
 			if m.Remote == "" || m.Local == "" {
 				errs = append(errs, fmt.Errorf("profiles.%s.mounts[%d]: remote and local are required", name, i))
+			} else if _, err := mount.Normalize(m.Spec(), home); err != nil {
+				errs = append(errs, fmt.Errorf("profiles.%s.mounts[%d]: %w", name, i, err))
 			}
 		}
 	}

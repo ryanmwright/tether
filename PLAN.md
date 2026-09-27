@@ -58,12 +58,14 @@ One binary, `tether`. `tether daemon` runs the daemon; every other subcommand is
 - Remote side: run `gpgconf --list-dirs agent-socket` over the master once and cache the result.
 - Before forwarding, remove the stale remote socket (`rm -f`) so that `StreamLocalBindUnlink yes` is not *required* in the remote sshd config (still recommended).
 - `tether doctor <host>` checks that the remote gpg-agent socket activation is masked, the public keys are present on the remote, and the socket is reachable.
-- **SSH via gpg-agent:** also forward the local `gpgconf --list-dirs agent-ssh-socket` to a stable remote path (e.g. `$XDG_RUNTIME_DIR/tether/ssh-agent.sock`). The remote shell points `SSH_AUTH_SOCK` there, either through the NixOS module or through a snippet that `doctor` prints for Debian.
+- **SSH via gpg-agent (`gpg_ssh`):** forward the local `agent-ssh-socket` to the remote's own `agent-ssh-socket` path. The remote shell points `SSH_AUTH_SOCK` there (NixOS module, or a snippet for Debian).
+- **Stop the remote's own agent before binding.** Removing its socket isn't enough: gpg-agent notices, exits, and deletes the socket path, taking the forward with it. `gpgconf --kill` through a stale forward is refused by the local extra socket (tested).
 - Remote-side NixOS module (`tether.remote.enable`): sets `StreamLocalBindUnlink yes`, disables gpg-agent socket activation for the user, enables FUSE `user_allow_other` if needed, and sets `SSH_AUTH_SOCK`.
 
 ### 3. Mounts (live FUSE)
 - **remote→local:** `sshfs -o ssh_command='ssh -S <ctlsock>' host:path localpath`, reusing the master connection.
-- **local→remote (reverse sshfs):** the local `sftp-server` is connected to `ssh -S sock host sshfs -o passive :<localpath> <remotepath>` through stdin/stdout. The daemon owns both processes and does the plumbing in Go, so `dpipe` is not needed.
+- **local→remote:** the remote runs `sshfs -o passive`, served over the session's stdin/stdout by an SFTP server inside the daemon (`internal/sftpjail`, `pkg/sftp` + `os.Root`) confined to the shared directory. OpenSSH's `sftp-server` would expose everything the user can read.
+- **remote→local:** the local `sshfs -o passive` is piped straight to an `ssh -s sftp` channel on the master; no second connection.
 - Unmount cleanly with `fusermount3 -u` on stop, and lazily when the connection dies. On reconnect, stale mount points are detected and cleaned up.
 - The `sshfs` flags are set per mount (`reconnect`, `ServerAliveInterval`, cache options).
 - **Fedora + Nix gotcha:** an `sshfs` built by Nix on a non-NixOS system still needs the setuid `/usr/bin/fusermount3` from the host. Resolve `fusermount3` from the system path first and check this in `doctor`.
@@ -135,10 +137,10 @@ Libraries: `cobra` (CLI), `bubbletea`/`lipgloss`/`bubbles` (TUI), `BurntSushi/to
 ## Phases
 
 0. ✅ **Skeleton:** Go module, flake devshell, `tether daemon`, socket API with `status`, config loading, systemd user unit.
-1. **SSH plus forwards:** master lifecycle, L/R/D forwards, reconnect and backoff, event stream, `up`/`down`/`fwd`/`status -w`.
-2. **GPG:** socket discovery, forwarding, `doctor`.
-3. **TUI:** host and profile tree, live status, toggles, log pane.
-4. **Mounts:** sshfs in both directions, cleanup and recovery.
+1. ✅ **SSH plus forwards:** master lifecycle, L/R/D forwards, reconnect and backoff, event stream, `up`/`down`/`fwd`/`status -w`.
+2. ✅ **GPG:** socket discovery, forwarding, `doctor`.
+3. ✅ **TUI:** host and profile tree, live status, toggles, log pane.
+4. ✅ **Mounts:** sshfs in both directions, cleanup and recovery.
 5. **Tray:** KDE StatusNotifierItem client (separate binary `tether-tray`).
 6. **USB/IP.**
 
@@ -146,5 +148,10 @@ Libraries: `cobra` (CLI), `bubbletea`/`lipgloss`/`bubbles` (TUI), `BurntSushi/to
 - Unit tests: spec parsing, config validation, reconciler (with a fake SSH layer behind an interface).
 - Integration tests: an `sshd` container or a NixOS VM test (`nixosTest`) with two nodes, covering forwards, gpg and sshfs from start to finish.
 
+## Deferred / follow-ups
+- `fwd add --save` (write ad-hoc forwards into the config) — needs comment-preserving TOML edits.
+- Interactive auth for the daemon (`SSH_ASKPASS`, e.g. ksshaskpass) for hosts that need a password or 2FA; today auth must be non-interactive.
+- Status-bar friendly output exists (`status -w --json`); a TUI comes in phase 3.
+
 ## Open questions
-- Go module path (currently just `tether`; switch to the real repo URL once it's hosted).
+- None currently.

@@ -153,3 +153,39 @@ func TestMalformedInput(t *testing.T) {
 		t.Errorf("parse error response: %s", line)
 	}
 }
+
+func TestNotifications(t *testing.T) {
+	socket, _, _ := startServer(t, func(s *Server) {
+		s.Handle("subscribe", func(ctx context.Context, _ json.RawMessage) (any, error) {
+			conn := ConnFromContext(ctx)
+			go func() {
+				for i := range 3 {
+					if conn.Notify("tick", i) != nil {
+						return
+					}
+				}
+			}()
+			return "ok", nil
+		})
+	})
+	c := dial(t, socket)
+	if err := c.Call(context.Background(), "subscribe", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	for want := range 3 {
+		select {
+		case n := <-c.Notifications():
+			var got int
+			json.Unmarshal(n.Params, &got)
+			if n.Method != "tick" || got != want {
+				t.Errorf("notification %d = %s %s", want, n.Method, n.Params)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for notification")
+		}
+	}
+	c.Close()
+	if _, ok := <-c.Notifications(); ok {
+		t.Error("notifications channel not closed after Close")
+	}
+}

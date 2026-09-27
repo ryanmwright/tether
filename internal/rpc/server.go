@@ -53,8 +53,13 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 }
 
 func (s *Server) serveConn(ctx context.Context, c net.Conn) {
+	w := &writer{c: c}
+	// Handlers get a context that lives as long as the connection, so they
+	// can keep pushing notifications after returning.
+	ctx, cancel := context.WithCancel(context.WithValue(ctx, connKey{}, &Conn{w: w}))
 	var inflight sync.WaitGroup
 	defer func() {
+		cancel()
 		inflight.Wait()
 		c.Close()
 	}()
@@ -63,7 +68,6 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 	stop := context.AfterFunc(ctx, func() { c.SetReadDeadline(time.Now()) })
 	defer stop()
 
-	w := &writer{c: c}
 	dec := json.NewDecoder(bufio.NewReader(c))
 	for {
 		var m message
@@ -84,6 +88,26 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 		}
 		inflight.Go(func() { s.dispatch(ctx, w, &m) })
 	}
+}
+
+// Conn lets a handler send notifications to its client.
+type Conn struct{ w *writer }
+
+type connKey struct{}
+
+// ConnFromContext returns the connection a handler was called on.
+func ConnFromContext(ctx context.Context) *Conn {
+	c, _ := ctx.Value(connKey{}).(*Conn)
+	return c
+}
+
+// Notify sends a notification (a request without an id) to the client.
+func (c *Conn) Notify(method string, params any) error {
+	b, err := json.Marshal(params)
+	if err != nil {
+		return err
+	}
+	return c.w.write(&message{Method: method, Params: b})
 }
 
 func (s *Server) dispatch(ctx context.Context, w *writer, req *message) {

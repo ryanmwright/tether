@@ -12,16 +12,24 @@ import (
 	"maps"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
-	"tether/internal/api"
-	"tether/internal/config"
-	"tether/internal/rpc"
+	"github.com/ryanmwright/tether/internal/api"
+	"github.com/ryanmwright/tether/internal/config"
+	"github.com/ryanmwright/tether/internal/forward"
+	"github.com/ryanmwright/tether/internal/gpg"
+	"github.com/ryanmwright/tether/internal/mount"
+	"github.com/ryanmwright/tether/internal/netwatch"
+	"github.com/ryanmwright/tether/internal/openssh"
+	"github.com/ryanmwright/tether/internal/rpc"
 )
 
 var ErrAlreadyRunning = errors.New("another tether daemon is already running")
@@ -31,23 +39,64 @@ type Options struct {
 	ConfigPath string
 	Version    string
 	Logger     *slog.Logger
+	SSH        openssh.Options
 }
 
 type Daemon struct {
 	opts    Options
 	log     *slog.Logger
 	started time.Time
+	ctx     context.Context // lifetime of sessions
+	wg      sync.WaitGroup
 
-	mu     sync.RWMutex
-	cfg    *config.Config
-	cfgErr error // last reload failure; cfg keeps the last good config
+	mu       sync.Mutex
+	cfg      *config.Config
+	cfgErr   error                             // last reload failure; cfg keeps the last good config
+	active   map[string]bool                   // active profiles
+	upHosts  map[string]bool                   // hosts brought up directly
+	adhoc    map[string]map[string]wantForward // host -> forward key -> forward
+	adhocMnt map[string]map[string]wantMount   // host -> mount key -> mount
+	home     string                            // for ~ in local mount paths
+	autoSeen map[string]bool                   // "host/x", "profile/x" -> autoconnect as last applied
+	sessions map[string]*sessionHandle
+
+	gen    atomic.Uint64 // see api.Status.Generation
+	logs   *logRing
+	subsMu sync.Mutex
+	subs   map[*subscriber]struct{}
+}
+
+type subscriber struct {
+	status chan struct{}     // coalesced "status changed"
+	logs   chan api.LogEntry // nil unless the client asked for logs
+}
+
+type sessionHandle struct {
+	s      *session
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 // Run serves until ctx is cancelled or a client requests shutdown.
 func Run(ctx context.Context, opts Options) error {
-	d := &Daemon{opts: opts, log: opts.Logger, started: time.Now(), cfg: config.Default()}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	d := &Daemon{
+		opts:     opts,
+		started:  time.Now(),
+		ctx:      ctx,
+		cfg:      config.Default(),
+		active:   map[string]bool{},
+		upHosts:  map[string]bool{},
+		adhoc:    map[string]map[string]wantForward{},
+		adhocMnt: map[string]map[string]wantMount{},
+		autoSeen: map[string]bool{},
+		sessions: map[string]*sessionHandle{},
+		subs:     map[*subscriber]struct{}{},
+	}
+	d.home, _ = os.UserHomeDir()
+	d.logs = &logRing{publish: d.publishLog}
+	d.log = slog.New(&logTee{inner: opts.Logger.Handler(), ring: d.logs})
 
 	if err := os.MkdirAll(filepath.Dir(opts.SocketPath), 0o700); err != nil {
 		return err
@@ -70,15 +119,33 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	defer os.Remove(opts.SocketPath)
 
+	d.ensureAuthSock()
 	d.reload()
+	defer d.wg.Wait() // sessions stop their connections when ctx ends
+	defer cancel()
 
 	srv := rpc.NewServer(d.log)
-	srv.Handle(api.MethodStatus, d.handleStatus)
+	srv.Handle(api.MethodStatus, func(context.Context, json.RawMessage) (any, error) { return d.status(), nil })
 	srv.Handle(api.MethodReload, d.handleReload)
 	srv.Handle(api.MethodShutdown, func(context.Context, json.RawMessage) (any, error) {
 		d.log.Info("shutdown requested")
 		cancel()
 		return nil, nil
+	})
+	srv.Handle(api.MethodUp, d.handleUp)
+	srv.Handle(api.MethodDown, d.handleDown)
+	srv.Handle(api.MethodForwardAdd, d.handleForwardAdd)
+	srv.Handle(api.MethodForwardRemove, d.handleForwardRemove)
+	srv.Handle(api.MethodSubscribe, d.handleSubscribe)
+	srv.Handle(api.MethodDoctor, d.handleDoctor)
+	srv.Handle(api.MethodMountAdd, d.handleMountAdd)
+	srv.Handle(api.MethodMountRemove, d.handleMountRemove)
+	srv.Handle(api.MethodLogs, func(_ context.Context, params json.RawMessage) (any, error) {
+		p, err := decode[api.LogsParams](orEmpty(params))
+		if err != nil {
+			return nil, err
+		}
+		return d.logs.recent(p.Limit), nil
 	})
 
 	hup := make(chan os.Signal, 1)
@@ -95,14 +162,47 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}()
 
+	if changes, err := netwatch.Watch(ctx, 2*time.Second); err != nil {
+		d.log.Warn("network change detection unavailable", "err", err)
+	} else {
+		go func() {
+			for range changes {
+				d.log.Info("network changed")
+				d.mu.Lock()
+				for _, h := range d.sessions {
+					h.s.networkChanged()
+				}
+				d.mu.Unlock()
+			}
+		}()
+	}
+
 	d.log.Info("daemon started", "version", opts.Version, "socket", opts.SocketPath, "config", opts.ConfigPath)
 	if err := sdNotify("READY=1"); err != nil {
 		d.log.Warn("sd_notify failed", "err", err)
 	}
 	err = srv.Serve(ctx, l)
 	sdNotify("STOPPING=1")
-	d.log.Info("daemon stopped")
+	d.log.Info("daemon stopping")
 	return err
+}
+
+// ensureAuthSock points ssh at gpg-agent's SSH socket when no agent is set.
+// systemd user services often lack SSH_AUTH_SOCK even though the user's
+// shells have it.
+func (d *Daemon) ensureAuthSock() {
+	if os.Getenv("SSH_AUTH_SOCK") != "" {
+		return
+	}
+	out, err := exec.Command("gpgconf", "--list-dirs", "agent-ssh-socket").Output()
+	if err != nil {
+		return
+	}
+	sock := strings.TrimSpace(string(out))
+	if fi, err := os.Stat(sock); err == nil && fi.Mode().Type() == os.ModeSocket {
+		os.Setenv("SSH_AUTH_SOCK", sock)
+		d.log.Info("SSH_AUTH_SOCK not set; using gpg-agent's SSH socket", "path", sock)
+	}
 }
 
 // reload re-reads the config. An invalid config is reported and the previous
@@ -110,30 +210,444 @@ func Run(ctx context.Context, opts Options) error {
 func (d *Daemon) reload() error {
 	cfg, err := config.Load(d.opts.ConfigPath)
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.cfgErr = err
 	if err != nil {
+		d.mu.Unlock()
 		d.log.Error("config invalid, keeping previous", "err", err)
+		d.notify()
 		return err
 	}
-	d.cfg = cfg
+	d.applyConfig(cfg)
+	d.mu.Unlock()
 	d.log.Info("config loaded", "hosts", len(cfg.Hosts), "profiles", len(cfg.Profiles))
+	d.notify()
 	return nil
+}
+
+// applyConfig switches to cfg, keeping runtime state (active profiles,
+// connected hosts, ad-hoc forwards) for everything that still exists.
+// Autoconnect applies to items that are new or newly marked autoconnect.
+// Callers hold d.mu.
+func (d *Daemon) applyConfig(cfg *config.Config) {
+	d.cfg = cfg
+	for name, h := range d.sessions {
+		if _, ok := cfg.Hosts[name]; !ok {
+			h.cancel()
+			<-h.done
+			delete(d.sessions, name)
+			delete(d.upHosts, name)
+			delete(d.adhoc, name)
+			delete(d.adhocMnt, name)
+		}
+	}
+	for name := range d.active {
+		if _, ok := cfg.Profiles[name]; !ok {
+			delete(d.active, name)
+		}
+	}
+
+	seen := map[string]bool{}
+	for name, h := range cfg.Hosts {
+		key := "host/" + name
+		if h.Autoconnect && !d.autoSeen[key] {
+			d.upHosts[name] = true
+		}
+		seen[key] = h.Autoconnect
+	}
+	for name, p := range cfg.Profiles {
+		key := "profile/" + name
+		if p.Autoconnect && !d.autoSeen[key] {
+			d.active[name] = true
+		}
+		seen[key] = p.Autoconnect
+	}
+	d.autoSeen = seen
+
+	for name := range cfg.Hosts {
+		if _, ok := d.sessions[name]; !ok {
+			d.startSession(name)
+		}
+	}
+	d.recompute()
+}
+
+func (d *Daemon) startSession(name string) {
+	ctlPath := filepath.Join(filepath.Dir(d.opts.SocketPath), "ctl", name)
+	s := newSession(name, ctlPath, d.opts.SSH, d.log, d.notify)
+	ctx, cancel := context.WithCancel(d.ctx)
+	h := &sessionHandle{s: s, cancel: cancel, done: make(chan struct{})}
+	d.sessions[name] = h
+	d.wg.Go(func() {
+		defer close(h.done)
+		s.run(ctx)
+	})
+}
+
+// recompute derives each host's want from the config and runtime state.
+// Callers hold d.mu.
+func (d *Daemon) recompute() {
+	for name, h := range d.sessions {
+		host := d.cfg.Hosts[name]
+		w := want{backoff: d.cfg.Defaults.ReconnectBackoff, forwards: map[string]wantForward{}, mounts: map[string]wantMount{}}
+		wanted := d.upHosts[name]
+		for _, pname := range slices.Sorted(maps.Keys(d.active)) {
+			p := d.cfg.Profiles[pname]
+			if p.Host != name {
+				continue
+			}
+			wanted = true
+			for key, wf := range profileForwards(p) {
+				wf.profiles = append(w.forwards[key].profiles, pname)
+				wf.adhoc = w.forwards[key].adhoc
+				w.forwards[key] = wf
+			}
+			for key, wm := range profileMounts(p, d.home) {
+				wm.profiles = append(w.mounts[key].profiles, pname)
+				w.mounts[key] = wm
+			}
+		}
+		for key, wm := range d.adhocMnt[name] {
+			wanted = true
+			wm.profiles = w.mounts[key].profiles
+			wm.adhoc = true
+			w.mounts[key] = wm
+		}
+		for key, wf := range d.adhoc[name] {
+			wanted = true
+			wf.profiles = w.forwards[key].profiles
+			wf.adhoc = true
+			w.forwards[key] = wf
+		}
+		if wanted {
+			w.dest = host.SSH
+		} else {
+			w.forwards, w.mounts = nil, nil
+		}
+		h.s.setWant(w)
+	}
+}
+
+// Named forwards that stand for gpg-agent sockets, usable in `fwd add`.
+const (
+	gpgAgentForward = "gpg-agent"
+	gpgSSHForward   = "gpg-ssh"
+)
+
+// parseForward parses a forward spec or a named forward, returning its key
+// (the canonical spec, or the name).
+func parseForward(s string) (string, wantForward, error) {
+	switch s {
+	case gpgAgentForward:
+		return s, wantForward{gpgKind: gpg.KindAgent}, nil
+	case gpgSSHForward:
+		return s, wantForward{gpgKind: gpg.KindSSH}, nil
+	}
+	spec, err := forward.Parse(s)
+	if err != nil {
+		return "", wantForward{}, err
+	}
+	return spec.String(), wantForward{spec: spec}, nil
+}
+
+// profileForwards is every forward a profile asks for, by key.
+func profileForwards(p config.Profile) map[string]wantForward {
+	fwds := map[string]wantForward{}
+	for _, f := range p.Forwards {
+		key, wf, _ := parseForward(f) // validated with the config
+		fwds[key] = wf
+	}
+	if p.GPG {
+		fwds[gpgAgentForward] = wantForward{gpgKind: gpg.KindAgent}
+	}
+	if p.GPGSSH {
+		fwds[gpgSSHForward] = wantForward{gpgKind: gpg.KindSSH}
+	}
+	return fwds
+}
+
+// profileMounts is every mount a profile asks for, by key.
+func profileMounts(p config.Profile, home string) map[string]wantMount {
+	mounts := map[string]wantMount{}
+	for _, m := range p.Mounts {
+		spec, _ := mount.Normalize(m.Spec(), home) // validated with the config
+		mounts[spec.Key()] = wantMount{spec: spec}
+	}
+	return mounts
+}
+
+// resolve finds the host or profile a request names. Callers hold d.mu.
+func (d *Daemon) resolve(p api.TargetParams) (api.TargetResult, error) {
+	prof, isProfile := d.cfg.Profiles[p.Name]
+	_, isHost := d.cfg.Hosts[p.Name]
+	kind := p.Kind
+	switch {
+	case kind == "" && isProfile && isHost:
+		return api.TargetResult{}, rpc.Errorf(api.CodeAmbiguous, "%q is both a host and a profile; specify which", p.Name)
+	case kind == "" && isProfile:
+		kind = api.TargetProfile
+	case kind == "" && isHost:
+		kind = api.TargetHost
+	}
+	switch {
+	case kind == api.TargetProfile && isProfile:
+		return api.TargetResult{Name: p.Name, Kind: kind, Host: prof.Host}, nil
+	case kind == api.TargetHost && isHost:
+		return api.TargetResult{Name: p.Name, Kind: kind, Host: p.Name}, nil
+	case kind == "":
+		return api.TargetResult{}, rpc.Errorf(api.CodeNotFound, "no host or profile named %q", p.Name)
+	default:
+		return api.TargetResult{}, rpc.Errorf(api.CodeNotFound, "no %s named %q", kind, p.Name)
+	}
+}
+
+func decode[T any](params json.RawMessage) (T, error) {
+	var v T
+	if err := json.Unmarshal(params, &v); err != nil {
+		return v, rpc.Errorf(rpc.CodeInvalidParams, "invalid params: %v", err)
+	}
+	return v, nil
+}
+
+func (d *Daemon) handleUp(_ context.Context, params json.RawMessage) (any, error) {
+	p, err := decode[api.TargetParams](params)
+	if err != nil {
+		return nil, err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	t, err := d.resolve(p)
+	if err != nil {
+		return nil, err
+	}
+	if t.Kind == api.TargetProfile {
+		d.active[t.Name] = true
+	} else {
+		d.upHosts[t.Name] = true
+	}
+	d.recompute()
+	d.sessions[t.Host].s.retryNow()
+	d.log.Info("up", "kind", t.Kind, "name", t.Name)
+	t.Generation = d.gen.Load()
+	return t, nil
+}
+
+func (d *Daemon) handleDown(_ context.Context, params json.RawMessage) (any, error) {
+	p, err := decode[api.TargetParams](params)
+	if err != nil {
+		return nil, err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	t, err := d.resolve(p)
+	if err != nil {
+		return nil, err
+	}
+	if t.Kind == api.TargetProfile {
+		delete(d.active, t.Name)
+	} else {
+		// Taking a host down takes everything on it down.
+		delete(d.upHosts, t.Name)
+		delete(d.adhoc, t.Name)
+		delete(d.adhocMnt, t.Name)
+		for name := range d.active {
+			if d.cfg.Profiles[name].Host == t.Name {
+				delete(d.active, name)
+			}
+		}
+	}
+	d.recompute()
+	d.log.Info("down", "kind", t.Kind, "name", t.Name)
+	t.Generation = d.gen.Load()
+	return t, nil
+}
+
+func (d *Daemon) forwardParams(params json.RawMessage) (p api.ForwardParams, key string, wf wantForward, err error) {
+	if p, err = decode[api.ForwardParams](params); err != nil {
+		return
+	}
+	if _, ok := d.cfg.Hosts[p.Host]; !ok {
+		err = rpc.Errorf(api.CodeNotFound, "no host named %q", p.Host)
+		return
+	}
+	if key, wf, err = parseForward(p.Spec); err != nil {
+		err = rpc.Errorf(rpc.CodeInvalidParams, "%v", err)
+	}
+	return
+}
+
+func (d *Daemon) handleForwardAdd(_ context.Context, params json.RawMessage) (any, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p, key, wf, err := d.forwardParams(params)
+	if err != nil {
+		return nil, err
+	}
+	if d.adhoc[p.Host] == nil {
+		d.adhoc[p.Host] = map[string]wantForward{}
+	}
+	d.adhoc[p.Host][key] = wf
+	d.recompute()
+	d.sessions[p.Host].s.retryNow()
+	d.log.Info("ad-hoc forward added", "host", p.Host, "forward", key)
+	return api.ForwardResult{Host: p.Host, Spec: key, Generation: d.gen.Load()}, nil
+}
+
+func (d *Daemon) handleForwardRemove(_ context.Context, params json.RawMessage) (any, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p, key, _, err := d.forwardParams(params)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := d.adhoc[p.Host][key]; !ok {
+		return nil, rpc.Errorf(api.CodeNotFound,
+			"no ad-hoc forward %s on %s (profile forwards go away with `tether down <profile>`)", key, p.Host)
+	}
+	delete(d.adhoc[p.Host], key)
+	d.recompute()
+	d.log.Info("ad-hoc forward removed", "host", p.Host, "forward", key)
+	return api.ForwardResult{Host: p.Host, Spec: key, Generation: d.gen.Load()}, nil
+}
+
+func (d *Daemon) mountParams(params json.RawMessage) (api.MountParams, mount.Spec, error) {
+	p, err := decode[api.MountParams](params)
+	if err != nil {
+		return p, mount.Spec{}, err
+	}
+	if _, ok := d.cfg.Hosts[p.Host]; !ok {
+		return p, mount.Spec{}, rpc.Errorf(api.CodeNotFound, "no host named %q", p.Host)
+	}
+	spec, err := mount.Normalize(mount.Spec{Direction: mount.Direction(p.Direction), Remote: p.Remote, Local: p.Local, Options: p.Options}, d.home)
+	if err != nil {
+		return p, spec, rpc.Errorf(rpc.CodeInvalidParams, "%v", err)
+	}
+	return p, spec, nil
+}
+
+func (d *Daemon) handleMountAdd(_ context.Context, params json.RawMessage) (any, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p, spec, err := d.mountParams(params)
+	if err != nil {
+		return nil, err
+	}
+	if d.adhocMnt[p.Host] == nil {
+		d.adhocMnt[p.Host] = map[string]wantMount{}
+	}
+	d.adhocMnt[p.Host][spec.Key()] = wantMount{spec: spec}
+	d.recompute()
+	d.sessions[p.Host].s.retryNow()
+	d.log.Info("ad-hoc mount added", "host", p.Host, "mount", spec.Key())
+	return api.MountResult{Host: p.Host, Key: spec.Key(), Generation: d.gen.Load()}, nil
+}
+
+func (d *Daemon) handleMountRemove(_ context.Context, params json.RawMessage) (any, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p, spec, err := d.mountParams(params)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := d.adhocMnt[p.Host][spec.Key()]; !ok {
+		return nil, rpc.Errorf(api.CodeNotFound,
+			"no ad-hoc mount %s on %s (profile mounts go away with `tether down <profile>`)", spec.Key(), p.Host)
+	}
+	delete(d.adhocMnt[p.Host], spec.Key())
+	d.recompute()
+	d.log.Info("ad-hoc mount removed", "host", p.Host, "mount", spec.Key())
+	return api.MountResult{Host: p.Host, Key: spec.Key(), Generation: d.gen.Load()}, nil
 }
 
 func (d *Daemon) handleReload(context.Context, json.RawMessage) (any, error) {
 	if err := d.reload(); err != nil {
 		return nil, &rpc.Error{Code: api.CodeInvalidConfig, Message: err.Error()}
 	}
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	return api.ReloadResult{Hosts: len(d.cfg.Hosts), Profiles: len(d.cfg.Profiles)}, nil
 }
 
-func (d *Daemon) handleStatus(context.Context, json.RawMessage) (any, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+// handleSubscribe pushes a status snapshot now and after every change until
+// the client disconnects. Snapshots are coalesced, so a slow client skips
+// intermediate states rather than falling behind. Log entries, if requested,
+// are buffered; a client that falls far behind misses some.
+func (d *Daemon) handleSubscribe(ctx context.Context, params json.RawMessage) (any, error) {
+	p, err := decode[api.SubscribeParams](orEmpty(params))
+	if err != nil {
+		return nil, err
+	}
+	conn := rpc.ConnFromContext(ctx)
+	sub := &subscriber{status: make(chan struct{}, 1)}
+	sub.status <- struct{}{}
+	if p.Logs {
+		sub.logs = make(chan api.LogEntry, 256)
+	}
+	d.subsMu.Lock()
+	d.subs[sub] = struct{}{}
+	d.subsMu.Unlock()
+	go func() {
+		defer func() {
+			d.subsMu.Lock()
+			delete(d.subs, sub)
+			d.subsMu.Unlock()
+		}()
+		for {
+			var err error
+			select {
+			case <-ctx.Done():
+				return
+			case <-sub.status:
+				err = conn.Notify(api.EventStatus, d.status())
+			case e := <-sub.logs:
+				err = conn.Notify(api.EventLog, e)
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return nil, nil
+}
+
+func (d *Daemon) notify() {
+	d.gen.Add(1)
+	d.subsMu.Lock()
+	defer d.subsMu.Unlock()
+	for sub := range d.subs {
+		poke(sub.status)
+	}
+}
+
+func (d *Daemon) publishLog(e api.LogEntry) {
+	d.subsMu.Lock()
+	defer d.subsMu.Unlock()
+	for sub := range d.subs {
+		if sub.logs == nil {
+			continue
+		}
+		select {
+		case sub.logs <- e:
+		default:
+		}
+	}
+}
+
+// orEmpty lets handlers with optional params accept a call without any.
+func orEmpty(params json.RawMessage) json.RawMessage {
+	if len(params) == 0 {
+		return json.RawMessage("{}")
+	}
+	return params
+}
+
+func (d *Daemon) status() api.Status {
+	// Read the generation first: the snapshot is at least that new.
+	gen := d.gen.Load()
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	st := api.Status{
+		Generation: gen,
+		Protocol:   api.ProtocolVersion,
 		Version:    d.opts.Version,
 		PID:        os.Getpid(),
 		StartedAt:  d.started,
@@ -144,15 +658,62 @@ func (d *Daemon) handleStatus(context.Context, json.RawMessage) (any, error) {
 	if d.cfgErr != nil {
 		st.ConfigError = d.cfgErr.Error()
 	}
+	hosts := map[string]api.HostStatus{}
 	for _, name := range slices.Sorted(maps.Keys(d.cfg.Hosts)) {
-		h := d.cfg.Hosts[name]
-		st.Hosts = append(st.Hosts, api.HostStatus{Name: name, SSH: h.SSH, Autoconnect: h.Autoconnect, State: api.StateDown})
+		hs := d.sessions[name].s.status(d.cfg.Hosts[name])
+		hosts[name] = hs
+		st.Hosts = append(st.Hosts, hs)
 	}
 	for _, name := range slices.Sorted(maps.Keys(d.cfg.Profiles)) {
 		p := d.cfg.Profiles[name]
-		st.Profiles = append(st.Profiles, api.ProfileStatus{Name: name, Host: p.Host, Autoconnect: p.Autoconnect, State: api.StateDown})
+		ps := api.ProfileStatus{Name: name, Host: p.Host, Autoconnect: p.Autoconnect, Active: d.active[name]}
+		ps.State, ps.Error = profileState(ps.Active, p, hosts[p.Host], d.home)
+		st.Profiles = append(st.Profiles, ps)
 	}
-	return st, nil
+	return st
+}
+
+// profileState summarizes an active profile from its host and forwards.
+func profileState(active bool, p config.Profile, hs api.HostStatus, home string) (api.State, string) {
+	if !active {
+		return api.StateDown, ""
+	}
+	switch hs.State {
+	case api.StateError:
+		return api.StateError, hs.Error
+	case api.StateUp, api.StateDegraded:
+	default:
+		return api.StatePending, ""
+	}
+	byspec := map[string]api.ForwardStatus{}
+	for _, f := range hs.Forwards {
+		byspec[f.Spec] = f
+	}
+	state := api.StateUp
+	for _, key := range slices.Sorted(maps.Keys(profileForwards(p))) {
+		fs := byspec[key]
+		switch fs.State {
+		case api.StateError:
+			return api.StateDegraded, fmt.Sprintf("%s: %s", key, fs.Error)
+		case api.StateUp:
+		default:
+			state = api.StatePending
+		}
+	}
+	bykey := map[string]api.MountStatus{}
+	for _, m := range hs.Mounts {
+		bykey[m.Key] = m
+	}
+	for _, key := range slices.Sorted(maps.Keys(profileMounts(p, home))) {
+		switch ms := bykey[key]; ms.State {
+		case api.StateError:
+			return api.StateDegraded, fmt.Sprintf("%s: %s", key, ms.Error)
+		case api.StateUp:
+		default:
+			state = api.StatePending
+		}
+	}
+	return state, ""
 }
 
 // lockFile takes an exclusive, non-blocking flock on path. The lock is

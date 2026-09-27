@@ -12,8 +12,8 @@ import (
 	"syscall"
 	"time"
 
-	"tether/internal/paths"
-	"tether/internal/rpc"
+	"github.com/ryanmwright/tether/internal/paths"
+	"github.com/ryanmwright/tether/internal/rpc"
 )
 
 const systemdUnit = "tether.service"

@@ -13,9 +13,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"tether/internal/client"
-	"tether/internal/paths"
-	"tether/internal/rpc"
+	"github.com/ryanmwright/tether/internal/api"
+	"github.com/ryanmwright/tether/internal/client"
+	"github.com/ryanmwright/tether/internal/paths"
+	"github.com/ryanmwright/tether/internal/rpc"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -52,6 +53,14 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(
 		newDaemonCmd(g),
 		newStatusCmd(g),
+		newUpCmd(g),
+		newDownCmd(g),
+		newFwdCmd(g),
+		newGPGCmd(g),
+		newMountCmd(g),
+		newDoctorCmd(g),
+		newLogsCmd(g),
+		newTUICmd(g),
 		newConfigCmd(g),
 		&cobra.Command{
 			Use:   "version",
@@ -63,7 +72,29 @@ func newRootCmd() *cobra.Command {
 	return root
 }
 
+// connect connects to the daemon, starting it if needed, and checks that it
+// speaks this tether's API.
 func (g *globalFlags) connect(ctx context.Context) (*rpc.Client, error) {
+	c, err := g.connectAny(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var st api.Status
+	if err := c.Call(ctx, api.MethodStatus, nil, &st); err != nil {
+		c.Close()
+		return nil, err
+	}
+	if st.Protocol < api.ProtocolVersion {
+		c.Close()
+		return nil, fmt.Errorf("the running daemon (pid %d, version %s) is older than this tether (%s).\n"+
+			"Restart it: `tether daemon stop` (the next command starts the new one), or\n"+
+			"`systemctl --user restart tether` if it runs as a service", st.PID, st.Version, version)
+	}
+	return c, nil
+}
+
+// connectAny connects without checking the daemon's version.
+func (g *globalFlags) connectAny(ctx context.Context) (*rpc.Client, error) {
 	c, err := client.Connect(ctx, client.Options{
 		SocketPath: g.socket,
 		ConfigPath: g.config,

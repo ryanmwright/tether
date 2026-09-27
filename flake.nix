@@ -24,6 +24,9 @@
         default = pkgs.mkShell {
           packages = with pkgs; [
             go
+            openssh
+            gnupg
+            sshfs
             gopls
             gotools
             golangci-lint
@@ -32,6 +35,9 @@
       });
 
       homeManagerModules.default = import ./nix/hm-module.nix self;
+
+      # For the machines you connect to.
+      nixosModules.remote = import ./nix/nixos-remote.nix;
 
       checks = forAllSystems (pkgs: {
         tether = self.packages.${pkgs.stdenv.hostPlatform.system}.tether;

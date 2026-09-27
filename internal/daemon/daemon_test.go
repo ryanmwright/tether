@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
@@ -9,17 +10,32 @@ import (
 	"testing"
 	"time"
 
-	"tether/internal/api"
-	"tether/internal/rpc"
+	"github.com/ryanmwright/tether/internal/api"
+	"github.com/ryanmwright/tether/internal/openssh"
+	"github.com/ryanmwright/tether/internal/rpc"
 )
+
+// testLogger shows daemon logs in verbose test output.
+func testLogger(t *testing.T) *slog.Logger {
+	if !testing.Verbose() {
+		return slog.New(slog.DiscardHandler)
+	}
+	return slog.New(slog.NewTextHandler(t.Output(), &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
 
 type harness struct {
 	socket, config string
 	done           chan error
 }
 
-func start(t *testing.T, configTOML string) *harness {
+// start runs a daemon. Unless sshOpts says otherwise, ssh gets an empty
+// config file so tests never touch the user's ~/.ssh/config.
+func start(t *testing.T, configTOML string, sshOpts ...openssh.Options) *harness {
 	t.Helper()
+	ssh := openssh.Options{ConfigFile: os.DevNull}
+	if len(sshOpts) > 0 {
+		ssh = sshOpts[0]
+	}
 	dir := t.TempDir()
 	h := &harness{
 		socket: filepath.Join(dir, "run", "tether.sock"),
@@ -31,7 +47,7 @@ func start(t *testing.T, configTOML string) *harness {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		h.done <- Run(ctx, Options{SocketPath: h.socket, ConfigPath: h.config, Version: "test", Logger: slog.New(slog.DiscardHandler)})
+		h.done <- Run(ctx, Options{SocketPath: h.socket, ConfigPath: h.config, Version: "test", Logger: testLogger(t), SSH: ssh})
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -77,7 +93,7 @@ func (h *harness) client(t *testing.T) *rpc.Client {
 }
 
 func TestStatusAndReload(t *testing.T) {
-	h := start(t, "[hosts.devbox]\nautoconnect = true\n[profiles.work]\nhost = \"devbox\"\n")
+	h := start(t, "[hosts.devbox]\nssh = \"devbox.invalid\"\n[profiles.work]\nhost = \"devbox\"\n")
 	c := h.client(t)
 	ctx := context.Background()
 
@@ -88,7 +104,7 @@ func TestStatusAndReload(t *testing.T) {
 	if st.Version != "test" || st.PID != os.Getpid() || st.ConfigError != "" {
 		t.Errorf("status = %+v", st)
 	}
-	if len(st.Hosts) != 1 || st.Hosts[0] != (api.HostStatus{Name: "devbox", SSH: "devbox", Autoconnect: true, State: api.StateDown}) {
+	if len(st.Hosts) != 1 || st.Hosts[0].Name != "devbox" || st.Hosts[0].SSH != "devbox.invalid" || st.Hosts[0].State != api.StateDown {
 		t.Errorf("hosts = %+v", st.Hosts)
 	}
 	if len(st.Profiles) != 1 || st.Profiles[0].Host != "devbox" {
@@ -157,5 +173,47 @@ func TestSocketPermissions(t *testing.T) {
 	}
 	if perm := fi.Mode().Perm(); perm != 0o600 {
 		t.Errorf("socket mode = %o, want 600", perm)
+	}
+}
+
+func TestLogs(t *testing.T) {
+	h := start(t, "[hosts.devbox]\nssh = \"devbox.invalid\"\n")
+	c := h.client(t)
+	ctx := context.Background()
+
+	var entries []api.LogEntry
+	if err := c.Call(ctx, api.MethodLogs, nil, &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 || entries[len(entries)-1].Message != "daemon started" {
+		t.Fatalf("recent logs = %+v", entries)
+	}
+	if err := c.Call(ctx, api.MethodLogs, api.LogsParams{Limit: 1}, &entries); err != nil || len(entries) != 1 {
+		t.Fatalf("limit 1: %v %+v", err, entries)
+	}
+
+	if err := c.Call(ctx, api.MethodSubscribe, api.SubscribeParams{Logs: true}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Call(ctx, api.MethodReload, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		select {
+		case n := <-c.Notifications():
+			if n.Method != api.EventLog {
+				continue
+			}
+			var e api.LogEntry
+			json.Unmarshal(n.Params, &e)
+			if e.Message == "config loaded" {
+				if len(e.Attrs) != 2 || e.Attrs[0] != (api.LogAttr{Key: "hosts", Value: "1"}) {
+					t.Errorf("attrs = %+v", e.Attrs)
+				}
+				return
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("no log event for the reload")
+		}
 	}
 }

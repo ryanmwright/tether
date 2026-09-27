@@ -13,10 +13,19 @@ import (
 
 var ErrClosed = errors.New("rpc: connection closed")
 
+// Notification is a message pushed by the server.
+type Notification struct {
+	Method string
+	Params json.RawMessage
+}
+
 // Client issues calls over a single connection. It is safe for concurrent use.
 type Client struct {
-	w      *writer
-	nextID atomic.Int64
+	w         *writer
+	nextID    atomic.Int64
+	notes     chan Notification
+	closing   chan struct{}
+	closeOnce sync.Once
 
 	mu      sync.Mutex
 	pending map[int64]chan *message
@@ -38,16 +47,24 @@ func NewClient(c net.Conn) *Client {
 		w:       &writer{c: c},
 		pending: map[int64]chan *message{},
 		done:    make(chan struct{}),
+		notes:   make(chan Notification, 16),
+		closing: make(chan struct{}),
 	}
 	go cl.readLoop()
 	return cl
 }
 
 func (c *Client) Close() error {
+	c.closeOnce.Do(func() { close(c.closing) })
 	err := c.w.c.Close()
 	<-c.done
 	return err
 }
+
+// Notifications delivers server-pushed messages. It is closed when the
+// connection ends. Clients that expect notifications must keep reading it,
+// since a full channel stalls call responses too.
+func (c *Client) Notifications() <-chan Notification { return c.notes }
 
 // Call invokes method and decodes the result into result, which may be nil.
 func (c *Client) Call(ctx context.Context, method string, params, result any) error {
@@ -102,9 +119,16 @@ func (c *Client) readLoop() {
 		if err := dec.Decode(&m); err != nil {
 			break
 		}
+		if len(m.ID) == 0 && m.Method != "" {
+			select {
+			case c.notes <- Notification{Method: m.Method, Params: m.Params}:
+			case <-c.closing:
+			}
+			continue
+		}
 		id, perr := strconv.ParseInt(string(m.ID), 10, 64)
 		if perr != nil {
-			continue // notification or unknown id
+			continue // unknown id
 		}
 		c.mu.Lock()
 		ch := c.pending[id]
@@ -116,5 +140,6 @@ func (c *Client) readLoop() {
 	c.mu.Lock()
 	c.err = ErrClosed
 	c.mu.Unlock()
+	close(c.notes)
 	close(c.done)
 }

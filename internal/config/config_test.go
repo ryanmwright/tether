@@ -70,9 +70,11 @@ func TestParseErrors(t *testing.T) {
 		{
 			"collects all profile errors",
 			"[profiles.p]\nforwards = [\"\"]\n[[profiles.p.mounts]]\ndirection = \"sideways\"",
-			[]string{"profiles.p.host: required", "forwards[0]: empty", "mounts[0].direction", "mounts[0]: remote and local are required"},
+			[]string{"profiles.p.host: required", "forwards[0]: invalid forward", "mounts[0]: remote and local are required"},
 		},
 		{"unknown host", "[profiles.p]\nhost = \"nope\"", []string{`unknown host "nope"`}},
+		{"bad mount", "[hosts.h]\n[profiles.p]\nhost = \"h\"\n[[profiles.p.mounts]]\ndirection = \"sideways\"\nremote = \"x\"\nlocal = \"rel/path\"\n", []string{"mounts[0]: direction must be"}},
+		{"relative mount", "[hosts.h]\n[profiles.p]\nhost = \"h\"\n[[profiles.p.mounts]]\ndirection = \"remote-to-local\"\nremote = \"x\"\nlocal = \"rel/path\"\n", []string{"must be absolute or start with ~/"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
