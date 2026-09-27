@@ -3,6 +3,7 @@ package tray
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"image/png"
 	"os/exec"
 	"strings"
@@ -43,21 +44,45 @@ func find(items []Item, id string) *Item {
 }
 
 func TestSummary(t *testing.T) {
-	if state, text := Summary(sample); state != api.StateError || text != "1 up, 1 error" {
-		t.Errorf("sample: %s %q", state, text)
+	hosts := func(states ...api.State) api.Status {
+		var st api.Status
+		for i, s := range states {
+			st.Hosts = append(st.Hosts, api.HostStatus{Name: fmt.Sprint("h", i), State: s})
+		}
+		return st
 	}
-	if state, text := Summary(api.Status{Hosts: []api.HostStatus{{State: api.StateDown}}}); state != api.StateDown || text != "nothing connected" {
-		t.Errorf("idle: %s %q", state, text)
+	up, down, pending, degraded, failed := api.StateUp, api.StateDown, api.StatePending, api.StateDegraded, api.StateError
+	tests := []struct {
+		st   api.Status
+		look Look
+		text string
+	}{
+		{api.Status{}, LookIdle, "no hosts"},
+		{hosts(down, down), LookIdle, "2 hosts: 2 disconnected"},
+		{hosts(up, up), LookUp, "2 hosts: 2 up"},
+		{hosts(up), LookUp, "1 host: 1 up"},
+		// Green only when every host is connected.
+		{hosts(up, down), LookPartial, "2 hosts: 1 up, 1 disconnected"},
+		{hosts(up, pending, down), LookBusy, "3 hosts: 1 up, 1 connecting, 1 disconnected"},
+		{hosts(up, degraded), LookBusy, "2 hosts: 1 up, 1 degraded"},
+		{hosts(up, up, failed, down), LookError, "4 hosts: 2 up, 1 failed, 1 disconnected"},
 	}
-	if state, _ := Summary(api.Status{Hosts: []api.HostStatus{{State: api.StateUp}, {State: api.StatePending}}}); state != api.StateDegraded {
-		t.Errorf("pending counts as not-yet-fine: %s", state)
+	for _, tt := range tests {
+		look, text := Summary(tt.st)
+		if look != tt.look || text != tt.text {
+			t.Errorf("%v: got %s %q, want %s %q", tt.st.Hosts, look, text, tt.look, tt.text)
+		}
+	}
+
+	if _, text := Summary(sample); text != "3 hosts: 1 up, 1 failed, 1 disconnected · 1/2 profiles active" {
+		t.Errorf("with profiles: %q", text)
 	}
 }
 
 func TestBuild(t *testing.T) {
 	items := Build(sample)
 
-	if it := find(items, "summary"); it == nil || it.Title != "tether — 1 up, 1 error" || it.Enabled {
+	if it := find(items, "summary"); it == nil || it.Title != "tether — 3 hosts: 1 up, 1 failed, 1 disconnected · 1/2 profiles active" || it.Enabled {
 		t.Errorf("summary = %+v", it)
 	}
 	if it := find(items, "host:dev:down"); it == nil || it.Action.Method != api.MethodDown {

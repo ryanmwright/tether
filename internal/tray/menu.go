@@ -50,32 +50,71 @@ var stateMark = map[api.State]string{
 	api.StateUp: "●", api.StatePending: "◌", api.StateDegraded: "◐", api.StateError: "✕", api.StateDown: "○",
 }
 
-// Summary is the overall state for the icon and a one-line tooltip. Only
-// hosts that are wanted (not down) count.
-func Summary(st api.Status) (api.State, string) {
+// Look is the icon's overall state.
+type Look string
+
+const (
+	LookUp      Look = "up"      // every host connected and healthy
+	LookPartial Look = "partial" // some hosts connected, others disconnected
+	LookBusy    Look = "busy"    // connecting, or connected with problems
+	LookError   Look = "error"   // a connection is failing
+	LookIdle    Look = "idle"    // nothing connected
+)
+
+// Summary picks the icon's look and a one-line description with counts:
+// "4 hosts: 2 up, 1 failed, 1 disconnected · 1/2 profiles active".
+func Summary(st api.Status) (Look, string) {
 	counts := map[api.State]int{}
 	for _, h := range st.Hosts {
 		counts[h.State]++
 	}
-	var parts []string
-	for _, s := range []api.State{api.StateUp, api.StateDegraded, api.StatePending, api.StateError} {
-		if n := counts[s]; n > 0 {
-			parts = append(parts, fmt.Sprintf("%d %s", n, s))
-		}
-	}
-	overall := api.StateDown
+	connected := counts[api.StateUp] + counts[api.StateDegraded]
+
+	look := LookIdle
 	switch {
 	case counts[api.StateError] > 0:
-		overall = api.StateError
-	case counts[api.StateDegraded] > 0, counts[api.StatePending] > 0:
-		overall = api.StateDegraded
-	case counts[api.StateUp] > 0:
-		overall = api.StateUp
+		look = LookError
+	case counts[api.StatePending] > 0, counts[api.StateDegraded] > 0:
+		look = LookBusy
+	case connected > 0 && connected == len(st.Hosts):
+		look = LookUp
+	case connected > 0:
+		look = LookPartial
 	}
-	if len(parts) == 0 {
-		return overall, "nothing connected"
+
+	text := "no hosts"
+	if len(st.Hosts) > 0 {
+		var parts []string
+		for _, c := range []struct {
+			state api.State
+			word  string
+		}{
+			{api.StateUp, "up"}, {api.StateDegraded, "degraded"}, {api.StatePending, "connecting"},
+			{api.StateError, "failed"}, {api.StateDown, "disconnected"},
+		} {
+			if n := counts[c.state]; n > 0 {
+				parts = append(parts, fmt.Sprintf("%d %s", n, c.word))
+			}
+		}
+		text = fmt.Sprintf("%d %s: %s", len(st.Hosts), plural(len(st.Hosts), "host", "hosts"), strings.Join(parts, ", "))
 	}
-	return overall, strings.Join(parts, ", ")
+	if len(st.Profiles) > 0 {
+		active := 0
+		for _, p := range st.Profiles {
+			if p.Active {
+				active++
+			}
+		}
+		text += fmt.Sprintf(" · %d/%d %s active", active, len(st.Profiles), plural(len(st.Profiles), "profile", "profiles"))
+	}
+	return look, text
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // Build lays out the menu for a status.

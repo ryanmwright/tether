@@ -605,9 +605,19 @@ the profile (or edit the config) instead.
 
 `tether tray` puts an icon in the system tray (a StatusNotifierItem: KDE
 Plasma, and most other Linux desktops; GNOME needs the AppIndicator
-extension). The icon's color is the overall state: green when everything
-wanted is up, amber while connecting or when something is degraded, red when
-a connection is failing, gray when nothing is connected.
+extension). The icon's color is the overall state:
+
+| Color | When |
+|---|---|
+| green | every host is connected |
+| blue | some hosts are connected, others disconnected |
+| amber | a host is connecting, or connected with a failing forward or mount |
+| red | a connection is failing |
+| gray | nothing is connected |
+
+The tooltip counts hosts by state, and active profiles, e.g.
+`4 hosts: 2 up, 1 failed, 1 disconnected · 1/2 profiles active`. The same
+summary heads the menu.
 
 - **Left-click** opens the terminal UI.
 - **The menu** has a submenu per host (connect or disconnect, its forwards

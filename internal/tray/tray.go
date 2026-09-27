@@ -72,7 +72,7 @@ func Run(ctx context.Context, opts Options) error {
 	systray.Run(func() {
 		systray.SetTitle("tether")
 		systray.SetOnTapped(func() { t.run(&Action{Local: localOpenTUI}) })
-		t.render(DisconnectedMenu(), api.StateDown, "tether: connecting to the daemon…")
+		t.render(DisconnectedMenu(), LookIdle, "tether: connecting to the daemon…")
 		go t.loop(ctx)
 	}, nil)
 	return nil
@@ -86,7 +86,7 @@ func (t *tray) loop(ctx context.Context) {
 		autostart = false
 		if err != nil {
 			t.opts.Log.Debug("daemon not reachable", "err", err)
-			t.render(DisconnectedMenu(), api.StateDown, "tether: daemon not running")
+			t.render(DisconnectedMenu(), LookIdle, "tether: daemon not running")
 			select {
 			case <-ctx.Done():
 				return
@@ -118,8 +118,8 @@ func (t *tray) follow(c *rpc.Client) {
 		if err := json.Unmarshal(n.Params, &st); err != nil {
 			continue
 		}
-		state, summary := Summary(st)
-		t.render(Build(st), state, "tether: "+summary)
+		look, summary := Summary(st)
+		t.render(Build(st), look, "tether: "+summary)
 		if prev != nil && t.notifier != nil {
 			for _, notice := range Changes(*prev, st) {
 				if err := t.notifier.Show(notice); err != nil {
@@ -139,8 +139,8 @@ func (t *tray) setClient(c *rpc.Client) {
 
 // render shows items, updating the existing menu in place when its shape is
 // unchanged (so an open menu doesn't jump) and rebuilding it otherwise.
-func (t *tray) render(items []Item, state api.State, tooltip string) {
-	systray.SetIcon(Icon(state))
+func (t *tray) render(items []Item, look Look, tooltip string) {
+	systray.SetIcon(Icon(look))
 	systray.SetTooltip(tooltip)
 
 	t.mu.Lock()

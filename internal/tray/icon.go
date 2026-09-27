@@ -7,26 +7,24 @@ import (
 	"image/png"
 	"math"
 	"sync"
-
-	"github.com/ryanmwright/tether/internal/api"
 )
 
-// Icon colors, matching the TUI's state colors.
-var iconColors = map[api.State]color.NRGBA{
-	api.StateUp:       {0x2e, 0xa0, 0x43, 0xff}, // green
-	api.StateDegraded: {0xd9, 0x9a, 0x06, 0xff}, // amber
-	api.StateError:    {0xd0, 0x31, 0x2d, 0xff}, // red
-	api.StateDown:     {0x8a, 0x8f, 0x98, 0xff}, // gray
+// Icon colors. Green is reserved for "everything connected".
+var iconColors = map[Look]color.NRGBA{
+	LookUp:      {0x2e, 0xa0, 0x43, 0xff}, // green
+	LookPartial: {0x2f, 0x7d, 0xd6, 0xff}, // blue
+	LookBusy:    {0xd9, 0x9a, 0x06, 0xff}, // amber
+	LookError:   {0xd0, 0x31, 0x2d, 0xff}, // red
+	LookIdle:    {0x8a, 0x8f, 0x98, 0xff}, // gray
 }
 
 var (
 	iconMu    sync.Mutex
-	iconCache = map[api.State][]byte{}
+	iconCache = map[Look][]byte{}
 )
 
-// Icon returns a PNG for an overall state: two linked rings (a tether) in
-// the state's color.
-func Icon(state api.State) []byte {
+// Icon returns a PNG for a look: two linked rings (a tether) in its color.
+func Icon(state Look) []byte {
 	iconMu.Lock()
 	defer iconMu.Unlock()
 	if b, ok := iconCache[state]; ok {
@@ -34,7 +32,7 @@ func Icon(state api.State) []byte {
 	}
 	c, ok := iconColors[state]
 	if !ok {
-		c = iconColors[api.StateDown]
+		c = iconColors[LookIdle]
 	}
 	const size = 64
 	img := image.NewNRGBA(image.Rect(0, 0, size, size))
