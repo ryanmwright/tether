@@ -1,0 +1,150 @@
+# tether — forwarding manager for remote development
+
+One binary, `tether`. `tether daemon` runs the daemon; every other subcommand is a client.
+
+## Decisions
+
+| Topic | Decision |
+|---|---|
+| Name | `tether` (no clashes in nixpkgs or with tunnel tools; `burrow`/`hitch` rejected for clashes) |
+| Language | Go |
+| SSH layer | Wrap system OpenSSH (one ControlMaster per host) |
+| Mounts | Live FUSE mounts (sshfs; reverse sshfs for local→remote) |
+| Platform (local side) | Linux only (systemd --user, D-Bus, FUSE available) |
+| Remote requirements | `sshd` only; `sshfs` + FUSE only for local→remote mounts. No remote agent. |
+| Local machine | Fedora + Nix + home-manager (primary). Also installable without Nix (`go install` / release binary). |
+| Remotes | Mostly NixOS (we ship a NixOS module for remote-side setup), some Debian (`doctor` prints manual fixes). |
+| GPG | Commit signing, `pass`/decryption, **and** gpg-agent as the SSH agent (forward the ssh socket too). |
+| Bastion / multi-hop | `ProxyJump` plus forwards to third-party hosts; no custom hop chains for now |
+| home-manager | Installs package + systemd user unit; generates `config.toml` only if `settings` is set, otherwise leaves a hand-edited file alone |
+| Autoconnect | Per host or profile `autoconnect` flag (start at login, reconnect on network change); otherwise on demand. |
+
+## Architecture
+
+```
+ tether (CLI)   tether tui   tray (future)
+       \            |            /
+        Unix socket API  ($XDG_RUNTIME_DIR/tether/tether.sock)
+        JSON-RPC 2.0 requests + server-pushed event stream
+                    |
+               tether daemon (systemd --user; CLI can also start it on demand)
+               ├── config loader + watcher (TOML)
+               ├── state store (desired vs. actual)
+               ├── reconciler / supervisor (backoff, health checks, netlink/NM watch)
+               └── per-host session
+                    ├── ControlMaster process   ssh -MNf -S <sock> <host>
+                    ├── forwards                ssh -S <sock> -O forward|cancel
+                    ├── gpg forward             unix RemoteForward
+                    └── mounts                  sshfs / reverse-sshfs child processes
+```
+
+### Core ideas
+- **The daemon owns all state.** CLI, TUI and tray are thin clients of the same API, so adding a GUI later means writing only a new client.
+- **Declarative config plus a reconciler.** The config and ad-hoc CLI commands make up the *desired* state. The daemon keeps the *actual* state matching it and heals it after drops, reconnects and network changes.
+- **Reuse the user's `~/.ssh/config`.** A host is usually just an ssh alias, so bastion hosts come from `ProxyJump`. Keys, FIDO, known_hosts and agents all work unchanged.
+- **Each item has an ID and a status** (`pending | up | degraded | down | error(msg)`), streamed to clients as events.
+
+## Feature mechanics
+
+### 1. Port forwarding
+- Local `L:[bind:]port:host:hostport`, remote `R:[bind:]port:host:hostport`, dynamic `D:[bind:]port` (SOCKS).
+- Added and removed live on the master: `ssh -S sock -O forward -L ...` / `-O cancel`.
+- Bastion hosts: `ProxyJump` in ssh config, or a forward whose target is a third-party host reachable from the remote.
+- Unix-socket forwards are supported too (useful for docker.sock, etc.).
+- Before adding a forward, check whether the local port is already in use and report a clear error.
+
+### 2. GPG agent forwarding
+- Local side: `gpgconf --list-dirs agent-extra-socket`.
+- Remote side: run `gpgconf --list-dirs agent-socket` over the master once and cache the result.
+- Before forwarding, remove the stale remote socket (`rm -f`) so that `StreamLocalBindUnlink yes` is not *required* in the remote sshd config (still recommended).
+- `tether doctor <host>` checks that the remote gpg-agent socket activation is masked, the public keys are present on the remote, and the socket is reachable.
+- **SSH via gpg-agent:** also forward the local `gpgconf --list-dirs agent-ssh-socket` to a stable remote path (e.g. `$XDG_RUNTIME_DIR/tether/ssh-agent.sock`). The remote shell points `SSH_AUTH_SOCK` there, either through the NixOS module or through a snippet that `doctor` prints for Debian.
+- Remote-side NixOS module (`tether.remote.enable`): sets `StreamLocalBindUnlink yes`, disables gpg-agent socket activation for the user, enables FUSE `user_allow_other` if needed, and sets `SSH_AUTH_SOCK`.
+
+### 3. Mounts (live FUSE)
+- **remote→local:** `sshfs -o ssh_command='ssh -S <ctlsock>' host:path localpath`, reusing the master connection.
+- **local→remote (reverse sshfs):** the local `sftp-server` is connected to `ssh -S sock host sshfs -o passive :<localpath> <remotepath>` through stdin/stdout. The daemon owns both processes and does the plumbing in Go, so `dpipe` is not needed.
+- Unmount cleanly with `fusermount3 -u` on stop, and lazily when the connection dies. On reconnect, stale mount points are detected and cleaned up.
+- The `sshfs` flags are set per mount (`reconnect`, `ServerAliveInterval`, cache options).
+- **Fedora + Nix gotcha:** an `sshfs` built by Nix on a non-NixOS system still needs the setuid `/usr/bin/fusermount3` from the host. Resolve `fusermount3` from the system path first and check this in `doctor`.
+
+### 4. USB forwarding (future)
+- USB/IP: the local `usbipd` is exported through a reverse forward on port 3240, and the remote runs `usbip attach`. Both sides need root and kernel modules, so this is kept behind a separate privileged helper.
+
+## Config (`~/.config/tether/config.toml`)
+
+```toml
+[defaults]
+reconnect_backoff = "1s..60s"
+
+[hosts.devbox]
+ssh = "devbox"              # ~/.ssh/config alias
+autoconnect = false
+
+[profiles.work]
+host = "devbox"
+gpg = true
+forwards = [
+  "L:5432:db.internal:5432",
+  "R:8080:localhost:3000",
+  "D:1080",
+]
+[[profiles.work.mounts]]
+direction = "remote-to-local"
+remote = "~/src"
+local = "~/mnt/devbox/src"
+```
+
+- A profile is a named bundle of forwards, gpg and mounts on one host. Several profiles can be active on one host and share its master connection.
+- Runtime/ad-hoc items are marked `ephemeral` and are not written back to the config unless `--save` is given.
+
+## CLI surface (draft)
+
+```
+tether up <profile|host>          tether down <profile|host>
+tether status [--json] [-w]       tether tui
+tether fwd add <host> L:5432:db:5432 [--save]
+tether fwd rm <id>
+tether mount <host> remote:~/src ~/mnt/src
+tether gpg on|off <host>
+tether doctor <host>              tether logs [-f]
+tether daemon                     tether daemon stop
+tether config check|reload        tether version
+```
+
+## Project layout
+
+```
+cmd/tether/          single binary: CLI, `daemon` subcommand, TUI (cobra)
+internal/api/        method names + result types shared by daemon and clients
+internal/rpc/        minimal JSON-RPC 2.0 over newline-delimited JSON
+internal/paths/      XDG config/runtime paths
+internal/client/     socket client library (used by CLI, TUI, tray)
+internal/config/     TOML schema, validation, watcher
+internal/daemon/     server, state store, reconciler
+internal/ssh/        ControlMaster mgmt, -O forward/cancel, remote exec
+internal/forward/    forward spec parsing + lifecycle
+internal/gpg/        gpg socket discovery + forwarding
+internal/mount/      sshfs + reverse-sshfs
+internal/tui/        Bubble Tea app
+nix/                 package, home-manager module (flake.nix at the root)
+```
+
+Libraries: `cobra` (CLI), `bubbletea`/`lipgloss`/`bubbles` (TUI), `BurntSushi/toml` or `pelletier/go-toml/v2`, `log/slog`, `godbus/dbus` (NetworkManager signals and, later, the tray).
+
+## Phases
+
+0. ✅ **Skeleton:** Go module, flake devshell, `tether daemon`, socket API with `status`, config loading, systemd user unit.
+1. **SSH plus forwards:** master lifecycle, L/R/D forwards, reconnect and backoff, event stream, `up`/`down`/`fwd`/`status -w`.
+2. **GPG:** socket discovery, forwarding, `doctor`.
+3. **TUI:** host and profile tree, live status, toggles, log pane.
+4. **Mounts:** sshfs in both directions, cleanup and recovery.
+5. **Tray:** KDE StatusNotifierItem client (separate binary `tether-tray`).
+6. **USB/IP.**
+
+## Testing
+- Unit tests: spec parsing, config validation, reconciler (with a fake SSH layer behind an interface).
+- Integration tests: an `sshd` container or a NixOS VM test (`nixosTest`) with two nodes, covering forwards, gpg and sshfs from start to finish.
+
+## Open questions
+- Go module path (currently just `tether`; switch to the real repo URL once it's hosted).
