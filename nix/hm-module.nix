@@ -40,6 +40,22 @@ in
       '';
     };
 
+    tray = {
+      enable = lib.mkEnableOption "the tether tray icon (StatusNotifierItem), started with the graphical session";
+
+      extraArgs = lib.mkOption {
+        type = with lib.types; listOf str;
+        default = [ ];
+        example = [
+          "--terminal"
+          "konsole"
+          "--terminal"
+          "-e"
+        ];
+        description = "Extra arguments for `tether tray`, e.g. the terminal to open the TUI in.";
+      };
+    };
+
     service = {
       enable = lib.mkOption {
         type = lib.types.bool;
@@ -66,6 +82,13 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = !cfg.tray.enable || cfg.service.enable;
+        message = "programs.tether.tray needs programs.tether.service.enable (the tray talks to the daemon).";
+      }
+    ];
+
     home.packages = [ cfg.package ];
 
     xdg.configFile."tether/config.toml" = lib.mkIf (cfg.settings != null) {
@@ -84,6 +107,32 @@ in
         Environment = [ "PATH=${lib.concatStringsSep ":" cfg.service.path}" ];
       };
       Install.WantedBy = [ "default.target" ];
+    };
+
+    systemd.user.services.tether-tray = lib.mkIf cfg.tray.enable {
+      Unit = {
+        Description = "tether tray icon";
+        PartOf = [ "graphical-session.target" ];
+        After = [
+          "graphical-session.target"
+          "tray.target"
+          "tether.service"
+        ];
+        Wants = [ "tether.service" ];
+      };
+      Service = {
+        ExecStart = lib.escapeShellArgs (
+          [
+            (lib.getExe cfg.package)
+            "tray"
+          ]
+          ++ cfg.tray.extraArgs
+        );
+        Restart = "on-failure";
+        RestartSec = 2;
+        Environment = [ "PATH=${lib.concatStringsSep ":" cfg.service.path}" ];
+      };
+      Install.WantedBy = [ "graphical-session.target" ];
     };
   };
 }

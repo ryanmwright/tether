@@ -11,14 +11,14 @@ your SSH connections to dev machines up and manages what flows over them:
   local directory on the remote (sshfs over the same connection)
 - Later: USB forwarding (USB/IP)
 
-You drive it from the CLI or a terminal UI (and later a KDE tray icon). It uses your
+You drive it from the CLI, a terminal UI, or a system tray icon. It uses your
 system OpenSSH, so everything in `~/.ssh/config` (`ProxyJump`, keys, FIDO
 tokens, `known_hosts`) works as it already does.
 
 > **Status: early development.** Connections, port forwards (`L`/`R`/`D`,
 > TCP and Unix sockets), automatic reconnects, gpg-agent forwarding, directory
-> mounts, profiles, `tether doctor`, the CLI and the terminal UI work today.
-> See [PLAN.md](PLAN.md) for the roadmap.
+> mounts, profiles, `tether doctor`, the CLI, the terminal UI and the tray icon
+> work today. See [PLAN.md](PLAN.md) for the roadmap.
 
 ## Contents
 
@@ -32,6 +32,7 @@ tokens, `known_hosts`) works as it already does.
 - [gpg-agent forwarding](#gpg-agent-forwarding)
 - [Directory mounts](#directory-mounts)
 - [Terminal UI](#terminal-ui)
+- [Tray icon](#tray-icon)
 - [CLI](#cli)
 - [Paths and environment variables](#paths-and-environment-variables)
 - [Development](#development)
@@ -174,6 +175,8 @@ All module options:
 | `programs.tether.package` | the flake's package | Package to use. |
 | `programs.tether.settings` | `null` | Config file contents as a Nix attrset. `null` means the file is not managed. |
 | `programs.tether.service.enable` | `true` | Install `tether.service` and start it at login (`default.target`). |
+| `programs.tether.tray.enable` | `false` | Start the [tray icon](#tray-icon) with the graphical session. |
+| `programs.tether.tray.extraArgs` | `[]` | Extra `tether tray` arguments, e.g. `--terminal`. |
 | `programs.tether.service.path` | see below | `PATH` for the daemon, used to find `ssh`, `sshfs`, `gpgconf` and `fusermount3`. |
 
 `service.path` defaults to
@@ -598,6 +601,53 @@ enter toggle · a add forward · g gpg · d doctor · r reload · l log · ? hel
 Forwards that come from a profile can't be removed on their own; deactivate
 the profile (or edit the config) instead.
 
+## Tray icon
+
+`tether tray` puts an icon in the system tray (a StatusNotifierItem: KDE
+Plasma, and most other Linux desktops; GNOME needs the AppIndicator
+extension). The icon's color is the overall state: green when everything
+wanted is up, amber while connecting or when something is degraded, red when
+a connection is failing, gray when nothing is connected.
+
+- **Left-click** opens the terminal UI.
+- **The menu** has a submenu per host (connect or disconnect, its forwards
+  and mounts with their state, retry, toggle gpg-agent forwarding, and forget
+  for ad-hoc hosts), your profiles as checkboxes, "Connect to host…" (asks
+  for `NAME [SSH-DEST]` with `kdialog` or `zenity`), and reload.
+- **Desktop notifications** say when a connection drops or comes back, and
+  when a forward or mount fails. Later news about the same thing replaces the
+  earlier notification. Turn them off with `--no-notify`.
+
+If the daemon isn't running, the icon turns gray and the menu offers to start
+it; the tray reconnects on its own when the daemon comes back. Quitting the
+tray leaves everything running.
+
+The terminal UI opens in `$TERMINAL`, or the first of konsole, kgx,
+gnome-terminal, kitty, alacritty, foot, wezterm, xfce4-terminal and xterm
+that's installed. Pick one with `--terminal`, one word per flag:
+`tether tray --terminal konsole --terminal -e`.
+
+**Start it with your desktop session.** With home-manager:
+
+```nix
+programs.tether.tray = {
+  enable = true;
+  # extraArgs = [ "--terminal" "konsole" "--terminal" "-e" ];
+};
+```
+
+This adds a `tether-tray.service` user unit tied to your graphical session.
+Without home-manager, add an autostart entry:
+
+```ini
+# ~/.config/autostart/tether-tray.desktop
+[Desktop Entry]
+Type=Application
+Name=tether
+Exec=tether tray
+X-KDE-autostart-phase=2
+```
+
 ## CLI
 
 ```
@@ -613,6 +663,8 @@ tether gpg on HOST [--ssh]        forward gpg-agent (and its SSH socket) ad hoc
 tether gpg off HOST [--ssh]       stop it
 tether doctor HOST [--json]       check local, connection and remote setup
 tether tui                        interactive terminal UI
+tether tray [--no-notify]         system tray icon
+  --terminal WORD                 terminal for the TUI (repeat per word)
 tether logs [-f] [-n 50]          the daemon's recent log (it keeps 500 entries)
 tether mount add HOST SRC DST     mount SRC at DST; one side is remote:PATH
   -o OPTION                       extra sshfs option (repeatable)

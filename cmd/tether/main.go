@@ -62,6 +62,7 @@ func newRootCmd() *cobra.Command {
 		newDoctorCmd(g),
 		newLogsCmd(g),
 		newTUICmd(g),
+		newTrayCmd(g),
 		newConfigCmd(g),
 		&cobra.Command{
 			Use:   "version",

@@ -141,7 +141,7 @@ Libraries: `cobra` (CLI), `bubbletea`/`lipgloss`/`bubbles` (TUI), `BurntSushi/to
 2. ✅ **GPG:** socket discovery, forwarding, `doctor`.
 3. ✅ **TUI:** host and profile tree, live status, toggles, log pane.
 4. ✅ **Mounts:** sshfs in both directions, cleanup and recovery.
-5. **Tray:** KDE StatusNotifierItem client (separate binary `tether-tray`).
+5. ✅ **Tray:** KDE StatusNotifierItem client (`tether tray`, via `fyne.io/systray`), desktop notifications, home-manager `programs.tether.tray`.
 6. **USB/IP.**
 
 ## Testing
