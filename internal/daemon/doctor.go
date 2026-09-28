@@ -13,6 +13,7 @@ import (
 
 	"github.com/ryanmwright/tether/internal/api"
 	"github.com/ryanmwright/tether/internal/gpg"
+	"github.com/ryanmwright/tether/internal/kube"
 	"github.com/ryanmwright/tether/internal/mount"
 	"github.com/ryanmwright/tether/internal/openssh"
 	"github.com/ryanmwright/tether/internal/rpc"
@@ -28,7 +29,10 @@ type doctor struct {
 	useGPG, gpgSSH bool
 	mountHere      bool // remote directories mounted on this machine
 	mountThere     bool // local directories mounted on the remote
-	useUSB         bool // USB devices shared with the host
+	local          bool // the host is this machine
+	kube           *kube.Options
+	kubeTargets    []kube.Source // claims mounted from the host
+	useUSB         bool          // USB devices shared with the host
 	usbHelper      func(context.Context) (int, error)
 	checks         []api.Check
 }
@@ -45,7 +49,7 @@ func (d *Daemon) handleDoctor(ctx context.Context, params json.RawMessage) (any,
 	d.mu.Lock()
 	host, ok := d.host(p.Host)
 	var s *session
-	dr := &doctor{host: p.Host, dest: host.SSH, usbHelper: d.usb.Port}
+	dr := &doctor{host: p.Host, dest: host.SSH, local: host.Local, usbHelper: d.usb.Port}
 	if ok {
 		s = d.sessions[p.Host].s
 		// Check gpg if anything could forward it to this host.
@@ -63,7 +67,9 @@ func (d *Daemon) handleDoctor(ctx context.Context, params json.RawMessage) (any,
 		for _, prof := range d.cfg.Profiles {
 			if prof.Host == p.Host {
 				for _, m := range prof.Mounts {
-					specs = append(specs, m.Spec())
+					if spec, err := m.Spec(host); err == nil {
+						specs = append(specs, spec)
+					}
 				}
 			}
 		}
@@ -71,8 +77,16 @@ func (d *Daemon) handleDoctor(ctx context.Context, params json.RawMessage) (any,
 			specs = append(specs, wm.spec)
 		}
 		for _, spec := range specs {
-			dr.mountHere = dr.mountHere || spec.Direction == mount.RemoteToLocal
+			dr.mountHere = dr.mountHere || spec.Direction == mount.RemoteToLocal || spec.Direction == mount.PVCToLocal
 			dr.mountThere = dr.mountThere || spec.Direction == mount.LocalToRemote
+			if spec.Kube != nil {
+				dr.kubeTargets = append(dr.kubeTargets, *spec.Kube)
+			}
+		}
+		if host.Local || len(dr.kubeTargets) > 0 {
+			opts := host.Kube.Options()
+			dr.kube = &opts
+			dr.mountHere = true
 		}
 		dr.useUSB = len(d.adhocUSB[p.Host]) > 0
 		for _, prof := range d.cfg.Profiles {
@@ -86,6 +100,11 @@ func (d *Daemon) handleDoctor(ctx context.Context, params json.RawMessage) (any,
 
 	ctx, cancel := context.WithTimeout(ctx, doctorTimeout)
 	defer cancel()
+	if dr.local {
+		dr.checkLocalMounts()
+		dr.checkKube(ctx, openssh.StartLocal(d.log))
+		return api.DoctorResult{Host: p.Host, Checks: dr.checks}, nil
+	}
 	dr.checkLocal(ctx)
 
 	m := s.liveMaster()
@@ -147,6 +166,7 @@ func (dr *doctor) checkLocal(ctx context.Context) {
 }
 
 func (dr *doctor) checkRemote(ctx context.Context, m *openssh.Master) {
+	dr.checkKube(ctx, m)
 	dr.checkRemoteMounts(ctx, m)
 	dr.checkRemoteUSB(ctx, m)
 	dr.checkRemoteGPG(ctx, m)
@@ -226,7 +246,64 @@ func (dr *doctor) checkLocalMounts() {
 		dr.add("local", "mounts", api.CheckFail, strings.Join(problems, "; "), strings.Join(fixes, "; "))
 		return
 	}
-	dr.add("local", "mounts", api.CheckOK, "sshfs and FUSE available for remote directories", "")
+	dr.add("local", "mounts", api.CheckOK, "sshfs and FUSE available for remote directories and claims", "")
+}
+
+// checkKube checks that kubectl works on the host and may run helper pods
+// where claims are mounted from.
+func (dr *doctor) checkKube(ctx context.Context, m *openssh.Master) {
+	if dr.kube == nil {
+		return
+	}
+	section := "remote"
+	if dr.local {
+		section = "local"
+	}
+	opts := *dr.kube
+	version, err := kube.ClientVersion(ctx, m, opts)
+	if err != nil {
+		dr.add(section, "kubectl", api.CheckFail, err.Error(),
+			fmt.Sprintf("install kubectl on %s, or set hosts.%s.kube.kubectl (and kubeconfig) if it isn't on the PATH of a non-interactive shell", dr.host, dr.host))
+		return
+	}
+	dr.add(section, "kubectl", api.CheckOK, version, "")
+	current, err := kube.CurrentContext(ctx, m, opts)
+	if err != nil {
+		dr.add(section, "kube context", api.CheckWarn, err.Error(), "name the context in each claim, or set one with kubectl config use-context")
+	} else {
+		dr.add(section, "kube context", api.CheckOK, "current context "+current, "")
+	}
+
+	// Check permissions where claims are mounted from, or in the current
+	// context's default namespace.
+	targets := dr.kubeTargets
+	if len(targets) == 0 {
+		targets = []kube.Source{{Context: current}}
+	}
+	seen := map[string]bool{}
+	for _, t := range targets {
+		if t.Context == "" {
+			t.Context = current
+		}
+		where := t.Context + "/" + t.Namespace
+		if t.Namespace == "" {
+			where = t.Context
+		}
+		if t.Context == "" || seen[where] {
+			continue
+		}
+		seen[where] = true
+		missing, err := kube.MissingPermissions(ctx, m, opts, t.Context, t.Namespace)
+		switch {
+		case err != nil:
+			dr.add(section, "kube access", api.CheckFail, where+": "+err.Error(), "")
+		case len(missing) > 0:
+			dr.add(section, "kube access", api.CheckFail, where+": not allowed to "+strings.Join(missing, ", "),
+				"helper pods need create/get/delete on pods and create on pods/exec and pods/attach in the claim's namespace")
+		default:
+			dr.add(section, "kube access", api.CheckOK, where+": may run helper pods", "")
+		}
+	}
 }
 
 // setuidFusermount reports whether a usable (setuid) fusermount is around.

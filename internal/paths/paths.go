@@ -29,6 +29,16 @@ func RuntimeDir() string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("%s-%d", app, os.Getuid()))
 }
 
+// StateDir is $XDG_STATE_HOME/tether, by default ~/.local/state/tether.
+func StateDir() string {
+	dir := os.Getenv("XDG_STATE_HOME")
+	if dir == "" {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, ".local", "state")
+	}
+	return filepath.Join(dir, app)
+}
+
 func SocketPath() string {
 	return filepath.Join(RuntimeDir(), app+".sock")
 }

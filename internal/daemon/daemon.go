@@ -26,6 +26,7 @@ import (
 	"github.com/ryanmwright/tether/internal/config"
 	"github.com/ryanmwright/tether/internal/forward"
 	"github.com/ryanmwright/tether/internal/gpg"
+	"github.com/ryanmwright/tether/internal/kube"
 	"github.com/ryanmwright/tether/internal/mount"
 	"github.com/ryanmwright/tether/internal/netwatch"
 	"github.com/ryanmwright/tether/internal/openssh"
@@ -43,6 +44,12 @@ type Options struct {
 	SSH        openssh.Options
 	// USBHelperSocket is the USB/IP helper's control socket.
 	USBHelperSocket string
+	// NoLocalHost leaves out the built-in local host even if kubectl is
+	// installed.
+	NoLocalHost bool
+	// RecentFile keeps the claims mounted lately across restarts; if empty,
+	// they're only kept in memory.
+	RecentFile string
 }
 
 type Daemon struct {
@@ -62,9 +69,11 @@ type Daemon struct {
 	adhocUSB   map[string]map[string]wantUSB     // host -> device spec -> device
 	adhocHosts map[string]config.Host            // hosts added at runtime, not in the config
 	home       string                            // for ~ in local mount paths
+	kubectl    bool                              // kubectl is installed here: offer the built-in local host
 	autoSeen   map[string]bool                   // "host/x", "profile/x" -> autoconnect as last applied
 	sessions   map[string]*sessionHandle
 	usb        *localUSB
+	recent     map[string][]api.RecentPVC // host -> claims mounted lately, newest first
 
 	gen    atomic.Uint64 // see api.Status.Generation
 	logs   *logRing
@@ -108,6 +117,9 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	defer d.usb.helper.Close()
 	d.home, _ = os.UserHomeDir()
+	_, noKubectl := exec.LookPath("kubectl")
+	d.kubectl = noKubectl == nil && !opts.NoLocalHost
+	d.recent = loadRecent(opts.RecentFile)
 	d.logs = &logRing{publish: d.publishLog}
 	d.log = slog.New(&logTee{inner: opts.Logger.Handler(), ring: d.logs})
 
@@ -159,6 +171,8 @@ func Run(ctx context.Context, opts Options) error {
 	srv.Handle(api.MethodMountRemove, d.handleMountRemove)
 	srv.Handle(api.MethodUSBAttach, d.handleUSBAttach)
 	srv.Handle(api.MethodUSBDetach, d.handleUSBDetach)
+	srv.Handle(api.MethodKubeList, d.handleKubeList)
+	srv.Handle(api.MethodKubeGC, d.handleKubeGC)
 	srv.Handle(api.MethodLogs, func(_ context.Context, params json.RawMessage) (any, error) {
 		p, err := decode[api.LogsParams](orEmpty(params))
 		if err != nil {
@@ -294,21 +308,30 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	d.recompute()
 }
 
-// host looks up a host in the config or among ad-hoc hosts. Callers hold
-// d.mu.
+// host looks up a host in the config, among ad-hoc hosts, or the built-in
+// local host. Callers hold d.mu.
 func (d *Daemon) host(name string) (config.Host, bool) {
 	if h, ok := d.cfg.Hosts[name]; ok {
 		return h, true
 	}
-	h, ok := d.adhocHosts[name]
-	return h, ok
+	if h, ok := d.adhocHosts[name]; ok {
+		return h, true
+	}
+	if name == config.LocalHost && d.kubectl && d.cfg.Defaults.LocalHost {
+		return config.Host{Local: true}, true
+	}
+	return config.Host{}, false
 }
 
-// hostNames lists configured and ad-hoc hosts, sorted. Callers hold d.mu.
+// hostNames lists configured, ad-hoc and built-in hosts, sorted. Callers
+// hold d.mu.
 func (d *Daemon) hostNames() []string {
 	names := slices.Collect(maps.Keys(d.cfg.Hosts))
 	for name := range d.adhocHosts {
 		names = append(names, name)
+	}
+	if _, ok := d.host(config.LocalHost); ok && !slices.Contains(names, config.LocalHost) {
+		names = append(names, config.LocalHost)
 	}
 	slices.Sort(names)
 	return names
@@ -344,7 +367,7 @@ func (d *Daemon) recompute() {
 				wf.adhoc = w.forwards[key].adhoc
 				w.forwards[key] = wf
 			}
-			for key, wm := range profileMounts(p, d.home) {
+			for key, wm := range profileMounts(p, host, d.home) {
 				wm.profiles = append(w.mounts[key].profiles, pname)
 				w.mounts[key] = wm
 			}
@@ -372,7 +395,7 @@ func (d *Daemon) recompute() {
 			w.forwards[key] = wf
 		}
 		if wanted {
-			w.dest = host.SSH
+			w.dest = host.Dest()
 		} else {
 			w.forwards, w.mounts, w.usb = nil, nil, nil
 		}
@@ -418,11 +441,15 @@ func profileForwards(p config.Profile) map[string]wantForward {
 	return fwds
 }
 
-// profileMounts is every mount a profile asks for, by key.
-func profileMounts(p config.Profile, home string) map[string]wantMount {
+// profileMounts is every mount a profile on host asks for, by key.
+func profileMounts(p config.Profile, host config.Host, home string) map[string]wantMount {
 	mounts := map[string]wantMount{}
 	for _, m := range p.Mounts {
-		spec, _ := mount.Normalize(m.Spec(), home) // validated with the config
+		spec, err := m.Spec(host)
+		if err != nil {
+			continue // validated with the config
+		}
+		spec, _ = mount.Normalize(spec, home)
 		mounts[spec.Key()] = wantMount{spec: spec}
 	}
 	return mounts
@@ -530,8 +557,11 @@ func (d *Daemon) forwardParams(params json.RawMessage) (p api.ForwardParams, key
 	if p, err = decode[api.ForwardParams](params); err != nil {
 		return
 	}
-	if _, ok := d.host(p.Host); !ok {
+	if h, ok := d.host(p.Host); !ok {
 		err = rpc.Errorf(api.CodeNotFound, "no host named %q", p.Host)
+		return
+	} else if h.Local {
+		err = rpc.Errorf(rpc.CodeInvalidParams, "%s is this machine; it has no forwards", p.Host)
 		return
 	}
 	if key, wf, err = parseForward(p.Spec); err != nil {
@@ -574,25 +604,73 @@ func (d *Daemon) handleForwardRemove(_ context.Context, params json.RawMessage) 
 	return api.ForwardResult{Host: p.Host, Spec: key, Generation: d.gen.Load()}, nil
 }
 
-func (d *Daemon) mountParams(params json.RawMessage) (api.MountParams, mount.Spec, error) {
-	p, err := decode[api.MountParams](params)
+// mountParams checks mount params and turns them into a spec. Callers hold
+// d.mu.
+func (d *Daemon) mountParams(p api.MountParams) (mount.Spec, error) {
+	host, ok := d.host(p.Host)
+	if !ok {
+		return mount.Spec{}, rpc.Errorf(api.CodeNotFound, "no host named %q", p.Host)
+	}
+	spec := mount.Spec{Direction: mount.Direction(p.Direction), Remote: p.Remote, Local: p.Local, Options: p.Options}
+	if spec.Direction == mount.PVCToLocal {
+		if p.Kube == nil {
+			return spec, rpc.Errorf(rpc.CodeInvalidParams, "no claim given")
+		}
+		spec.Kube = &kube.Source{
+			Context: p.Kube.Context, Namespace: p.Kube.Namespace, PVC: p.Kube.PVC,
+			SubPath: p.Kube.SubPath, ReadOnly: p.Kube.ReadOnly, Opts: host.Kube.Options(),
+		}
+		if spec.Local == "" {
+			spec.Local = mount.DefaultPVCLocal(spec.Kube.Opts.MountRoot, *spec.Kube)
+		}
+	} else if host.Local {
+		return spec, rpc.Errorf(rpc.CodeInvalidParams, "%s is this machine; it can only mount claims", p.Host)
+	}
+	spec, err := mount.Normalize(spec, d.home)
 	if err != nil {
-		return p, mount.Spec{}, err
+		return spec, rpc.Errorf(rpc.CodeInvalidParams, "%v", err)
 	}
-	if _, ok := d.host(p.Host); !ok {
-		return p, mount.Spec{}, rpc.Errorf(api.CodeNotFound, "no host named %q", p.Host)
-	}
-	spec, err := mount.Normalize(mount.Spec{Direction: mount.Direction(p.Direction), Remote: p.Remote, Local: p.Local, Options: p.Options}, d.home)
-	if err != nil {
-		return p, spec, rpc.Errorf(rpc.CodeInvalidParams, "%v", err)
-	}
-	return p, spec, nil
+	return spec, nil
 }
 
-func (d *Daemon) handleMountAdd(_ context.Context, params json.RawMessage) (any, error) {
+// resolveContext fills in kubectl's current context on the host for a PVC
+// mount that doesn't name one, so the mount stays on that cluster even if
+// the current context changes. If the host isn't connected, it's left for
+// the mount to resolve each time it starts.
+func (d *Daemon) resolveContext(ctx context.Context, p *api.MountParams) {
+	if p.Kube == nil || p.Kube.Context != "" || p.Direction != string(mount.PVCToLocal) {
+		return
+	}
+	d.mu.Lock()
+	host, ok := d.host(p.Host)
+	h := d.sessions[p.Host]
+	d.mu.Unlock()
+	if !ok || h == nil {
+		return
+	}
+	m := h.s.liveMaster()
+	if m == nil && host.Local {
+		m = openssh.StartLocal(d.log)
+	}
+	if m == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, controlTimeout)
+	defer cancel()
+	if c, err := kube.CurrentContext(ctx, m, host.Kube.Options()); err == nil {
+		p.Kube.Context = c
+	}
+}
+
+func (d *Daemon) handleMountAdd(ctx context.Context, params json.RawMessage) (any, error) {
+	p, err := decode[api.MountParams](params)
+	if err != nil {
+		return nil, err
+	}
+	d.resolveContext(ctx, &p)
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	p, spec, err := d.mountParams(params)
+	spec, err := d.mountParams(p)
 	if err != nil {
 		return nil, err
 	}
@@ -600,6 +678,12 @@ func (d *Daemon) handleMountAdd(_ context.Context, params json.RawMessage) (any,
 		d.adhocMnt[p.Host] = map[string]wantMount{}
 	}
 	d.adhocMnt[p.Host][spec.Key()] = wantMount{spec: spec}
+	if k := spec.Kube; k != nil {
+		d.rememberPVC(p.Host, api.RecentPVC{
+			KubeMount: api.KubeMount{Context: k.Context, Namespace: k.Namespace, PVC: k.PVC, SubPath: k.SubPath, ReadOnly: k.ReadOnly},
+			Local:     spec.Local,
+		})
+	}
 	d.recompute()
 	d.sessions[p.Host].s.retryNow()
 	d.log.Info("ad-hoc mount added", "host", p.Host, "mount", spec.Key())
@@ -607,11 +691,33 @@ func (d *Daemon) handleMountAdd(_ context.Context, params json.RawMessage) (any,
 }
 
 func (d *Daemon) handleMountRemove(_ context.Context, params json.RawMessage) (any, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	p, spec, err := d.mountParams(params)
+	p, err := decode[api.MountParams](params)
 	if err != nil {
 		return nil, err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	spec, err := d.mountParams(p)
+	if err != nil {
+		return nil, err
+	}
+	if k := spec.Kube; k != nil && (k.Context == "" || p.Local == "") {
+		// No context or mount point given: match the claim in whichever
+		// context it was mounted from, wherever, if that's unambiguous.
+		var found []mount.Spec
+		for _, wm := range d.adhocMnt[p.Host] {
+			o := wm.spec.Kube
+			if o != nil && o.Namespace == k.Namespace && o.PVC == k.PVC &&
+				(k.Context == "" || o.Context == k.Context) && (p.Local == "" || wm.spec.Local == spec.Local) {
+				found = append(found, wm.spec)
+			}
+		}
+		if len(found) > 1 {
+			return nil, rpc.Errorf(api.CodeAmbiguous, "%s is mounted more than once; name the context and mount point", k.Ref())
+		}
+		if len(found) == 1 {
+			spec = found[0]
+		}
 	}
 	if _, ok := d.adhocMnt[p.Host][spec.Key()]; !ok {
 		return nil, rpc.Errorf(api.CodeNotFound,
@@ -628,8 +734,10 @@ func (d *Daemon) usbParams(params json.RawMessage) (api.USBParams, usbip.Spec, e
 	if err != nil {
 		return p, "", err
 	}
-	if _, ok := d.host(p.Host); !ok {
+	if h, ok := d.host(p.Host); !ok {
 		return p, "", rpc.Errorf(api.CodeNotFound, "no host named %q", p.Host)
+	} else if h.Local {
+		return p, "", rpc.Errorf(rpc.CodeInvalidParams, "%s is this machine; USB devices are already here", p.Host)
 	}
 	spec, err := usbip.ParseSpec(p.Device)
 	if err != nil {
@@ -852,6 +960,7 @@ func (d *Daemon) status() api.Status {
 		h, _ := d.host(name)
 		hs := d.sessions[name].s.status(h)
 		_, hs.AdHoc = d.adhocHosts[name]
+		hs.RecentPVCs = d.recent[name]
 		hosts[name] = hs
 		st.Hosts = append(st.Hosts, hs)
 	}
@@ -859,14 +968,15 @@ func (d *Daemon) status() api.Status {
 	for _, name := range slices.Sorted(maps.Keys(d.cfg.Profiles)) {
 		p := d.cfg.Profiles[name]
 		ps := api.ProfileStatus{Name: name, Host: p.Host, Autoconnect: p.Autoconnect, Active: d.active[name]}
-		ps.State, ps.Error = profileState(ps.Active, p, hosts[p.Host], d.home)
+		host, _ := d.host(p.Host)
+		ps.State, ps.Error = profileState(ps.Active, p, host, hosts[p.Host], d.home)
 		st.Profiles = append(st.Profiles, ps)
 	}
 	return st
 }
 
 // profileState summarizes an active profile from its host and forwards.
-func profileState(active bool, p config.Profile, hs api.HostStatus, home string) (api.State, string) {
+func profileState(active bool, p config.Profile, host config.Host, hs api.HostStatus, home string) (api.State, string) {
 	if !active {
 		return api.StateDown, ""
 	}
@@ -896,7 +1006,7 @@ func profileState(active bool, p config.Profile, hs api.HostStatus, home string)
 	for _, m := range hs.Mounts {
 		bykey[m.Key] = m
 	}
-	for _, key := range slices.Sorted(maps.Keys(profileMounts(p, home))) {
+	for _, key := range slices.Sorted(maps.Keys(profileMounts(p, host, home))) {
 		switch ms := bykey[key]; ms.State {
 		case api.StateError:
 			return api.StateDegraded, fmt.Sprintf("%s: %s", key, ms.Error)

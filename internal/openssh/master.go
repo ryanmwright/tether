@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -52,7 +53,27 @@ type Master struct {
 	stderr *linelog.Writer
 	done   chan struct{}
 	err    error // valid after done is closed
+
+	local    bool // see StartLocal
+	stopOnce sync.Once
 }
+
+// LocalDest is the destination of the built-in local host: commands run on
+// this machine instead of over SSH.
+const LocalDest = "(local)"
+
+// errLocal is returned for what only makes sense over SSH.
+var errLocal = errors.New("not supported on the local host")
+
+// StartLocal returns a Master for LocalDest. It has no connection: Run and
+// Command run shell commands here, the same way they'd run on a remote, and
+// forwards are refused. It stays "connected" until stopped.
+func StartLocal(log *slog.Logger) *Master {
+	return &Master{dest: LocalDest, log: log, local: true, done: make(chan struct{})}
+}
+
+// IsLocal reports whether m is a local Master from StartLocal.
+func (m *Master) IsLocal() bool { return m.local }
 
 // masterOptions keep the connection non-interactive and detect dead links.
 // ClearAllForwardings drops forwards from the user's ssh_config; forwards
@@ -151,6 +172,13 @@ func (m *Master) Err() error { return m.err }
 
 // Stop terminates the master and waits for it to exit.
 func (m *Master) Stop() {
+	if m.local {
+		m.stopOnce.Do(func() {
+			m.err = errors.New("stopped")
+			close(m.done)
+		})
+		return
+	}
 	select {
 	case <-m.done:
 		return
@@ -172,6 +200,9 @@ func (m *Master) Stop() {
 // ssh reports some failures only on stderr with exit status 0, so any
 // "failed" message there is treated as an error.
 func (m *Master) Forward(ctx context.Context, spec forward.Spec) (allocatedPort int, err error) {
+	if m.local {
+		return 0, errLocal
+	}
 	out, err := m.control(ctx, "forward", spec.Flag(), spec.Arg())
 	if err != nil {
 		return 0, err
@@ -187,6 +218,9 @@ func (m *Master) Forward(ctx context.Context, spec forward.Spec) (allocatedPort 
 }
 
 func (m *Master) Cancel(ctx context.Context, spec forward.Spec) error {
+	if m.local {
+		return errLocal
+	}
 	_, err := m.control(ctx, "cancel", spec.Flag(), spec.Arg())
 	return err
 }
@@ -206,6 +240,9 @@ var probeOptions = []string{
 // the connection doesn't answer within the context's deadline; a remote
 // command error (e.g. no shell access) still proves the link is alive.
 func (m *Master) Probe(ctx context.Context) error {
+	if m.local {
+		return nil
+	}
 	args := append(m.opts.baseArgs(), probeOptions...)
 	args = append(args, "-S", m.ctl, "--", m.dest, "true")
 	cmd := exec.CommandContext(ctx, m.opts.binary(), args...)
@@ -224,9 +261,14 @@ func (m *Master) Probe(ctx context.Context) error {
 // returns its standard output. On failure the error carries the first line
 // of its standard error.
 func (m *Master) Run(ctx context.Context, stdin, command string) ([]byte, error) {
-	args := append(m.opts.baseArgs(), probeOptions...)
-	args = append(args, "-S", m.ctl, "--", m.dest, command)
-	cmd := exec.CommandContext(ctx, m.opts.binary(), args...)
+	var cmd *exec.Cmd
+	if m.local {
+		cmd = exec.CommandContext(ctx, "/bin/sh", "-c", command)
+	} else {
+		args := append(m.opts.baseArgs(), probeOptions...)
+		args = append(args, "-S", m.ctl, "--", m.dest, command)
+		cmd = exec.CommandContext(ctx, m.opts.binary(), args...)
+	}
 	cmd.Stdin = strings.NewReader(stdin)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -241,8 +283,18 @@ func (m *Master) Run(ctx context.Context, stdin, command string) ([]byte, error)
 
 // Command returns an unstarted `ssh [opts] dest [remote...]` that runs over
 // the connection, e.g. Command([]string{"-s"}, "sftp") for a subsystem. It
-// dies with the daemon.
+// dies with the daemon. On a local Master the remote words are run by the
+// shell here, as sshd would run them, and ssh options aren't supported.
 func (m *Master) Command(opts []string, remote ...string) *exec.Cmd {
+	if m.local {
+		script := strings.Join(remote, " ")
+		if len(opts) > 0 {
+			script = "echo 'ssh options are not supported on the local host' >&2; exit 1"
+		}
+		cmd := exec.Command("/bin/sh", "-c", script)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
+		return cmd
+	}
 	args := append(m.opts.baseArgs(), probeOptions...)
 	args = append(args, "-S", m.ctl)
 	args = append(args, opts...)

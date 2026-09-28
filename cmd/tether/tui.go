@@ -9,7 +9,8 @@ import (
 )
 
 func newTUICmd(g *globalFlags) *cobra.Command {
-	return &cobra.Command{
+	var pvcHost string
+	cmd := &cobra.Command{
 		Use:   "tui",
 		Short: "Open the interactive terminal UI",
 		Long: "Open the interactive terminal UI: live status of hosts, forwards and\n" +
@@ -30,8 +31,14 @@ func newTUICmd(g *globalFlags) *cobra.Command {
 			if err := c.Call(ctx, api.MethodLogs, api.LogsParams{Limit: 200}, &logs); err != nil {
 				return err
 			}
-			_, err = tea.NewProgram(tui.New(c, logs), tea.WithContext(ctx)).Run()
+			m := tui.New(c, logs)
+			if pvcHost != "" {
+				m = m.WithPVCPicker(pvcHost)
+			}
+			_, err = tea.NewProgram(m, tea.WithContext(ctx)).Run()
 			return err
 		},
 	}
+	cmd.Flags().StringVar(&pvcHost, "pvc", "", "open the Kubernetes claim picker for this host")
+	return cmd
 }

@@ -98,6 +98,9 @@ func printStatus(out io.Writer, st *api.Status) {
 			detail += fmt.Sprintf(" (retry in %s)", untilRounded(*h.RetryAt))
 		}
 		ssh := h.SSH
+		if h.Local {
+			ssh = "(this machine)"
+		}
 		if h.AdHoc {
 			ssh += " (ad-hoc)"
 		}
@@ -131,7 +134,11 @@ func printStatus(out io.Writer, st *api.Status) {
 		fmt.Fprintln(tw, "\nMOUNT\tHOST\tFROM\tSTATE\tDETAIL")
 		for _, h := range st.Hosts {
 			for _, m := range h.Mounts {
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", m.Key, h.Name, source(m.Profiles, m.AdHoc), m.State, m.Error)
+				detail := m.Error
+				if detail == "" && m.Kube != nil && m.Kube.Pod != "" {
+					detail = "pod " + m.Kube.Pod + " on " + m.Kube.Node
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", m.Key, h.Name, source(m.Profiles, m.AdHoc), m.State, detail)
 			}
 		}
 	}

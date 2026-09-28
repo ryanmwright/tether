@@ -24,6 +24,8 @@ const (
 	MethodUSBDetach     = "usb.detach"
 	MethodDoctor        = "host.doctor"
 	MethodLogs          = "daemon.logs"
+	MethodKubeList      = "kube.list"
+	MethodKubeGC        = "kube.gc"
 
 	// MethodSubscribe makes the daemon push EventStatus notifications, each
 	// carrying a full Status, now and whenever anything changes; and, if
@@ -37,7 +39,7 @@ const (
 // method or field that clients rely on is added or changed, so a client can
 // tell it's talking to an older daemon left running across an upgrade.
 // Daemons from before it existed report 0.
-const ProtocolVersion = 4
+const ProtocolVersion = 5
 
 // Application error codes (outside the range reserved by JSON-RPC).
 const (
@@ -93,16 +95,20 @@ func (d USBDevice) Title() string {
 }
 
 type HostStatus struct {
-	Name        string          `json:"name"`
-	SSH         string          `json:"ssh"`
-	Autoconnect bool            `json:"autoconnect"`
-	AdHoc       bool            `json:"adhoc,omitempty"` // added with host.add, not in the config
-	State       State           `json:"state"`
-	Error       string          `json:"error,omitempty"`
-	RetryAt     *time.Time      `json:"retry_at,omitempty"` // next reconnect attempt
-	Forwards    []ForwardStatus `json:"forwards"`
-	Mounts      []MountStatus   `json:"mounts"`
-	USB         []USBStatus     `json:"usb"`
+	Name        string `json:"name"`
+	SSH         string `json:"ssh"`
+	Autoconnect bool   `json:"autoconnect"`
+	AdHoc       bool   `json:"adhoc,omitempty"` // added with host.add, not in the config
+	Local       bool   `json:"local,omitempty"` // this machine, no SSH: only PVC mounts
+	// RecentPVCs are claims mounted from this host lately, newest first, to
+	// mount again quickly.
+	RecentPVCs []RecentPVC     `json:"recent_pvcs,omitempty"`
+	State      State           `json:"state"`
+	Error      string          `json:"error,omitempty"`
+	RetryAt    *time.Time      `json:"retry_at,omitempty"` // next reconnect attempt
+	Forwards   []ForwardStatus `json:"forwards"`
+	Mounts     []MountStatus   `json:"mounts"`
+	USB        []USBStatus     `json:"usb"`
 }
 
 // USBStatus is a USB device shared with a host.
@@ -118,13 +124,36 @@ type USBStatus struct {
 
 type MountStatus struct {
 	Key       string   `json:"key"`       // e.g. "remote:~/src -> /home/me/mnt/src"
-	Direction string   `json:"direction"` // remote-to-local or local-to-remote
-	Remote    string   `json:"remote"`
+	Direction string   `json:"direction"` // remote-to-local, local-to-remote or pvc-to-local
+	Remote    string   `json:"remote"`    // for a PVC, "pvc:context/namespace/claim"
 	Local     string   `json:"local"`
 	Profiles  []string `json:"profiles,omitempty"`
 	AdHoc     bool     `json:"adhoc,omitempty"`
 	State     State    `json:"state"`
 	Error     string   `json:"error,omitempty"`
+	// Kube describes a PVC mount, and its helper pod once running.
+	Kube *KubeMountStatus `json:"kube,omitempty"`
+}
+
+// KubeMount names a Kubernetes claim to mount.
+type KubeMount struct {
+	Context   string `json:"context,omitempty"` // empty for kubectl's current context
+	Namespace string `json:"namespace"`
+	PVC       string `json:"pvc"`
+	SubPath   string `json:"sub_path,omitempty"`
+	ReadOnly  bool   `json:"read_only,omitempty"`
+}
+
+// RecentPVC is a claim mounted lately, and where.
+type RecentPVC struct {
+	KubeMount
+	Local string `json:"local"`
+}
+
+type KubeMountStatus struct {
+	KubeMount
+	Pod  string `json:"pod,omitempty"`  // the helper pod
+	Node string `json:"node,omitempty"` // where it runs
 }
 
 type ForwardStatus struct {
@@ -254,13 +283,16 @@ func (e LogEntry) Line() string {
 }
 
 // MountParams names a mount for mount.add and mount.remove. Local must be
-// absolute or start with ~/ (the daemon's home).
+// absolute or start with ~/ (the daemon's home). For direction pvc-to-local,
+// Kube names the claim instead of Remote, and an empty Local means the
+// default mount point.
 type MountParams struct {
-	Host      string   `json:"host"`
-	Direction string   `json:"direction"`
-	Remote    string   `json:"remote"`
-	Local     string   `json:"local"`
-	Options   []string `json:"options,omitempty"`
+	Host      string     `json:"host"`
+	Direction string     `json:"direction"`
+	Remote    string     `json:"remote,omitempty"`
+	Local     string     `json:"local"`
+	Options   []string   `json:"options,omitempty"`
+	Kube      *KubeMount `json:"kube,omitempty"`
 }
 
 type MountResult struct {
@@ -287,4 +319,74 @@ type USBResult struct {
 	Host       string `json:"host"`
 	Device     string `json:"device"` // canonical form
 	Generation uint64 `json:"generation"`
+}
+
+// KubeListParams asks for the claims kubectl on Host can see. An empty
+// Context means kubectl's current one; an empty Namespace means all of them.
+type KubeListParams struct {
+	Host      string `json:"host"`
+	Context   string `json:"context,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+}
+
+type KubeListResult struct {
+	Host     string   `json:"host"`
+	Context  string   `json:"context"` // the context listed
+	Current  string   `json:"current"` // kubectl's current context
+	Contexts []string `json:"contexts"`
+	PVCs     []PVC    `json:"pvcs"`
+	// MountRoot is where claims are mounted by default, as
+	// MountRoot/<context>/<namespace>/<claim>.
+	MountRoot string `json:"mount_root"`
+}
+
+// PVC is a claim as listed for picking one to mount.
+type PVC struct {
+	Namespace    string        `json:"namespace"`
+	Name         string        `json:"name"`
+	Phase        string        `json:"phase"` // Bound, Pending, Lost
+	Capacity     string        `json:"capacity,omitempty"`
+	Request      string        `json:"request,omitempty"`
+	StorageClass string        `json:"storage_class,omitempty"`
+	AccessModes  []string      `json:"access_modes,omitempty"` // abbreviated: RWO, ROX, RWX, RWOP
+	BindingMode  string        `json:"binding_mode,omitempty"` // Immediate, WaitForFirstConsumer; empty if unknown
+	Deleting     bool          `json:"deleting,omitempty"`
+	UsedBy       []PVCConsumer `json:"used_by,omitempty"`
+	// Mountable says whether a helper pod can mount it now; Note explains
+	// why not, or what mounting will do (pin to a node, provision a volume).
+	Mountable bool   `json:"mountable"`
+	Note      string `json:"note,omitempty"`
+	// Node is where the helper pod must run: the node of a pod already using
+	// a ReadWriteOnce volume.
+	Node string `json:"node,omitempty"`
+}
+
+// Ref is "namespace/claim".
+func (p PVC) Ref() string { return p.Namespace + "/" + p.Name }
+
+// Size is the claim's capacity, or its request while it has none.
+func (p PVC) Size() string {
+	if p.Capacity != "" {
+		return p.Capacity
+	}
+	return p.Request
+}
+
+// PVCConsumer is a pod that uses a claim.
+type PVCConsumer struct {
+	Pod    string `json:"pod"`
+	Node   string `json:"node,omitempty"`
+	Phase  string `json:"phase,omitempty"`
+	Tether bool   `json:"tether,omitempty"` // a tether helper pod
+}
+
+// KubeGCParams asks to delete leftover helper pods in a context (empty for
+// kubectl's current one).
+type KubeGCParams struct {
+	Host    string `json:"host"`
+	Context string `json:"context,omitempty"`
+}
+
+type KubeGCResult struct {
+	Deleted int `json:"deleted"`
 }

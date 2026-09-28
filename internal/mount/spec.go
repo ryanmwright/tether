@@ -3,11 +3,14 @@
 package mount
 
 import (
+	"errors"
 	"fmt"
 	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/ryanmwright/tether/internal/kube"
 )
 
 type Direction string
@@ -15,6 +18,7 @@ type Direction string
 const (
 	RemoteToLocal Direction = "remote-to-local" // a remote directory mounted here
 	LocalToRemote Direction = "local-to-remote" // a local directory mounted there
+	PVCToLocal    Direction = "pvc-to-local"    // a Kubernetes claim mounted here, via kubectl on the host
 )
 
 type Spec struct {
@@ -22,14 +26,21 @@ type Spec struct {
 	Remote    string // path on the remote; relative paths and ~ are from the remote home
 	Local     string // absolute path here
 	Options   []string
+	Kube      *kube.Source // the claim, for PVCToLocal
 }
 
 // RemotePrefix marks the remote side in "SRC DST" arguments, scp-style.
 const RemotePrefix = "remote:"
 
+// PVCPrefix marks a Kubernetes claim as the source: "pvc:[context/]ns/claim".
+const PVCPrefix = "pvc:"
+
 // Key identifies a mount and reads like the arguments that create it:
 // "remote:~/src -> /home/me/mnt/src" or "/home/me/proj -> remote:~/proj".
 func (s Spec) Key() string {
+	if s.Direction == PVCToLocal && s.Kube != nil {
+		return PVCPrefix + s.Kube.Ref() + " -> " + s.Local
+	}
 	if s.Direction == LocalToRemote {
 		return s.Local + " -> " + RemotePrefix + s.Remote
 	}
@@ -37,8 +48,19 @@ func (s Spec) Key() string {
 }
 
 // Parse builds a spec from a source and a mount point, one of which is
-// prefixed with "remote:".
+// prefixed with "remote:"; or from a "pvc:" source and a mount point, which
+// may be empty for the default.
 func Parse(src, dst string) (Spec, error) {
+	if ref, ok := strings.CutPrefix(src, PVCPrefix); ok {
+		k, err := kube.ParseRef(ref)
+		if err != nil {
+			return Spec{}, err
+		}
+		if strings.HasPrefix(dst, RemotePrefix) {
+			return Spec{}, fmt.Errorf("claims can only be mounted here, not at %q", dst)
+		}
+		return Spec{Direction: PVCToLocal, Local: dst, Kube: &k}, nil
+	}
 	srcRemote, dstRemote := strings.HasPrefix(src, RemotePrefix), strings.HasPrefix(dst, RemotePrefix)
 	switch {
 	case srcRemote && !dstRemote:
@@ -54,8 +76,21 @@ var optionPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_=.,:/+-]*$`)
 // Normalize validates s and puts its paths in canonical form, expanding ~ in
 // the local path with home.
 func Normalize(s Spec, home string) (Spec, error) {
-	if s.Direction != RemoteToLocal && s.Direction != LocalToRemote {
-		return s, fmt.Errorf("direction must be %q or %q", RemoteToLocal, LocalToRemote)
+	switch s.Direction {
+	case RemoteToLocal, LocalToRemote:
+		s.Kube = nil
+	case PVCToLocal:
+		if s.Kube == nil {
+			return s, errors.New("no claim given")
+		}
+		if err := s.Kube.Validate(); err != nil {
+			return s, err
+		}
+		k := *s.Kube
+		s.Kube = &k
+		s.Remote = PVCPrefix + k.Ref()
+	default:
+		return s, fmt.Errorf("direction must be %q, %q or %q", RemoteToLocal, LocalToRemote, PVCToLocal)
 	}
 
 	local := s.Local
@@ -69,6 +104,15 @@ func Normalize(s Spec, home string) (Spec, error) {
 		return s, fmt.Errorf("local path %q must be absolute or start with ~/", s.Local)
 	}
 	s.Local = filepath.Clean(local)
+
+	for _, o := range s.Options {
+		if !optionPattern.MatchString(o) {
+			return s, fmt.Errorf("invalid sshfs option %q", o)
+		}
+	}
+	if s.Direction == PVCToLocal {
+		return s, nil
+	}
 
 	remote := strings.TrimSpace(s.Remote)
 	if remote == "" || strings.ContainsAny(remote, "\x00\n") {
@@ -84,12 +128,6 @@ func Normalize(s Spec, home string) (Spec, error) {
 		remote = "~" + path.Clean("/"+remote)
 	}
 	s.Remote = strings.TrimSuffix(remote, "/") // "~/" -> "~"
-
-	for _, o := range s.Options {
-		if !optionPattern.MatchString(o) {
-			return s, fmt.Errorf("invalid sshfs option %q", o)
-		}
-	}
 	return s, nil
 }
 
@@ -118,4 +156,11 @@ func sshfsOptions(user []string) string {
 		opts = append(opts, "idmap=user")
 	}
 	return strings.Join(append(opts, user...), ",")
+}
+
+// DefaultPVCLocal is where a claim is mounted when no mount point is given:
+// root/<context>/<namespace>/<claim>, with slashes in the context name
+// replaced.
+func DefaultPVCLocal(root string, k kube.Source) string {
+	return path.Join(root, strings.ReplaceAll(k.Context, "/", "_"), k.Namespace, k.PVC)
 }

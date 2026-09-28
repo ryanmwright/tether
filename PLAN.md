@@ -16,6 +16,7 @@ One binary, `tether`. `tether daemon` runs the daemon; every other subcommand is
 | Remotes | Mostly NixOS (we ship a NixOS module for remote-side setup), some Debian (`doctor` prints manual fixes). |
 | GPG | Commit signing, `pass`/decryption, **and** gpg-agent as the SSH agent (forward the ssh socket too). |
 | Bastion / multi-hop | `ProxyJump` plus forwards to third-party hosts; no custom hop chains for now |
+| Kubernetes volumes | Helper pod + `kubectl exec sftp-server` piped to local sshfs; kubectl on a connected host (jump box) or on this machine (built-in `local` host). No in-cluster install, no ports. |
 | home-manager | Installs package + systemd user unit; generates `config.toml` only if `settings` is set, otherwise leaves a hand-edited file alone |
 | Autoconnect | Per host or profile `autoconnect` flag (start at login, reconnect on network change); otherwise on demand. |
 
@@ -77,6 +78,13 @@ One binary, `tether`. `tether daemon` runs the daemon; every other subcommand is
 - **Daemon (unprivileged):** lists devices from sysfs (polled every 2s; also how it notices a dropped attachment, from `usbip_status`), adds `R:127.0.0.1:0:127.0.0.1:<helper port>` on the host's master, and runs `sudo -n usbip --tcp-port <port> attach -r 127.0.0.1` on the remote. Detach finds the vhci port in `usbip port`.
 - Remote needs `usbip`, `vhci-hcd` and passwordless sudo for usbip (NixOS: `tether.remote.usb`). Devices are named by bus ID or `vendor:product`.
 
+### 5. Kubernetes volumes (`internal/kube`)
+- **Helper pod** per mount, in the claim's namespace: the claim at `/data`, main process `cat` on a `stdinOnce` stdin. tether holds `kubectl attach -i` open; when it closes (unmount, daemon/connection/jump box gone) the pod exits. Unmount also deletes it; mounting deletes this owner's finished pods and pods of earlier daemons (labels `tether.dev/owner`, `tether.dev/instance`).
+- **Data path:** local `sshfs -o passive` ↔ `kubectl exec -i pod -- sftp-server -d /data`, over the host's master (the same pipe wiring as remote→local mounts).
+- **Classification:** `ReadWriteOnce` in use → node affinity to the consumer's node (+ tolerate all taints); `ReadWriteOncePod` in use → refused; Pending + `WaitForFirstConsumer` → mountable (the helper provisions it); Pending + `Immediate` → refused.
+- **Local host:** `openssh.StartLocal` is a Master whose commands run under `sh -c` here, so the kube code is the same for "via jump box" and "on the jump box". Only PVC mounts are allowed on it.
+- Unset context → kubectl's current one, resolved when the mount is added (if connected) so it stays on that cluster.
+
 ## Config (`~/.config/tether/config.toml`)
 
 ```toml
@@ -133,6 +141,7 @@ internal/forward/    forward spec parsing + lifecycle
 internal/gpg/        gpg socket discovery + forwarding
 internal/mount/      sshfs + reverse-sshfs
 internal/usbip/      USB/IP: sysfs devices, the privileged helper, remote scripts
+internal/kube/       Kubernetes claims: kubectl, discovery, helper pods
 internal/tui/        Bubble Tea app
 nix/                 package, home-manager module (flake.nix at the root)
 ```
@@ -148,6 +157,7 @@ Libraries: `cobra` (CLI), `bubbletea`/`lipgloss`/`bubbles` (TUI), `BurntSushi/to
 4. ✅ **Mounts:** sshfs in both directions, cleanup and recovery.
 5. ✅ **Tray:** KDE StatusNotifierItem client (`tether tray`, via `fyne.io/systray`), desktop notifications, home-manager `programs.tether.tray`.
 6. ✅ **USB/IP:** privileged helper, `tether usb`, profile `usb = [...]`, TUI and tray sections, doctor checks, NixOS modules.
+7. ✅ **Kubernetes volumes:** `tether kube`, `pvc:` mounts, the built-in `local` host, TUI claim picker, tray picker + recent claims, doctor checks, flake `sftp-image`.
 
 ## Testing
 - Unit tests: spec parsing, config validation, reconciler (with a fake SSH layer behind an interface).

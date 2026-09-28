@@ -163,6 +163,19 @@ func descendants(pid int) []int {
 	return out
 }
 
+// SFTPServer is the path of OpenSSH's sftp-server, or "" if it can't be
+// found.
+func SFTPServer() string {
+	sshd := findSSHD()
+	if sshd == "" {
+		return ""
+	}
+	if p := findSFTPServer(sshd); p != "internal-sftp" {
+		return p
+	}
+	return ""
+}
+
 // findSFTPServer finds sftp-server next to sshd (Nix: ../libexec) or in the
 // usual distribution locations.
 func findSFTPServer(sshd string) string {

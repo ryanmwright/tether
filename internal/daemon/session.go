@@ -351,6 +351,9 @@ func (s *session) run(ctx context.Context) {
 }
 
 func (s *session) connect(ctx context.Context, dest string) (*openssh.Master, error) {
+	if dest == openssh.LocalDest {
+		return openssh.StartLocal(s.log), nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, connectTimeout)
 	defer cancel()
 	s.mu.Lock()
@@ -535,6 +538,7 @@ func (s *session) status(host config.Host) api.HostStatus {
 		Name:        s.name,
 		SSH:         host.SSH,
 		Autoconnect: host.Autoconnect,
+		Local:       host.Local,
 		State:       s.state,
 		Error:       s.err,
 		Forwards:    []api.ForwardStatus{},

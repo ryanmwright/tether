@@ -3,12 +3,14 @@ package main
 import (
 	"log/slog"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ryanmwright/tether/internal/api"
 	"github.com/ryanmwright/tether/internal/daemon"
 	"github.com/ryanmwright/tether/internal/openssh"
+	"github.com/ryanmwright/tether/internal/paths"
 	"github.com/ryanmwright/tether/internal/usbip"
 )
 
@@ -30,6 +32,7 @@ func newDaemonCmd(g *globalFlags) *cobra.Command {
 				Logger:          log,
 				SSH:             openssh.Options{ConfigFile: sshConfig},
 				USBHelperSocket: usbHelper,
+				RecentFile:      filepath.Join(paths.StateDir(), "recent.json"),
 			})
 		},
 	}

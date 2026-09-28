@@ -85,3 +85,34 @@ func TestShellQuote(t *testing.T) {
 		t.Errorf("command = %s", cmd)
 	}
 }
+
+func TestParsePVC(t *testing.T) {
+	spec, err := Parse("pvc:prod/db/data-pg-0", "~/mnt/pg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Normalize(spec, "/home/me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Direction != PVCToLocal || got.Kube.Context != "prod" || got.Kube.Namespace != "db" || got.Kube.PVC != "data-pg-0" || got.Local != "/home/me/mnt/pg" {
+		t.Errorf("spec = %+v, kube = %+v", got, got.Kube)
+	}
+	if got.Key() != "pvc:prod/db/data-pg-0 -> /home/me/mnt/pg" || got.Remote != "pvc:prod/db/data-pg-0" {
+		t.Errorf("key = %q, remote = %q", got.Key(), got.Remote)
+	}
+
+	for _, args := range [][2]string{{"pvc:data", "/mnt/x"}, {"pvc:db/data", "remote:/x"}, {"pvc:db/Bad", "/mnt/x"}} {
+		if _, err := Parse(args[0], args[1]); err == nil {
+			t.Errorf("Parse(%q, %q) succeeded", args[0], args[1])
+		}
+	}
+	if _, err := Normalize(Spec{Direction: PVCToLocal, Local: "/mnt/x"}, "/home/me"); err == nil {
+		t.Error("PVC spec without a claim accepted")
+	}
+
+	spec, _ = Parse("pvc:arn:aws:eks:x:1:cluster/prod/db/data", "")
+	if got := DefaultPVCLocal("~/mnt/k8s", *spec.Kube); got != "~/mnt/k8s/arn:aws:eks:x:1:cluster_prod/db/data" {
+		t.Errorf("default mount point = %q", got)
+	}
+}

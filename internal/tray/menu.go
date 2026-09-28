@@ -28,7 +28,7 @@ type Action struct {
 	Method string // api method; empty for Local
 	Params any
 	Done   string // said in a notification if the call fails ("connect devbox")
-	Local  string // localOpenTUI, localConnectPrompt, localMountHere, localMountThere, localQuit, localStartDaemon
+	Local  string // localOpenTUI, localConnectPrompt, localMountHere, localMountThere, localPickPVC, localQuit, localStartDaemon
 	Host   string // the host a local action is for
 }
 
@@ -37,6 +37,7 @@ const (
 	localConnectPrompt = "connect-prompt"
 	localMountHere     = "mount-here"  // a remote directory, mounted here
 	localMountThere    = "mount-there" // a local directory, mounted on the remote
+	localPickPVC       = "pick-pvc"    // the terminal UI's claim picker
 	localQuit          = "quit"
 	localStartDaemon   = "start-daemon"
 )
@@ -67,6 +68,14 @@ const (
 // Summary picks the icon's look and a one-line description with counts:
 // "4 hosts: 2 up, 1 failed, 1 disconnected · 1/2 profiles active".
 func Summary(st api.Status) (Look, string) {
+	// The local host isn't a connection: count it only while it's in use.
+	var hosts []api.HostStatus
+	for _, h := range st.Hosts {
+		if !h.Local || h.State != api.StateDown {
+			hosts = append(hosts, h)
+		}
+	}
+	st.Hosts = hosts
 	counts := map[api.State]int{}
 	for _, h := range st.Hosts {
 		counts[h.State]++
@@ -205,12 +214,13 @@ func hostItem(h api.HostStatus) Item {
 		}
 		it := label(id+":mount:"+m.Key, title)
 		if m.AdHoc {
+			p := api.MountParams{Host: h.Name, Direction: m.Direction, Remote: m.Remote, Local: m.Local}
+			if m.Kube != nil {
+				k := m.Kube.KubeMount
+				p.Remote, p.Kube = "", &k
+			}
 			it.Enabled = true
-			it.Children = []Item{action(it.ID+":rm", "Unmount", &Action{
-				Method: api.MethodMountRemove,
-				Params: api.MountParams{Host: h.Name, Direction: m.Direction, Remote: m.Remote, Local: m.Local},
-				Done:   "unmount " + m.Key,
-			})}
+			it.Children = []Item{action(it.ID+":rm", "Unmount", &Action{Method: api.MethodMountRemove, Params: p, Done: "unmount " + m.Key})}
 		}
 		children = append(children, it)
 	}
@@ -228,6 +238,15 @@ func hostItem(h api.HostStatus) Item {
 	}
 
 	children = append(children, separator(id+":sep-actions"))
+	pick := action(id+":pvc", "Mount a Kubernetes claim…", &Action{Local: localPickPVC, Host: h.Name})
+	if recent := recentItems(id, h); len(recent) > 0 {
+		children = append(children, pick, Item{ID: id + ":recent", Title: "Recent claims", Enabled: true, Children: recent})
+	} else {
+		children = append(children, pick)
+	}
+	if h.Local {
+		return Item{ID: id, Title: title, Enabled: true, Children: children}
+	}
 	gpg := Item{ID: id + ":gpg", Title: "Forward gpg-agent", Enabled: true, Checkable: true, Checked: gpgAdHoc}
 	if gpgAdHoc {
 		gpg.Action = &Action{Method: api.MethodForwardRemove, Params: api.ForwardParams{Host: h.Name, Spec: "gpg-agent"}, Done: "stop gpg-agent forwarding to " + h.Name}
@@ -242,6 +261,38 @@ func hostItem(h api.HostStatus) Item {
 		children = append(children, action(id+":forget", "Forget this host", &Action{Method: api.MethodHostRemove, Params: api.HostParams{Name: h.Name}, Done: "forget " + h.Name}))
 	}
 	return Item{ID: id, Title: title, Enabled: true, Children: children}
+}
+
+// recentItems mounts again a claim mounted lately from h, one click each;
+// claims mounted now are left out.
+func recentItems(id string, h api.HostStatus) []Item {
+	var items []Item
+	for _, r := range h.RecentPVCs {
+		mounted := false
+		for _, m := range h.Mounts {
+			if k := m.Kube; k != nil && k.Context == r.Context && k.Namespace == r.Namespace && k.PVC == r.PVC {
+				mounted = true
+			}
+		}
+		if mounted {
+			continue
+		}
+		ref := r.Namespace + "/" + r.PVC
+		if r.Context != "" {
+			ref = r.Context + "/" + ref
+		}
+		title := ref + " → " + r.Local
+		if r.ReadOnly {
+			title += " (read-only)"
+		}
+		k := r.KubeMount
+		p := api.MountParams{Host: h.Name, Direction: "pvc-to-local", Local: r.Local, Kube: &k}
+		if r.ReadOnly {
+			p.Options = []string{"ro"}
+		}
+		items = append(items, action(id+":recent:"+ref, title, &Action{Method: api.MethodMountAdd, Params: p, Done: "mount " + ref}))
+	}
+	return items
 }
 
 // usbItems is the USB section: each local device, with a checkbox per host

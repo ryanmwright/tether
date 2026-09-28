@@ -383,3 +383,56 @@ func TestTerminalCommand(t *testing.T) {
 		t.Errorf("$TERMINAL = %v", got)
 	}
 }
+
+func TestPVCMenu(t *testing.T) {
+	st := api.Status{Hosts: []api.HostStatus{
+		{Name: "jump", SSH: "jump", State: api.StateUp,
+			Mounts: []api.MountStatus{{
+				Key: "pvc:prod/db/data -> /mnt/pg", Direction: "pvc-to-local", Remote: "pvc:prod/db/data", Local: "/mnt/pg", AdHoc: true, State: api.StateUp,
+				Kube: &api.KubeMountStatus{KubeMount: api.KubeMount{Context: "prod", Namespace: "db", PVC: "data"}, Pod: "tether-data-x", Node: "n1"},
+			}},
+			RecentPVCs: []api.RecentPVC{
+				{KubeMount: api.KubeMount{Context: "prod", Namespace: "db", PVC: "data"}, Local: "/mnt/pg"}, // mounted now: left out
+				{KubeMount: api.KubeMount{Context: "prod", Namespace: "web", PVC: "uploads", ReadOnly: true}, Local: "/mnt/up"},
+			}},
+		{Name: "local", Local: true, State: api.StateDown},
+	}}
+	items := Build(st)
+
+	if it := find(items, "host:jump:pvc"); it == nil || *it.Action != (Action{Local: localPickPVC, Host: "jump"}) {
+		t.Errorf("pick claim = %+v", it)
+	}
+	unmount := api.MountParams{Host: "jump", Direction: "pvc-to-local", Local: "/mnt/pg", Kube: &api.KubeMount{Context: "prod", Namespace: "db", PVC: "data"}}
+	if it := find(items, "host:jump:mount:pvc:prod/db/data -> /mnt/pg:rm"); it == nil || !reflect.DeepEqual(it.Action.Params, unmount) {
+		t.Errorf("unmount claim = %+v", it)
+	}
+	recent := find(items, "host:jump:recent")
+	if recent == nil || len(recent.Children) != 1 {
+		t.Fatalf("recent claims = %+v", recent)
+	}
+	it := recent.Children[0]
+	want := api.MountParams{Host: "jump", Direction: "pvc-to-local", Local: "/mnt/up", Options: []string{"ro"},
+		Kube: &api.KubeMount{Context: "prod", Namespace: "web", PVC: "uploads", ReadOnly: true}}
+	if it.Title != "prod/web/uploads → /mnt/up (read-only)" || it.Action.Method != api.MethodMountAdd || !reflect.DeepEqual(it.Action.Params, want) {
+		t.Errorf("recent claim = %+v %+v", it, it.Action)
+	}
+
+	// The local host only has claims.
+	if find(items, "host:local:pvc") == nil || find(items, "host:local:gpg") != nil || find(items, "host:local:mount-here") != nil {
+		t.Errorf("local host menu = %+v", find(items, "host:local"))
+	}
+	if find(items, "host:local:recent") != nil {
+		t.Error("recent claims submenu without any")
+	}
+}
+
+func TestSummaryIgnoresIdleLocalHost(t *testing.T) {
+	st := api.Status{Hosts: []api.HostStatus{{Name: "dev", State: api.StateUp}, {Name: "local", Local: true, State: api.StateDown}}}
+	if look, text := Summary(st); look != LookUp || text != "1 host: 1 up" {
+		t.Errorf("summary = %s %q", look, text)
+	}
+	st.Hosts[1].State = api.StateUp
+	if look, text := Summary(st); look != LookUp || text != "2 hosts: 2 up" {
+		t.Errorf("summary with local in use = %s %q", look, text)
+	}
+}

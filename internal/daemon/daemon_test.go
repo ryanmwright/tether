@@ -50,7 +50,9 @@ func start(t *testing.T, configTOML string, sshOpts ...openssh.Options) *harness
 	go func() {
 		// Only the USB test talks to a real USB/IP helper.
 		helper := cmp.Or(os.Getenv("TETHER_TEST_USBIP_HELPER"), filepath.Join(dir, "no-usbip-helper.sock"))
-		h.done <- Run(ctx, Options{SocketPath: h.socket, ConfigPath: h.config, Version: "test", Logger: testLogger(t), SSH: ssh, USBHelperSocket: helper})
+		// Only the kube tests want the built-in local host.
+		noLocal := os.Getenv("TETHER_TEST_LOCAL_HOST") == ""
+		h.done <- Run(ctx, Options{SocketPath: h.socket, ConfigPath: h.config, Version: "test", Logger: testLogger(t), SSH: ssh, USBHelperSocket: helper, NoLocalHost: noLocal})
 	}()
 	t.Cleanup(func() {
 		cancel()

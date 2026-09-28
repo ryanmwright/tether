@@ -18,6 +18,21 @@
           version = "0.1.0-${self.shortRev or self.dirtyShortRev or "dev"}";
         };
         default = tether;
+
+        # Helper image for Kubernetes claim mounts (sh, cat and sftp-server), to
+        # push to a registry the cluster can pull from:
+        #   nix build .#sftp-image && skopeo copy docker-archive:result docker://REGISTRY/tether-sftp:TAG
+        # then set hosts.<name>.kube.image.
+        sftp-image = pkgs.dockerTools.buildLayeredImage {
+          name = "tether-sftp";
+          tag = "latest";
+          contents = [ pkgs.busybox ];
+          extraCommands = ''
+            mkdir -p usr/lib/ssh tmp
+            chmod 1777 tmp
+            ln -s ${pkgs.openssh}/libexec/sftp-server usr/lib/ssh/sftp-server
+          '';
+        };
       });
 
       devShells = forAllSystems (pkgs: {

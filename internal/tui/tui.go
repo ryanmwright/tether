@@ -40,6 +40,7 @@ const (
 	modeInput       // typing a forward spec
 	modeDoctor
 	modeHelp
+	modePVC // picking a claim to mount
 )
 
 type rowKind int
@@ -85,6 +86,8 @@ type Model struct {
 	doctorErr     error
 	doctorRunning bool
 
+	pvc pvcPicker
+
 	flash    string
 	flashErr bool
 }
@@ -106,13 +109,15 @@ const (
 	inputMount
 	inputConnect
 	inputShare
+	inputPVCPath // where to mount the claim picked
 )
 
 var prompts = map[inputKind]struct{ prompt, placeholder, title string }{
 	inputForward: {"forward> ", "L:8080:localhost:80   R:0:localhost:3000   D:1080   gpg-agent", "add a forward to %s"},
-	inputMount:   {"mount> ", "remote:~/src ~/mnt/src   or   ~/proj remote:~/proj", "add a mount on %s"},
+	inputMount:   {"mount> ", "remote:~/src ~/mnt/src   or   ~/proj remote:~/proj   or   pvc:NS/CLAIM [DST]", "add a mount on %s"},
 	inputConnect: {"connect> ", "NAME [SSH-DEST]   e.g. devbox2   or   scratch me@10.0.0.5", "connect to a host that isn't in the config"},
 	inputShare:   {"host> ", "HOST", "share %s with which host?"},
+	inputPVCPath: {"at> ", "mount point", "mount %s here at"},
 }
 
 type (
@@ -132,7 +137,11 @@ type (
 )
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(waitEvent(m.client), tick())
+	cmds := []tea.Cmd{waitEvent(m.client), tick()}
+	if m.mode == modePVC {
+		cmds = append(cmds, m.listPVCs())
+	}
+	return tea.Batch(cmds...)
 }
 
 // waitEvent delivers the next daemon event. Update re-issues it after each.
@@ -166,7 +175,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.input.SetWidth(max(msg.Width-12, 10))
+		m.pvc.filter.SetWidth(max(msg.Width-12, 10))
 		return m, nil
+	case pvcListMsg:
+		return m.gotPVCs(msg), nil
 	case statusMsg:
 		m.setStatus(api.Status(msg))
 		return m, waitEvent(m.client)
@@ -196,9 +208,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyPressMsg:
 		return m.key(msg)
 	}
-	if m.mode == modeInput {
+	switch m.mode {
+	case modeInput:
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
+		return m, cmd
+	case modePVC:
+		var cmd tea.Cmd
+		m.pvc.filter, cmd = m.pvc.filter.Update(msg)
 		return m, cmd
 	}
 	return m, nil
@@ -250,10 +267,15 @@ func (m Model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.mode = modeNormal
 		}
 		return m, nil
+	case modePVC:
+		return m.pvcKey(msg)
 	case modeInput:
 		switch k {
 		case "esc":
 			m.mode = modeNormal
+			if m.inputKind == inputPVCPath {
+				m.mode = modePVC // back to the picker
+			}
 			m.input.Blur()
 			return m, nil
 		case "enter":
@@ -261,9 +283,14 @@ func (m Model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.mode = modeNormal
 			m.input.Blur()
 			if value == "" {
+				if m.inputKind == inputPVCPath {
+					m.mode = modePVC
+				}
 				return m, nil
 			}
 			switch m.inputKind {
+			case inputPVCPath:
+				return m.mountPVC(value)
 			case inputMount:
 				return m.addMount(value)
 			case inputConnect:
@@ -326,6 +353,11 @@ func (m Model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "g":
 		if hostOK {
 			return m, m.toggleGPG(sel.host)
+		}
+	case "K", "p":
+		if hostOK {
+			m.openPVC(sel.host)
+			return m, m.listPVCs()
 		}
 	case "d":
 		if hostOK {
@@ -439,7 +471,12 @@ func (m Model) remove(r row) (tea.Model, tea.Cmd) {
 			m.flash, m.flashErr = fmt.Sprintf("this mount comes from profile %s; deactivate the profile to remove it", strings.Join(mt.Profiles, ", ")), true
 			return m, nil
 		}
-		return m, m.call("unmounted "+r.name, api.MethodMountRemove, api.MountParams{Host: r.host, Direction: mt.Direction, Remote: mt.Remote, Local: mt.Local})
+		p := api.MountParams{Host: r.host, Direction: mt.Direction, Remote: mt.Remote, Local: mt.Local}
+		if mt.Kube != nil {
+			k := mt.Kube.KubeMount
+			p.Remote, p.Kube = "", &k
+		}
+		return m, m.call("unmounted "+r.name, api.MethodMountRemove, p)
 	}
 	if r.kind == rowHost {
 		// An ad-hoc host that's already down is forgotten.
@@ -472,11 +509,16 @@ func (m Model) addHost(value string) (tea.Model, tea.Cmd) {
 	return m, m.call("connecting "+p.Name, api.MethodHostAdd, p)
 }
 
-// addMount parses "SRC DST" from the prompt, one side marked remote:.
+// addMount parses "SRC DST" from the prompt, one side marked remote:, or
+// "pvc:CLAIM [DST]".
 func (m Model) addMount(value string) (tea.Model, tea.Cmd) {
 	fields := strings.Fields(value)
+	isPVC := len(fields) > 0 && strings.HasPrefix(fields[0], mount.PVCPrefix)
+	if isPVC && len(fields) == 1 {
+		fields = append(fields, "") // the default mount point
+	}
 	if len(fields) != 2 {
-		m.flash, m.flashErr = "enter two paths: SRC DST, one of them remote:PATH", true
+		m.flash, m.flashErr = "enter two paths: SRC DST, one of them remote:PATH; or pvc:[CONTEXT/]NS/CLAIM [DST]", true
 		return m, nil
 	}
 	spec, err := mount.Parse(fields[0], fields[1])
@@ -484,11 +526,14 @@ func (m Model) addMount(value string) (tea.Model, tea.Cmd) {
 		m.flash, m.flashErr = err.Error(), true
 		return m, nil
 	}
-	if !strings.HasPrefix(spec.Local, "~") && !filepath.IsAbs(spec.Local) {
+	if spec.Local != "" && !strings.HasPrefix(spec.Local, "~") && !filepath.IsAbs(spec.Local) {
 		spec.Local, _ = filepath.Abs(spec.Local)
 	}
-	return m, m.call("mounting "+value+" on "+m.inputHost, api.MethodMountAdd,
-		api.MountParams{Host: m.inputHost, Direction: string(spec.Direction), Remote: spec.Remote, Local: spec.Local})
+	p := api.MountParams{Host: m.inputHost, Direction: string(spec.Direction), Remote: spec.Remote, Local: spec.Local}
+	if k := spec.Kube; k != nil {
+		p.Kube = &api.KubeMount{Context: k.Context, Namespace: k.Namespace, PVC: k.PVC}
+	}
+	return m, m.call("mounting "+value+" on "+m.inputHost, api.MethodMountAdd, p)
 }
 
 func (m Model) toggleGPG(host string) tea.Cmd {
@@ -637,10 +682,19 @@ func (m Model) render() string {
 		switch {
 		case m.inputKind == inputShare:
 			title = fmt.Sprintf(title, m.inputUSB.Title())
+		case m.inputKind == inputPVCPath:
+			title = fmt.Sprintf(title, m.pvc.chosen.Ref())
+			if m.pvc.readOnly {
+				title += " (read-only)"
+			}
 		case strings.Contains(title, "%s"):
 			title = fmt.Sprintf(title, m.inputHost)
 		}
 		bottom = append(bottom, title+" (enter to confirm, esc to cancel)", m.input.View())
+	} else if m.mode == modePVC {
+		if detail := m.pvcDetail(); detail != "" {
+			bottom = append(bottom, detail)
+		}
 	} else if detail := m.detail(); detail != "" {
 		bottom = append(bottom, detail)
 	}
@@ -665,6 +719,14 @@ func (m Model) render() string {
 		body = m.doctorView()
 	case modeHelp:
 		body = helpLines
+	case modePVC:
+		body = m.pvcView(bodyHeight)
+	case modeInput:
+		if m.inputKind == inputPVCPath {
+			body = m.pvcView(bodyHeight)
+		} else {
+			body = m.rowLines(bodyHeight)
+		}
 	default:
 		body = m.rowLines(bodyHeight)
 	}
@@ -694,8 +756,10 @@ func (m Model) footer() string {
 		return "esc back"
 	case modeHelp:
 		return "any key to go back"
+	case modePVC:
+		return "enter mount · type to filter · ↑↓ move · tab context · ctrl+o read-only · ctrl+r refresh · esc back"
 	}
-	return m.enterHint() + " · c connect to… · a forward · m mount · g gpg · d doctor · ? help · q quit"
+	return m.enterHint() + " · c connect to… · a forward · m mount · K claims · g gpg · d doctor · ? help · q quit"
 }
 
 // enterHint says what enter does on the selected row.
@@ -799,6 +863,9 @@ func (m Model) rowLine(r row, selected bool, nameW int) string {
 	case rowHost:
 		h := m.hostStatus(r.host)
 		state, name, info = h.State, h.Name, "ssh "+h.SSH
+		if h.Local {
+			info = "this machine · K to mount a claim"
+		}
 		if h.Autoconnect {
 			info += " · auto"
 		}
@@ -903,8 +970,12 @@ func (m Model) detail() string {
 			return styleFaint.Render(f.Spec + " → " + f.Resolved)
 		}
 	case rowMount:
-		if e := m.mountStatus(r.host, r.name).Error; e != "" {
-			return styleErr.Render(r.name + ": " + e)
+		mt := m.mountStatus(r.host, r.name)
+		if mt.Error != "" {
+			return styleErr.Render(r.name + ": " + mt.Error)
+		}
+		if k := mt.Kube; k != nil && k.Pod != "" {
+			return styleFaint.Render(fmt.Sprintf("helper pod %s/%s on node %s", k.Namespace, k.Pod, k.Node))
 		}
 	case rowUSB:
 		if e := m.usbStatus(r.host, r.name).Error; e != "" {
@@ -981,7 +1052,10 @@ var helpLines = []string{
 	"  x            take down the selection; on an ad-hoc host that's down, forget it",
 	"  c            connect to a host that isn't in the config (NAME [SSH-DEST])",
 	"  a            add an ad-hoc forward to the selected host",
-	"  m            add an ad-hoc mount on the selected host (SRC DST, one side remote:PATH)",
+	"  m            add an ad-hoc mount on the selected host (SRC DST, one side remote:PATH;",
+	"               or pvc:[CONTEXT/]NS/CLAIM [DST] for a Kubernetes claim)",
+	"  K / p        pick a Kubernetes claim to mount, with kubectl on the selected host",
+	"               (\"local\": kubectl on this machine)",
 	"  g            toggle ad-hoc gpg-agent forwarding to the selected host",
 	"  d            run doctor on the selected host",
 	"  r            reload the config file",

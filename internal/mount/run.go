@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ryanmwright/tether/internal/kube"
 	"github.com/ryanmwright/tether/internal/linelog"
 	"github.com/ryanmwright/tether/internal/openssh"
 	"github.com/ryanmwright/tether/internal/sftpjail"
@@ -27,6 +28,9 @@ const (
 
 // Running is an active mount.
 type Running struct {
+	// Pod and Node are the helper pod behind a PVC mount and its node.
+	Pod, Node string
+
 	done chan struct{}
 	once sync.Once
 	err  error
@@ -55,7 +59,12 @@ func (r *Running) Stop(ctx context.Context) error { return r.stop(ctx) }
 // Start mounts spec over the connection m and returns once the mount is in
 // place.
 func Start(ctx context.Context, m *openssh.Master, spec Spec, log *slog.Logger) (*Running, error) {
-	if spec.Direction == LocalToRemote {
+	switch {
+	case spec.Direction == PVCToLocal:
+		return startPVC(ctx, m, spec, log)
+	case m.IsLocal():
+		return nil, errors.New("only PVC mounts are supported on the local host")
+	case spec.Direction == LocalToRemote:
 		return startLocalToRemote(ctx, m, spec, log)
 	}
 	return startRemoteToLocal(ctx, m, spec, log)
@@ -64,9 +73,38 @@ func Start(ctx context.Context, m *openssh.Master, spec Spec, log *slog.Logger) 
 // startRemoteToLocal runs sshfs here, piped to the remote's SFTP server
 // through an `ssh -s sftp` channel on the existing connection.
 func startRemoteToLocal(ctx context.Context, m *openssh.Master, s Spec, log *slog.Logger) (*Running, error) {
+	return startSSHFS(ctx, m.Command([]string{"-s"}, "sftp"), "ssh", sftpPath(s.Remote), s, log, nil)
+}
+
+// startPVC starts a helper pod holding the claim and runs sshfs here, piped
+// to an sftp-server in the pod through `kubectl exec` on the connection.
+func startPVC(ctx context.Context, m *openssh.Master, s Spec, log *slog.Logger) (*Running, error) {
+	if _, err := exec.LookPath("sshfs"); err != nil {
+		return nil, errSSHFSMissing
+	}
+	pod, err := kube.StartPod(ctx, m, *s.Kube, log)
+	if err != nil {
+		return nil, err
+	}
+	r, err := startSSHFS(ctx, pod.SFTPCommand(), "kubectl exec", ".", s, log, pod)
+	if err != nil {
+		pod.Stop(context.Background())
+		return nil, err
+	}
+	r.Pod, r.Node = pod.Name, pod.Node
+	return r, nil
+}
+
+var errSSHFSMissing = errors.New("sshfs not found locally; install it (Fedora: fuse-sshfs, Debian: sshfs)")
+
+// startSSHFS runs sshfs here on the SFTP server that server runs (reading
+// SFTP requests on its stdin), mounting path from it at s.Local. If pod is
+// set, it goes with the mount: the mount ends when the pod does, and the pod
+// is stopped after unmounting.
+func startSSHFS(ctx context.Context, server *exec.Cmd, what, path string, s Spec, log *slog.Logger, pod *kube.Pod) (*Running, error) {
 	sshfs, err := exec.LookPath("sshfs")
 	if err != nil {
-		return nil, errors.New("sshfs not found locally; install it (Fedora: fuse-sshfs, Debian: sshfs)")
+		return nil, errSSHFSMissing
 	}
 	if err := os.MkdirAll(s.Local, 0o755); err != nil {
 		unmountLocal(s.Local, true) // maybe a stale mount in the way
@@ -82,60 +120,86 @@ func startRemoteToLocal(ctx context.Context, m *openssh.Master, s Spec, log *slo
 		unmountLocal(mp, true) // left over from a lost connection
 	}
 
-	ssh := m.Command([]string{"-s"}, "sftp")
-	fs := exec.Command(sshfs, "-f", "-o", sshfsOptions(s.Options), ":"+sftpPath(s.Remote), mp)
+	fs := exec.Command(sshfs, "-f", "-o", sshfsOptions(s.Options), ":"+path, mp)
 	fs.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
-	sshErr, fsErr := linelog.New(log, "ssh output"), linelog.New(log, "sshfs output")
-	ssh.Stderr, fs.Stderr = sshErr, fsErr
+	srvErr, fsErr := linelog.New(log, what+" output"), linelog.New(log, "sshfs output")
+	server.Stderr, fs.Stderr = srvErr, fsErr
 
-	// Connect the two processes directly: ssh's stdout is sshfs's stdin and
-	// the other way around.
-	toFS, fromSSH, err := os.Pipe()
+	// Connect the two processes directly: the server's stdout is sshfs's
+	// stdin and the other way around.
+	toFS, fromSrv, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
-	toSSH, fromFS, err := os.Pipe()
+	toSrv, fromFS, err := os.Pipe()
 	if err != nil {
 		toFS.Close()
-		fromSSH.Close()
+		fromSrv.Close()
 		return nil, err
 	}
-	ssh.Stdin, ssh.Stdout = toSSH, fromSSH
+	server.Stdin, server.Stdout = toSrv, fromSrv
 	fs.Stdin, fs.Stdout = toFS, fromFS
 	closePipes := func() {
-		for _, f := range []*os.File{toFS, fromSSH, toSSH, fromFS} {
+		for _, f := range []*os.File{toFS, fromSrv, toSrv, fromFS} {
 			f.Close()
 		}
 	}
-	if err := ssh.Start(); err != nil {
+	if err := server.Start(); err != nil {
 		closePipes()
 		return nil, err
 	}
 	if err := fs.Start(); err != nil {
 		closePipes()
-		ssh.Process.Kill()
-		ssh.Wait()
+		server.Process.Kill()
+		server.Wait()
 		return nil, err
 	}
 	closePipes() // the children have their own copies
 
 	r := newRunning()
+	var podGone error
+	var podMu sync.Mutex
+	if pod != nil {
+		go func() {
+			select {
+			case <-pod.Done():
+				// The pod is gone, so the mount is dead: unmount so sshfs exits.
+				podMu.Lock()
+				podGone = pod.Err()
+				podMu.Unlock()
+				unmountLocal(mp, true)
+				fs.Process.Signal(syscall.SIGTERM)
+			case <-r.done:
+			}
+		}()
+	}
 	go func() {
 		// When either side exits the other sees EOF and follows.
 		fsWait := fs.Wait()
-		ssh.Process.Signal(syscall.SIGTERM)
-		ssh.Wait()
+		server.Process.Signal(syscall.SIGTERM)
+		server.Wait()
 		if mounted(mp) {
 			unmountLocal(mp, true)
 		}
-		r.finish(exitReason("sshfs", fsWait, fsErr.Last(), sshErr.Last()))
+		podMu.Lock()
+		gone := podGone
+		podMu.Unlock()
+		if gone != nil {
+			r.finish(gone)
+			return
+		}
+		r.finish(exitReason("sshfs", fsWait, fsErr.Last(), srvErr.Last()))
 	}()
 	r.stop = func(ctx context.Context) error {
 		err := unmountLocal(mp, false)
 		if err != nil {
 			err = unmountLocal(mp, true)
 		}
-		return waitOrKill(ctx, r, fs.Process, ssh.Process, err)
+		err = waitOrKill(ctx, r, fs.Process, server.Process, err)
+		if pod != nil {
+			err = errors.Join(err, pod.Stop(ctx))
+		}
+		return err
 	}
 
 	if err := waitReady(ctx, r, func(context.Context) bool { return mounted(mp) }); err != nil {

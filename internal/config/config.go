@@ -16,7 +16,9 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/ryanmwright/tether/internal/forward"
+	"github.com/ryanmwright/tether/internal/kube"
 	"github.com/ryanmwright/tether/internal/mount"
+	"github.com/ryanmwright/tether/internal/openssh"
 	"github.com/ryanmwright/tether/internal/usbip"
 )
 
@@ -28,6 +30,9 @@ type Config struct {
 
 type Defaults struct {
 	ReconnectBackoff Backoff `toml:"reconnect_backoff"`
+	// LocalHost offers the built-in "local" host (PVC mounts with kubectl on
+	// this machine) when kubectl is installed. On by default.
+	LocalHost bool `toml:"local_host"`
 }
 
 type Host struct {
@@ -35,7 +40,66 @@ type Host struct {
 	// ~/.ssh/config. Defaults to the host's name.
 	SSH         string `toml:"ssh"`
 	Autoconnect bool   `toml:"autoconnect"`
+	// Local makes this host stand for this machine, with no SSH: only PVC
+	// mounts, with kubectl run here.
+	Local bool `toml:"local"`
+	Kube  Kube `toml:"kube"`
 }
+
+// LocalHost is the name of the built-in local host, present when kubectl is
+// installed here and no configured host has that name.
+const LocalHost = "local"
+
+// Dest is where the host's session connects: its ssh destination, or
+// openssh.LocalDest for a local host.
+func (h Host) Dest() string {
+	if h.Local {
+		return openssh.LocalDest
+	}
+	return h.SSH
+}
+
+// Kube says how to run kubectl on a host and what helper pods look like;
+// see kube.Options.
+type Kube struct {
+	Kubectl      string   `toml:"kubectl"`
+	Kubeconfig   string   `toml:"kubeconfig"`
+	Image        string   `toml:"image"`
+	SFTPServer   string   `toml:"sftp_server"`
+	RunAsUser    *int64   `toml:"run_as_user"`
+	RunAsGroup   *int64   `toml:"run_as_group"`
+	FSGroup      *int64   `toml:"fs_group"`
+	MountRoot    string   `toml:"mount_root"`
+	StartTimeout Duration `toml:"start_timeout"`
+}
+
+func (k Kube) Options() kube.Options {
+	return kube.Options{
+		Kubectl:      k.Kubectl,
+		Kubeconfig:   k.Kubeconfig,
+		Image:        k.Image,
+		SFTPServer:   k.SFTPServer,
+		RunAsUser:    k.RunAsUser,
+		RunAsGroup:   k.RunAsGroup,
+		FSGroup:      k.FSGroup,
+		MountRoot:    k.MountRoot,
+		StartTimeout: time.Duration(k.StartTimeout),
+	}.WithDefaults()
+}
+
+// Duration is a time.Duration written as "2m".
+type Duration time.Duration
+
+func (d *Duration) UnmarshalText(text []byte) error {
+	v, err := time.ParseDuration(string(text))
+	if err != nil || v <= 0 {
+		return fmt.Errorf("invalid duration %q", text)
+	}
+	*d = Duration(v)
+	return nil
+}
+
+func (d Duration) MarshalText() ([]byte, error) { return []byte(time.Duration(d).String()), nil }
 
 // Profile is a named bundle of forwards, gpg, mounts and USB devices on one
 // host.
@@ -61,11 +125,30 @@ type Mount struct {
 	Remote    string    `toml:"remote"`
 	Local     string    `toml:"local"`
 	Options   []string  `toml:"options"`
+	// PVC mounts a Kubernetes claim here instead: "[context/]namespace/claim".
+	// Direction and Remote are then unused.
+	PVC      string `toml:"pvc"`
+	SubPath  string `toml:"sub_path"`
+	ReadOnly bool   `toml:"read_only"`
 }
 
 // Spec is the mount as the mount package describes it, not yet normalized.
-func (m Mount) Spec() mount.Spec {
-	return mount.Spec{Direction: m.Direction, Remote: m.Remote, Local: m.Local, Options: m.Options}
+// A PVC mount gets the host's kube options, and its default mount point if
+// Local is empty.
+func (m Mount) Spec(h Host) (mount.Spec, error) {
+	if m.PVC == "" {
+		return mount.Spec{Direction: m.Direction, Remote: m.Remote, Local: m.Local, Options: m.Options}, nil
+	}
+	k, err := kube.ParseRef(m.PVC)
+	if err != nil {
+		return mount.Spec{}, err
+	}
+	k.SubPath, k.ReadOnly, k.Opts = m.SubPath, m.ReadOnly, h.Kube.Options()
+	local := m.Local
+	if local == "" {
+		local = mount.DefaultPVCLocal(k.Opts.MountRoot, k)
+	}
+	return mount.Spec{Direction: mount.PVCToLocal, Local: local, Options: m.Options, Kube: &k}, nil
 }
 
 // Backoff is a reconnect delay range, written as "1s..60s" or a single
@@ -98,7 +181,7 @@ func (b Backoff) MarshalText() ([]byte, error) {
 
 func Default() *Config {
 	return &Config{
-		Defaults: Defaults{ReconnectBackoff: Backoff{Min: time.Second, Max: time.Minute}},
+		Defaults: Defaults{ReconnectBackoff: Backoff{Min: time.Second, Max: time.Minute}, LocalHost: true},
 		Hosts:    map[string]Host{},
 		Profiles: map[string]Profile{},
 	}
@@ -135,7 +218,7 @@ func Parse(data []byte) (*Config, error) {
 		return nil, fmt.Errorf("unknown keys: %s", strings.Join(keys, ", "))
 	}
 	for name, h := range c.Hosts {
-		if h.SSH == "" {
+		if h.SSH == "" && !h.Local {
 			h.SSH = name
 			c.Hosts[name] = h
 		}
@@ -154,6 +237,12 @@ func ValidateHost(name string, h Host) error {
 	if !namePattern.MatchString(name) {
 		errs = append(errs, fmt.Errorf("hosts.%s: name must match %s", name, namePattern))
 	}
+	if err := h.Kube.Options().Validate(); err != nil {
+		errs = append(errs, fmt.Errorf("hosts.%s.kube: %w", name, err))
+	}
+	if h.Local {
+		return errors.Join(errs...)
+	}
 	// The destination is passed to ssh as an argument, so it must not be
 	// mistaken for an option.
 	if h.SSH == "" || strings.HasPrefix(h.SSH, "-") || strings.ContainsFunc(h.SSH, func(r rune) bool {
@@ -162,6 +251,25 @@ func ValidateHost(name string, h Host) error {
 		errs = append(errs, fmt.Errorf("hosts.%s.ssh: invalid destination %q", name, h.SSH))
 	}
 	return errors.Join(errs...)
+}
+
+func validateMount(m Mount, h Host, home string) error {
+	switch {
+	case m.PVC != "" && (m.Remote != "" || m.Direction != ""):
+		return errors.New("pvc can't be combined with remote or direction")
+	case m.PVC == "" && (m.SubPath != "" || m.ReadOnly):
+		return errors.New("sub_path and read_only are only for pvc mounts")
+	case m.PVC == "" && h.Local:
+		return errors.New("the host is local, so it can only have pvc mounts")
+	case m.PVC == "" && (m.Remote == "" || m.Local == ""):
+		return errors.New("remote and local are required")
+	}
+	spec, err := m.Spec(h)
+	if err != nil {
+		return err
+	}
+	_, err = mount.Normalize(spec, home)
+	return err
 }
 
 // Validate reports every problem found, not just the first.
@@ -178,10 +286,17 @@ func (c *Config) Validate() error {
 		if !namePattern.MatchString(name) {
 			errs = append(errs, fmt.Errorf("profiles.%s: name must match %s", name, namePattern))
 		}
+		host, known := c.Hosts[p.Host]
+		if p.Host == LocalHost && !known && c.Defaults.LocalHost {
+			host, known = Host{Local: true}, true // the built-in local host
+		}
 		if p.Host == "" {
 			errs = append(errs, fmt.Errorf("profiles.%s.host: required", name))
-		} else if _, ok := c.Hosts[p.Host]; !ok {
+		} else if !known {
 			errs = append(errs, fmt.Errorf("profiles.%s.host: unknown host %q", name, p.Host))
+		}
+		if host.Local && (p.GPG || p.GPGSSH || len(p.Forwards) > 0 || len(p.USB) > 0) {
+			errs = append(errs, fmt.Errorf("profiles.%s: host %q is local, so it can only have PVC mounts", name, p.Host))
 		}
 		for i, f := range p.Forwards {
 			if _, err := forward.Parse(f); err != nil {
@@ -189,9 +304,7 @@ func (c *Config) Validate() error {
 			}
 		}
 		for i, m := range p.Mounts {
-			if m.Remote == "" || m.Local == "" {
-				errs = append(errs, fmt.Errorf("profiles.%s.mounts[%d]: remote and local are required", name, i))
-			} else if _, err := mount.Normalize(m.Spec(), home); err != nil {
+			if err := validateMount(m, host, home); err != nil {
 				errs = append(errs, fmt.Errorf("profiles.%s.mounts[%d]: %w", name, i, err))
 			}
 		}

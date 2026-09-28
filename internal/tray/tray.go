@@ -259,6 +259,9 @@ func (t *tray) run(a *Action) {
 	case localConnectPrompt:
 		t.report("connect", t.connectPrompt())
 		return
+	case localPickPVC:
+		t.report("open the claim picker", t.openTUI("--pvc", a.Host))
+		return
 	case localMountHere, localMountThere:
 		t.report("mount on "+a.Host, t.mountPrompt(a.Host, a.Local == localMountThere))
 		return
@@ -289,12 +292,14 @@ func (t *tray) report(what string, err error) {
 	}
 }
 
-func (t *tray) openTUI() error {
+// openTUI opens the terminal UI in a terminal, with extra arguments to
+// `tether tui`.
+func (t *tray) openTUI(args ...string) error {
 	term := terminalCommand(t.opts.Terminal)
 	if term == nil {
 		return errors.New("no terminal emulator found; set one with `tether tray --terminal`")
 	}
-	return spawn(append(term, t.opts.TetherPath, "tui")...)
+	return spawn(append(append(term, t.opts.TetherPath, "tui"), args...)...)
 }
 
 // connectPrompt asks for "NAME [SSH-DEST]" with the desktop's dialog tool,

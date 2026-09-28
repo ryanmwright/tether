@@ -38,6 +38,21 @@ func (f *fakeClient) Call(_ context.Context, method string, params, result any) 
 			{Section: "remote", Name: "public keys", Status: api.CheckWarn, Detail: "1 of 1 missing", Fix: "gpg --export X | ssh dev gpg --import"},
 		}}
 	}
+	if method == api.MethodKubeList && f.err == nil {
+		kctx := params.(api.KubeListParams).Context
+		if kctx == "" {
+			kctx = "prod"
+		}
+		*result.(*api.KubeListResult) = api.KubeListResult{
+			Host: "dev", Context: kctx, Current: "prod", Contexts: []string{"prod", "staging"}, MountRoot: "/home/me/mnt/k8s",
+			PVCs: []api.PVC{
+				{Namespace: "db", Name: "data-pg-0", Phase: "Bound", Capacity: "10Gi", StorageClass: "fast", AccessModes: []string{"RWO"},
+					UsedBy: []api.PVCConsumer{{Pod: "pg-0", Node: "n2"}}, Mountable: true, Node: "n2", Note: "in use by pg-0; helper runs on node n2"},
+				{Namespace: "db", Name: "exclusive", Phase: "Bound", AccessModes: []string{"RWOP"}, Note: "in exclusive use (ReadWriteOncePod) by solo"},
+				{Namespace: "web", Name: "uploads", Phase: "Pending", Request: "5Gi", StorageClass: "local", Mountable: true, Note: "not bound yet; mounting provisions its volume"},
+			},
+		}
+	}
 	return f.err
 }
 
@@ -117,6 +132,10 @@ func keyMsg(key string) tea.KeyPressMsg {
 		return tea.KeyPressMsg{Code: tea.KeyEscape}
 	case "down":
 		return tea.KeyPressMsg{Code: tea.KeyDown}
+	case "tab":
+		return tea.KeyPressMsg{Code: tea.KeyTab}
+	case "ctrl+o":
+		return tea.KeyPressMsg{Code: 'o', Mod: tea.ModCtrl}
 	}
 	r := []rune(key)[0]
 	return tea.KeyPressMsg{Code: r, Text: key}
@@ -465,5 +484,93 @@ func TestUSB(t *testing.T) {
 	}
 	if s := screen(moveTo(t, m, "1-1")); !strings.Contains(s, "enter stop sharing ·") {
 		t.Error("footer lacks the stop-sharing hint")
+	}
+}
+
+func TestPVCPicker(t *testing.T) {
+	m, fc := newModel(t)
+	m = press(t, moveTo(t, m, "dev"), "K")
+	if m.mode != modePVC {
+		t.Fatalf("mode = %v", m.mode)
+	}
+	if got := fc.last(); got.method != api.MethodKubeList || got.params.(api.KubeListParams).Host != "dev" {
+		t.Fatalf("last call = %+v", got)
+	}
+	s := screen(m)
+	for _, want := range []string{"CLAIMS on dev · context prod (1 of 2", "db/data-pg-0", "10Gi", "pg-0", "web/uploads", "5Gi", "helper runs on node n2"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("screen missing %q:\n%s", want, s)
+		}
+	}
+
+	// Typing filters; claims that can't be mounted say why.
+	for _, r := range "excl" {
+		m = press(t, m, string(r))
+	}
+	if s := screen(m); strings.Contains(s, "data-pg-0") || !strings.Contains(s, "can't mount: in exclusive use") {
+		t.Errorf("filtered screen:\n%s", s)
+	}
+	m = press(t, m, "enter")
+	if m.mode != modePVC || !m.flashErr {
+		t.Errorf("unmountable claim picked: mode %v flash %q", m.mode, m.flash)
+	}
+	m = press(t, m, "esc") // clears the filter
+	if m.mode != modePVC || m.pvc.filter.Value() != "" {
+		t.Fatalf("esc with a filter: mode %v filter %q", m.mode, m.pvc.filter.Value())
+	}
+
+	// Pick a claim: the mount point prompt offers the default.
+	m = press(t, m, "ctrl+o")
+	m = press(t, m, "enter")
+	if !m.choosingPath() || m.input.Value() != "/home/me/mnt/k8s/prod/db/data-pg-0" {
+		t.Fatalf("path prompt: mode %v value %q", m.mode, m.input.Value())
+	}
+	if s := screen(m); !strings.Contains(s, "mount db/data-pg-0 here at (read-only)") {
+		t.Errorf("path prompt title missing:\n%s", s)
+	}
+	m = press(t, m, "enter")
+	want := call{api.MethodMountAdd, api.MountParams{
+		Host: "dev", Direction: "pvc-to-local", Local: "/home/me/mnt/k8s/prod/db/data-pg-0", Options: []string{"ro"},
+		Kube: &api.KubeMount{Context: "prod", Namespace: "db", PVC: "data-pg-0", ReadOnly: true},
+	}}
+	if got := fc.last(); !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v\nwant %+v", got, want)
+	}
+	if m.mode != modeNormal {
+		t.Errorf("mode after mounting = %v", m.mode)
+	}
+
+	// Tab moves to the next context.
+	m = press(t, moveTo(t, m, "dev"), "K")
+	m = press(t, m, "tab")
+	if got := fc.last(); got.params.(api.KubeListParams).Context != "staging" || !strings.Contains(screen(m), "context staging (2 of 2") {
+		t.Errorf("tab: last call %+v\n%s", got, screen(m))
+	}
+	m = press(t, m, "esc")
+	if m.mode != modeNormal {
+		t.Errorf("esc: mode %v", m.mode)
+	}
+}
+
+func TestPVCMountRow(t *testing.T) {
+	m, fc := newModel(t)
+	st := sampleStatus
+	st.Hosts = append([]api.HostStatus{{Name: "local", Local: true, State: api.StateUp, Mounts: []api.MountStatus{{
+		Key: "pvc:prod/db/data -> /mnt/pg", Direction: "pvc-to-local", Remote: "pvc:prod/db/data", Local: "/mnt/pg", AdHoc: true, State: api.StateUp,
+		Kube: &api.KubeMountStatus{KubeMount: api.KubeMount{Context: "prod", Namespace: "db", PVC: "data"}, Pod: "tether-data-x1", Node: "n1"},
+	}}}}, st.Hosts...)
+	m = update(t, m, statusMsg(st))
+	if s := screen(m); !strings.Contains(s, "this machine") {
+		t.Errorf("local host not shown as this machine:\n%s", s)
+	}
+	m = moveTo(t, m, "pvc:prod/db/data -> /mnt/pg")
+	if s := screen(m); !strings.Contains(s, "helper pod db/tether-data-x1 on node n1") {
+		t.Errorf("no pod detail:\n%s", s)
+	}
+	press(t, m, "x")
+	want := call{api.MethodMountRemove, api.MountParams{Host: "local", Direction: "pvc-to-local", Local: "/mnt/pg",
+		Kube: &api.KubeMount{Context: "prod", Namespace: "db", PVC: "data"}}}
+	if got := fc.last(); !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v\nwant %+v", got, want)
 	}
 }

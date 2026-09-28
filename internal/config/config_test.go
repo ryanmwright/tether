@@ -106,3 +106,59 @@ func TestLoad(t *testing.T) {
 		t.Errorf("error should be prefixed with the path, got %v", err)
 	}
 }
+
+func TestKubeConfig(t *testing.T) {
+	c, err := Parse([]byte(`
+[hosts.jump.kube]
+kubeconfig = "~/.kube/prod"
+image = "registry.internal/sftp:1"
+run_as_user = 1000
+start_timeout = "5m"
+
+[hosts.box]
+local = true
+
+[profiles.db]
+host = "jump"
+[[profiles.db.mounts]]
+pvc = "prod/db/data-pg-0"
+read_only = true
+sub_path = "pgdata"
+
+[profiles.here]
+host = "local"
+[[profiles.here.mounts]]
+pvc = "db/cache"
+local = "~/mnt/cache"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := c.Hosts["jump"].Kube.Options()
+	if opts.Kubeconfig != "~/.kube/prod" || opts.Image != "registry.internal/sftp:1" || *opts.RunAsUser != 1000 || opts.StartTimeout != 5*time.Minute || opts.Kubectl != "kubectl" {
+		t.Errorf("kube options = %+v", opts)
+	}
+	if h := c.Hosts["box"]; !h.Local || h.SSH != "" || h.Dest() == "" {
+		t.Errorf("local host = %+v", h)
+	}
+	spec, err := c.Profiles["db"].Mounts[0].Spec(c.Hosts["jump"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Local != "~/mnt/k8s/prod/db/data-pg-0" || !spec.Kube.ReadOnly || spec.Kube.SubPath != "pgdata" || spec.Kube.Opts.Image != opts.Image {
+		t.Errorf("pvc mount spec = %+v kube = %+v", spec, spec.Kube)
+	}
+
+	for _, bad := range []string{
+		"[hosts.x]\nlocal = true\n[profiles.p]\nhost = \"x\"\nforwards = [\"D:1080\"]",
+		"[hosts.x]\n[profiles.p]\nhost = \"x\"\n[[profiles.p.mounts]]\npvc = \"db/x\"\nremote = \"~/a\"",
+		"[hosts.x]\n[profiles.p]\nhost = \"x\"\n[[profiles.p.mounts]]\nremote = \"~/a\"\nlocal = \"~/b\"\nread_only = true",
+		"[hosts.x.kube]\nsftp_server = \"sftp-server\"",
+		"[hosts.x.kube]\nstart_timeout = \"soon\"",
+		"[defaults]\nlocal_host = false\n[profiles.p]\nhost = \"local\"",
+	} {
+		if _, err := Parse([]byte(bad)); err == nil {
+			t.Errorf("accepted:\n%s", bad)
+		}
+	}
+}

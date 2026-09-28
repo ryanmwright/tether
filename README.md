@@ -11,6 +11,8 @@ your SSH connections to dev machines up and manages what flows over them:
   local directory on the remote (sshfs over the same connection)
 - **USB devices** plugged in here, shared with a remote (USB/IP over the
   same connection): a security key, a board you're flashing, a serial adapter
+- **Kubernetes volumes** (PersistentVolumeClaims) mounted here, with
+  `kubectl` running on your jump box or on this machine
 
 You drive it from the CLI, a terminal UI, or a system tray icon. It uses your
 system OpenSSH, so everything in `~/.ssh/config` (`ProxyJump`, keys, FIDO
@@ -18,7 +20,7 @@ tokens, `known_hosts`) works as it already does.
 
 > **Status: early development.** Connections, port forwards (`L`/`R`/`D`,
 > TCP and Unix sockets), automatic reconnects, gpg-agent forwarding, directory
-> mounts, USB sharing, profiles, `tether doctor`, the CLI, the terminal UI and
+> mounts, USB sharing, Kubernetes volume mounts, profiles, `tether doctor`, the CLI, the terminal UI and
 > the tray icon work today. See [PLAN.md](PLAN.md) for the roadmap.
 
 ## Contents
@@ -33,6 +35,7 @@ tokens, `known_hosts`) works as it already does.
 - [gpg-agent forwarding](#gpg-agent-forwarding)
 - [Directory mounts](#directory-mounts)
 - [USB devices](#usb-devices)
+- [Kubernetes volumes](#kubernetes-volumes)
 - [Terminal UI](#terminal-ui)
 - [Tray icon](#tray-icon)
 - [CLI](#cli)
@@ -335,6 +338,7 @@ options = ["reconnect"]
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `reconnect_backoff` | string | `"1s..60s"` | Reconnect delay range `"min..max"`, or a single duration for a fixed delay. Go duration syntax (`500ms`, `10s`, `2m`). |
+| `local_host` | bool | `true` | Offer the built-in host `local` (Kubernetes volume mounts with `kubectl` on this machine) when `kubectl` is installed. |
 
 **`[hosts.<name>]`**: a machine you connect to. Names may contain letters,
 digits, `.`, `_` and `-`.
@@ -343,6 +347,8 @@ digits, `.`, `_` and `-`.
 |---|---|---|---|
 | `ssh` | string | the host's name | Destination passed to `ssh`: an alias from `~/.ssh/config`, or `user@host`. Put bastions, ports, users and keys in `~/.ssh/config` (e.g. `ProxyJump`). |
 | `autoconnect` | bool | `false` | Connect when the daemon starts and after network changes. |
+| `local` | bool | `false` | This machine, with no SSH: only Kubernetes volume mounts, `kubectl` run here. |
+| `kube` | table | | How to run `kubectl` there and what helper pods look like. See [Kubernetes volumes](#kubernetes-volumes). |
 
 **`[profiles.<name>]`**: a named bundle of forwards, gpg, mounts and USB
 devices on one host. Several profiles on the same host share one SSH connection.
@@ -373,6 +379,8 @@ devices on one host. Several profiles on the same host share one SSH connection.
 | `remote` | string | Path on the remote. Relative paths and `~` are from the remote home. |
 | `local` | string | Path on your machine: absolute, or starting with `~/`. |
 | `options` | list of strings | Extra `sshfs -o` options, e.g. `["ro"]`. |
+| `pvc` | string | Instead of `direction` and `remote`: a Kubernetes claim to mount here, `[CONTEXT/]NAMESPACE/CLAIM`. `local` is then optional. See [Kubernetes volumes](#kubernetes-volumes). |
+| `read_only`, `sub_path` | bool, string | For `pvc`: mount it read-only, or only a directory inside it. |
 
 Unknown keys are errors (so typos are caught), and every problem is reported
 at once. Check a file without touching the daemon:
@@ -563,6 +571,103 @@ On a non-NixOS machine where Nix provides your tools, install `sshfs` and
 `fuse3` from the distribution anyway: FUSE mounts need the distribution's
 setuid `fusermount3`, which a Nix-built one isn't.
 
+## Kubernetes volumes
+
+Mount a Kubernetes PersistentVolumeClaim here, with `kubectl` running on a host
+you connect to, typically the jump box you already use for `kubectl` and
+`k9s`. Nothing is installed in the cluster and nothing listens on a port:
+
+```console
+$ tether kube ls jump
+context prod
+
+NAMESPACE  NAME       STATUS   SIZE  CLASS  MODES  USED BY  MOUNT
+db         data-pg-0  Bound    10Gi  fast   RWO    pg-0     yes: in use by pg-0; helper runs on node n2
+web        uploads    Pending  5Gi   local  RWO    -        yes: not bound yet; mounting provisions its volume
+$ tether kube mount jump db/data-pg-0
+pvc:prod/db/data-pg-0 -> /home/you/mnt/k8s/prod/db/data-pg-0: up
+helper pod db/tether-data-pg-0-x7k2p on n2
+$ tether kube umount jump db/data-pg-0
+```
+
+In the terminal UI, press `K` on a host for a picker: type to filter, `tab` to
+switch contexts, `enter` to mount. In the tray, each host has
+"Mount a Kubernetes claim…" (opens that picker) and "Recent claims" (one
+click to mount one again).
+
+**How it works.** tether starts a small helper pod in the claim's namespace
+that mounts the claim at `/data`, then runs `sshfs` here piped to
+`kubectl exec -i <pod> -- sftp-server` over the host's SSH connection, the
+same way remote directories are mounted. The pod lives only as long as
+tether holds a `kubectl attach` session to it, so if the daemon, the
+connection or the jump box goes away, the pod exits by itself. Unmounting
+deletes it. When mounting, tether also deletes its own finished pods in that
+namespace; `tether kube gc HOST` does every namespace.
+
+**Which claims can be mounted:**
+
+| Claim | What happens |
+|---|---|
+| Bound, unused | Mounted. |
+| Bound, `ReadWriteOnce`, used by a pod | The helper runs on that pod's node (volumes attach to one node at a time). |
+| Bound, `ReadWriteMany`/`ReadOnlyMany` | Mounted, on any node. |
+| Bound, `ReadWriteOncePod`, used by a pod | Refused: only that pod may use it. |
+| Pending, `WaitForFirstConsumer` class | Mounted: the helper pod is its first consumer, so **mounting provisions and binds the volume**. |
+| Pending, `Immediate` class | Refused until a volume is bound. |
+
+**Two ways to run it:**
+
+- **Through the jump box** (this machine → jump box → cluster): add the jump
+  box as a host; `kubectl` runs there, the mount appears here.
+- **On the jump box** (jump box → cluster): install tether there too and use
+  the built-in host `local`, which runs `kubectl` on the same machine and
+  appears when `kubectl` is installed (turn it off with
+  `[defaults] local_host = false`). It only does claim mounts.
+
+**Contexts.** `[CONTEXT/]NAMESPACE/CLAIM` picks one. Without a context,
+kubectl's current context on the host is used, and remembered with the mount,
+so switching contexts later doesn't move it to another cluster. The default
+mount point is `~/mnt/k8s/<context>/<namespace>/<claim>`.
+
+**Per-host settings**, under `[hosts.<name>.kube]` (all optional):
+
+```toml
+[hosts.jump.kube]
+kubectl = "kubectl"               # or a path; "~/" is the jump box's home
+kubeconfig = "~/.kube/config"     # if a non-interactive ssh shell doesn't set KUBECONFIG
+image = "docker.io/atmoz/sftp:alpine"  # needs sh, cat and sftp-server
+sftp_server = "/usr/lib/ssh/sftp-server"
+run_as_user = 999                 # helper pod securityContext: run_as_user, run_as_group, fs_group
+mount_root = "~/mnt/k8s"
+start_timeout = "2m"              # for the pod to start (image pull, volume attach)
+```
+
+Watch out for:
+
+- **File ownership.** Files are read and written as the helper pod's user,
+  root by default. On a volume owned by an app's user (Postgres is 999), set
+  `run_as_user` so new files belong to it. Namespaces with the "restricted"
+  Pod Security Standard also need a non-root `run_as_user`.
+- **The image.** The default is pulled from Docker Hub. If your cluster can't
+  reach it, build the flake's `sftp-image` (busybox and sftp-server), push it
+  to your registry and set `image`.
+- **Permissions.** You need to create, get and delete pods, and create
+  `pods/exec` and `pods/attach`, in the claim's namespace.
+  `tether doctor HOST` checks this, along with `kubectl` and your contexts.
+- **kubectl on the jump box** must work in a non-interactive `ssh` session
+  (no `.bashrc` aliases, no interactive login plugins). If `kubectl` or
+  `KUBECONFIG` come from your shell rc files, set `kubectl`/`kubeconfig`.
+
+For a claim you always want, use a profile:
+
+```toml
+[[profiles.db.mounts]]
+pvc = "prod/db/data-pg-0"         # [CONTEXT/]NAMESPACE/CLAIM
+local = "~/mnt/pg"                # optional
+read_only = true                  # the pod mounts it read-only too
+sub_path = "pgdata"               # optional: a directory inside the volume
+```
+
 ## USB devices
 
 Share a USB device plugged in here with a remote. It shows up there as if it
@@ -721,7 +826,8 @@ enter toggle · a add forward · g gpg · d doctor · r reload · l log · ? hel
 | `x` | Take the selection down; on an ad-hoc host that's already down, forget it |
 | `c` | Connect to a host that isn't in the config: `NAME [SSH-DEST]` |
 | `a` | Add an ad-hoc forward to the selected host (any spec, or `gpg-agent`/`gpg-ssh`) |
-| `m` | Add an ad-hoc mount on the selected host: `SRC DST`, one side `remote:PATH` |
+| `m` | Add an ad-hoc mount on the selected host: `SRC DST`, one side `remote:PATH`; or `pvc:[CONTEXT/]NS/CLAIM [DST]` |
+| `K`, `p` | Pick a Kubernetes claim to mount, with `kubectl` on the selected host. Type to filter, `tab` for the next context, `ctrl+o` read-only, `enter` to mount (asks where, suggesting the default) |
 | `g` | Toggle ad-hoc gpg-agent forwarding to the selected host |
 | `d` | Run `doctor` on the selected host |
 | `r` | Reload the config file |
@@ -760,7 +866,9 @@ summary heads the menu.
   mounts and USB devices with their state, retry, toggle gpg-agent forwarding, mount a
   directory in either direction, unmount ad-hoc mounts, and forget for
   ad-hoc hosts), your profiles as checkboxes, "Connect to host…" (asks for
-  `NAME [SSH-DEST]`), a "USB devices" section, and reload. Prompts use `kdialog` or `zenity`; without
+  `NAME [SSH-DEST]`), a "USB devices" section, and reload. Each host also
+  has "Mount a Kubernetes claim…", which opens the terminal UI's claim
+  picker, and "Recent claims" to mount one again with a click. Prompts use `kdialog` or `zenity`; without
   either, the terminal UI opens instead.
 - **Mounting from the menu**: "Mount remote directory here…" asks for the
   remote directory and a local mount point (default `~/mnt/<name>`, created
@@ -825,6 +933,13 @@ tether logs [-f] [-n 50]          the daemon's recent log (it keeps 500 entries)
 tether mount add HOST SRC DST     mount SRC at DST; one side is remote:PATH
   -o OPTION                       extra sshfs option (repeatable)
 tether mount rm HOST SRC DST      unmount an ad-hoc mount
+tether kube ls HOST               Kubernetes claims kubectl on HOST can see
+  --context CTX, -n NAMESPACE, --json
+tether kube mount HOST [CTX/]NS/CLAIM [DST]   mount a claim here
+  --ro, --sub-path DIR, -o OPTION
+tether kube umount HOST [CTX/]NS/CLAIM [DST]  unmount it, delete its helper pod
+tether kube gc HOST [--context]   delete helper pods left behind
+tether tui --pvc HOST             open the TUI in the claim picker
 tether usb list                   USB devices here, and where they're shared
 tether usb attach HOST DEVICE     share a device (bus ID or vendor:product)
 tether usb detach HOST DEVICE     stop sharing it
@@ -904,6 +1019,7 @@ well for status bars and scripts.
 | Config file | `$XDG_CONFIG_HOME/tether/config.toml` (`~/.config/...`) | `--config` or `TETHER_CONFIG` |
 | Socket | `$XDG_RUNTIME_DIR/tether/tether.sock` | `--socket` or `TETHER_SOCKET` |
 | SSH control sockets | `$XDG_RUNTIME_DIR/tether/ctl/<host>` | — |
+| Recent claims | `$XDG_STATE_HOME/tether/recent.json` (`~/.local/state/...`) | — |
 | Log (on-demand daemon) | next to the socket, `daemon.log` | — |
 | Log (systemd) | the journal: `journalctl --user -u tether` | — |
 

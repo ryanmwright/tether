@@ -21,8 +21,18 @@ type wantMount struct {
 }
 
 type mountState struct {
-	state api.State
-	err   string
+	state     api.State
+	err       string
+	pod, node string // a PVC mount's helper pod
+}
+
+// startTimeout is how long mounting spec may take: a PVC mount waits for a
+// helper pod, which may have to pull its image and attach the volume.
+func startTimeout(spec mount.Spec) time.Duration {
+	if spec.Kube != nil {
+		return spec.Kube.Opts.WithDefaults().StartTimeout + mountStartTimeout
+	}
+	return mountStartTimeout
 }
 
 // syncMounts unmounts what's no longer wanted and mounts what's missing. It
@@ -37,10 +47,11 @@ func (s *session) syncMounts(ctx context.Context, m *openssh.Master, w want, run
 		if running[key] != nil {
 			continue
 		}
-		sctx, cancel := context.WithTimeout(ctx, mountStartTimeout)
-		r, err := mount.Start(sctx, m, w.mounts[key].spec, s.log.With("mount", key))
+		spec := w.mounts[key].spec
+		sctx, cancel := context.WithTimeout(ctx, startTimeout(spec))
+		r, err := mount.Start(sctx, m, spec, s.log.With("mount", key))
 		cancel()
-		if prev := s.setMount(key, err); err != nil {
+		if prev := s.setMount(key, r, err); err != nil {
 			if prev != err.Error() {
 				s.log.Warn("mount failed", "mount", key, "err", err)
 			}
@@ -66,7 +77,7 @@ func (s *session) reapMounts(running map[string]*mount.Running) (failed bool) {
 			delete(running, key)
 			err := fmt.Errorf("mount went away: %w", r.Err())
 			s.log.Warn("mount lost", "mount", key, "err", r.Err())
-			s.setMount(key, err)
+			s.setMount(key, nil, err)
 			failed = true
 		default:
 		}
@@ -93,14 +104,14 @@ func (s *session) stopMount(key string, running map[string]*mount.Running) {
 }
 
 // setMount records the outcome of mounting and returns the previous error.
-func (s *session) setMount(key string, err error) (prevErr string) {
+func (s *session) setMount(key string, r *mount.Running, err error) (prevErr string) {
 	s.mu.Lock()
 	if ms := s.mounts[key]; ms != nil {
 		prevErr = ms.err
 		if err != nil {
 			*ms = mountState{state: api.StateError, err: err.Error()}
 		} else {
-			*ms = mountState{state: api.StateUp}
+			*ms = mountState{state: api.StateUp, pod: r.Pod, node: r.Node}
 		}
 	}
 	s.mu.Unlock()
@@ -113,7 +124,7 @@ func (s *session) mountStatuses() []api.MountStatus {
 	out := []api.MountStatus{}
 	for _, key := range slices.Sorted(maps.Keys(s.mounts)) {
 		ms, wm := s.mounts[key], s.want.mounts[key]
-		out = append(out, api.MountStatus{
+		st := api.MountStatus{
 			Key:       key,
 			Direction: string(wm.spec.Direction),
 			Remote:    wm.spec.Remote,
@@ -122,7 +133,15 @@ func (s *session) mountStatuses() []api.MountStatus {
 			AdHoc:     wm.adhoc,
 			State:     ms.state,
 			Error:     ms.err,
-		})
+		}
+		if k := wm.spec.Kube; k != nil {
+			st.Kube = &api.KubeMountStatus{
+				KubeMount: api.KubeMount{Context: k.Context, Namespace: k.Namespace, PVC: k.PVC, SubPath: k.SubPath, ReadOnly: k.ReadOnly},
+				Pod:       ms.pod,
+				Node:      ms.node,
+			}
+		}
+		out = append(out, st)
 	}
 	return out
 }
