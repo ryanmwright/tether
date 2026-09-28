@@ -18,6 +18,9 @@ buildGoModule {
     ];
   };
 
+  # Static, so `tether usbip-helper install` can copy it out of the store.
+  env.CGO_ENABLED = 0;
+
   vendorHash = "sha256-Q8mJjiWVoVkwAS7WkNLUHQ63X4SRKEYHSXzAAgJ5lL0=";
 
   ldflags = [

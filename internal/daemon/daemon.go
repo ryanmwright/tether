@@ -30,6 +30,7 @@ import (
 	"github.com/ryanmwright/tether/internal/netwatch"
 	"github.com/ryanmwright/tether/internal/openssh"
 	"github.com/ryanmwright/tether/internal/rpc"
+	"github.com/ryanmwright/tether/internal/usbip"
 )
 
 var ErrAlreadyRunning = errors.New("another tether daemon is already running")
@@ -40,6 +41,8 @@ type Options struct {
 	Version    string
 	Logger     *slog.Logger
 	SSH        openssh.Options
+	// USBHelperSocket is the USB/IP helper's control socket.
+	USBHelperSocket string
 }
 
 type Daemon struct {
@@ -56,10 +59,12 @@ type Daemon struct {
 	upHosts    map[string]bool                   // hosts brought up directly
 	adhoc      map[string]map[string]wantForward // host -> forward key -> forward
 	adhocMnt   map[string]map[string]wantMount   // host -> mount key -> mount
+	adhocUSB   map[string]map[string]wantUSB     // host -> device spec -> device
 	adhocHosts map[string]config.Host            // hosts added at runtime, not in the config
 	home       string                            // for ~ in local mount paths
 	autoSeen   map[string]bool                   // "host/x", "profile/x" -> autoconnect as last applied
 	sessions   map[string]*sessionHandle
+	usb        *localUSB
 
 	gen    atomic.Uint64 // see api.Status.Generation
 	logs   *logRing
@@ -91,11 +96,17 @@ func Run(ctx context.Context, opts Options) error {
 		upHosts:    map[string]bool{},
 		adhoc:      map[string]map[string]wantForward{},
 		adhocMnt:   map[string]map[string]wantMount{},
+		adhocUSB:   map[string]map[string]wantUSB{},
 		adhocHosts: map[string]config.Host{},
 		autoSeen:   map[string]bool{},
 		sessions:   map[string]*sessionHandle{},
 		subs:       map[*subscriber]struct{}{},
+		usb:        &localUSB{helper: &usbip.Client{Socket: opts.USBHelperSocket}},
 	}
+	if d.usb.helper.Socket == "" {
+		d.usb.helper.Socket = usbip.DefaultHelperSocket
+	}
+	defer d.usb.helper.Close()
 	d.home, _ = os.UserHomeDir()
 	d.logs = &logRing{publish: d.publishLog}
 	d.log = slog.New(&logTee{inner: opts.Logger.Handler(), ring: d.logs})
@@ -122,7 +133,9 @@ func Run(ctx context.Context, opts Options) error {
 	defer os.Remove(opts.SocketPath)
 
 	d.ensureAuthSock()
+	d.usb.poll()
 	d.reload()
+	go d.watchUSB(ctx)
 	defer d.wg.Wait() // sessions stop their connections when ctx ends
 	defer cancel()
 
@@ -144,6 +157,8 @@ func Run(ctx context.Context, opts Options) error {
 	srv.Handle(api.MethodHostAdd, d.handleHostAdd)
 	srv.Handle(api.MethodHostRemove, d.handleHostRemove)
 	srv.Handle(api.MethodMountRemove, d.handleMountRemove)
+	srv.Handle(api.MethodUSBAttach, d.handleUSBAttach)
+	srv.Handle(api.MethodUSBDetach, d.handleUSBDetach)
 	srv.Handle(api.MethodLogs, func(_ context.Context, params json.RawMessage) (any, error) {
 		p, err := decode[api.LogsParams](orEmpty(params))
 		if err != nil {
@@ -245,6 +260,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			delete(d.upHosts, name)
 			delete(d.adhoc, name)
 			delete(d.adhocMnt, name)
+			delete(d.adhocUSB, name)
 		}
 	}
 	for name := range d.active {
@@ -300,7 +316,7 @@ func (d *Daemon) hostNames() []string {
 
 func (d *Daemon) startSession(name string) {
 	ctlPath := filepath.Join(filepath.Dir(d.opts.SocketPath), "ctl", name)
-	s := newSession(name, ctlPath, d.opts.SSH, d.log, d.notify)
+	s := newSession(name, ctlPath, d.opts.SSH, d.usb, d.log, d.notify)
 	ctx, cancel := context.WithCancel(d.ctx)
 	h := &sessionHandle{s: s, cancel: cancel, done: make(chan struct{})}
 	d.sessions[name] = h
@@ -315,7 +331,7 @@ func (d *Daemon) startSession(name string) {
 func (d *Daemon) recompute() {
 	for name, h := range d.sessions {
 		host, _ := d.host(name)
-		w := want{backoff: d.cfg.Defaults.ReconnectBackoff, forwards: map[string]wantForward{}, mounts: map[string]wantMount{}}
+		w := want{backoff: d.cfg.Defaults.ReconnectBackoff, forwards: map[string]wantForward{}, mounts: map[string]wantMount{}, usb: map[string]wantUSB{}}
 		wanted := d.upHosts[name]
 		for _, pname := range slices.Sorted(maps.Keys(d.active)) {
 			p := d.cfg.Profiles[pname]
@@ -332,6 +348,16 @@ func (d *Daemon) recompute() {
 				wm.profiles = append(w.mounts[key].profiles, pname)
 				w.mounts[key] = wm
 			}
+			for key, wu := range profileUSB(p) {
+				wu.profiles = append(w.usb[key].profiles, pname)
+				w.usb[key] = wu
+			}
+		}
+		for key, wu := range d.adhocUSB[name] {
+			wanted = true
+			wu.profiles = w.usb[key].profiles
+			wu.adhoc = true
+			w.usb[key] = wu
 		}
 		for key, wm := range d.adhocMnt[name] {
 			wanted = true
@@ -348,7 +374,7 @@ func (d *Daemon) recompute() {
 		if wanted {
 			w.dest = host.SSH
 		} else {
-			w.forwards, w.mounts = nil, nil
+			w.forwards, w.mounts, w.usb = nil, nil, nil
 		}
 		h.s.setWant(w)
 	}
@@ -400,6 +426,16 @@ func profileMounts(p config.Profile, home string) map[string]wantMount {
 		mounts[spec.Key()] = wantMount{spec: spec}
 	}
 	return mounts
+}
+
+// profileUSB is every USB device a profile shares, by spec.
+func profileUSB(p config.Profile) map[string]wantUSB {
+	devs := map[string]wantUSB{}
+	for _, u := range p.USB {
+		spec, _ := usbip.ParseSpec(u) // validated with the config
+		devs[string(spec)] = wantUSB{spec: spec}
+	}
+	return devs
 }
 
 // resolve finds the host or profile a request names. Callers hold d.mu.
@@ -477,6 +513,7 @@ func (d *Daemon) handleDown(_ context.Context, params json.RawMessage) (any, err
 		delete(d.upHosts, t.Name)
 		delete(d.adhoc, t.Name)
 		delete(d.adhocMnt, t.Name)
+		delete(d.adhocUSB, t.Name)
 		for name := range d.active {
 			if d.cfg.Profiles[name].Host == t.Name {
 				delete(d.active, name)
@@ -586,6 +623,69 @@ func (d *Daemon) handleMountRemove(_ context.Context, params json.RawMessage) (a
 	return api.MountResult{Host: p.Host, Key: spec.Key(), Generation: d.gen.Load()}, nil
 }
 
+func (d *Daemon) usbParams(params json.RawMessage) (api.USBParams, usbip.Spec, error) {
+	p, err := decode[api.USBParams](params)
+	if err != nil {
+		return p, "", err
+	}
+	if _, ok := d.host(p.Host); !ok {
+		return p, "", rpc.Errorf(api.CodeNotFound, "no host named %q", p.Host)
+	}
+	spec, err := usbip.ParseSpec(p.Device)
+	if err != nil {
+		return p, "", rpc.Errorf(rpc.CodeInvalidParams, "%v", err)
+	}
+	return p, spec, nil
+}
+
+func (d *Daemon) handleUSBAttach(_ context.Context, params json.RawMessage) (any, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p, spec, err := d.usbParams(params)
+	if err != nil {
+		return nil, err
+	}
+	// A device can only be in one place: refuse a second host up front
+	// rather than failing later.
+	if dev, err := spec.Find(d.usb.Devices()); err == nil {
+		for name, h := range d.sessions {
+			if name == p.Host {
+				continue
+			}
+			for _, u := range h.s.status(config.Host{}).USB {
+				if u.BusID == dev.BusID || spec.Matches(dev) && u.Device == string(spec) {
+					return nil, rpc.Errorf(api.CodeInvalidConfig, "%s is already shared with %s", dev.Title(), name)
+				}
+			}
+		}
+	}
+	if d.adhocUSB[p.Host] == nil {
+		d.adhocUSB[p.Host] = map[string]wantUSB{}
+	}
+	d.adhocUSB[p.Host][string(spec)] = wantUSB{spec: spec}
+	d.recompute()
+	d.sessions[p.Host].s.retryNow()
+	d.log.Info("ad-hoc USB device added", "host", p.Host, "usb", spec)
+	return api.USBResult{Host: p.Host, Device: string(spec), Generation: d.gen.Load()}, nil
+}
+
+func (d *Daemon) handleUSBDetach(_ context.Context, params json.RawMessage) (any, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p, spec, err := d.usbParams(params)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := d.adhocUSB[p.Host][string(spec)]; !ok {
+		return nil, rpc.Errorf(api.CodeNotFound,
+			"no ad-hoc USB device %s on %s (profile devices go away with `tether down <profile>`)", spec, p.Host)
+	}
+	delete(d.adhocUSB[p.Host], string(spec))
+	d.recompute()
+	d.log.Info("ad-hoc USB device removed", "host", p.Host, "usb", spec)
+	return api.USBResult{Host: p.Host, Device: string(spec), Generation: d.gen.Load()}, nil
+}
+
 func (d *Daemon) handleHostAdd(_ context.Context, params json.RawMessage) (any, error) {
 	p, err := decode[api.HostParams](params)
 	if err != nil {
@@ -636,6 +736,7 @@ func (d *Daemon) handleHostRemove(_ context.Context, params json.RawMessage) (an
 	delete(d.upHosts, p.Name)
 	delete(d.adhoc, p.Name)
 	delete(d.adhocMnt, p.Name)
+	delete(d.adhocUSB, p.Name)
 	h := d.sessions[p.Name]
 	h.cancel() // disconnects, unmounting first
 	<-h.done
@@ -754,6 +855,7 @@ func (d *Daemon) status() api.Status {
 		hosts[name] = hs
 		st.Hosts = append(st.Hosts, hs)
 	}
+	st.USB, st.USBUnavailable = d.usbStatus(st.Hosts)
 	for _, name := range slices.Sorted(maps.Keys(d.cfg.Profiles)) {
 		p := d.cfg.Profiles[name]
 		ps := api.ProfileStatus{Name: name, Host: p.Host, Autoconnect: p.Autoconnect, Active: d.active[name]}
@@ -798,6 +900,19 @@ func profileState(active bool, p config.Profile, hs api.HostStatus, home string)
 		switch ms := bykey[key]; ms.State {
 		case api.StateError:
 			return api.StateDegraded, fmt.Sprintf("%s: %s", key, ms.Error)
+		case api.StateUp:
+		default:
+			state = api.StatePending
+		}
+	}
+	usb := map[string]api.USBStatus{}
+	for _, u := range hs.USB {
+		usb[u.Device] = u
+	}
+	for _, key := range slices.Sorted(maps.Keys(profileUSB(p))) {
+		switch us := usb[key]; us.State {
+		case api.StateError:
+			return api.StateDegraded, fmt.Sprintf("USB %s: %s", key, us.Error)
 		case api.StateUp:
 		default:
 			state = api.StatePending

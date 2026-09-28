@@ -17,6 +17,7 @@ import (
 
 	"github.com/ryanmwright/tether/internal/forward"
 	"github.com/ryanmwright/tether/internal/mount"
+	"github.com/ryanmwright/tether/internal/usbip"
 )
 
 type Config struct {
@@ -36,7 +37,8 @@ type Host struct {
 	Autoconnect bool   `toml:"autoconnect"`
 }
 
-// Profile is a named bundle of forwards, gpg and mounts on one host.
+// Profile is a named bundle of forwards, gpg, mounts and USB devices on one
+// host.
 type Profile struct {
 	Host        string   `toml:"host"`
 	Autoconnect bool     `toml:"autoconnect"`
@@ -44,6 +46,7 @@ type Profile struct {
 	GPGSSH      bool     `toml:"gpg_ssh"` // forward gpg-agent's SSH socket
 	Forwards    []string `toml:"forwards"`
 	Mounts      []Mount  `toml:"mounts"`
+	USB         []string `toml:"usb"` // devices to share: bus IDs or vendor:product
 }
 
 type Direction = mount.Direction
@@ -190,6 +193,11 @@ func (c *Config) Validate() error {
 				errs = append(errs, fmt.Errorf("profiles.%s.mounts[%d]: remote and local are required", name, i))
 			} else if _, err := mount.Normalize(m.Spec(), home); err != nil {
 				errs = append(errs, fmt.Errorf("profiles.%s.mounts[%d]: %w", name, i, err))
+			}
+		}
+		for i, u := range p.USB {
+			if _, err := usbip.ParseSpec(u); err != nil {
+				errs = append(errs, fmt.Errorf("profiles.%s.usb[%d]: %w", name, i, err))
 			}
 		}
 	}

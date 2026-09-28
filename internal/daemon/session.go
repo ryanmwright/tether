@@ -34,6 +34,7 @@ type want struct {
 	dest     string // ssh destination; empty means disconnected
 	forwards map[string]wantForward
 	mounts   map[string]wantMount
+	usb      map[string]wantUSB
 	backoff  config.Backoff
 }
 
@@ -61,6 +62,7 @@ type session struct {
 	name    string
 	ctlPath string
 	ssh     openssh.Options
+	usb     usbBackend
 	log     *slog.Logger
 	changed func()
 
@@ -76,16 +78,18 @@ type session struct {
 	retryAt        time.Time
 	forwards       map[string]*forwardState
 	mounts         map[string]*mountState
+	usbStates      map[string]*usbState
 	master         *openssh.Master // the live connection, if any
 	cancelConnect  context.CancelFunc
 	connectingDest string
 }
 
-func newSession(name, ctlPath string, ssh openssh.Options, log *slog.Logger, changed func()) *session {
+func newSession(name, ctlPath string, ssh openssh.Options, usb usbBackend, log *slog.Logger, changed func()) *session {
 	return &session{
 		name:      name,
 		ctlPath:   ctlPath,
 		ssh:       ssh,
+		usb:       usb,
 		log:       log.With("host", name),
 		changed:   changed,
 		wake:      make(chan struct{}, 1),
@@ -95,6 +99,7 @@ func newSession(name, ctlPath string, ssh openssh.Options, log *slog.Logger, cha
 		state:     api.StateDown,
 		forwards:  map[string]*forwardState{},
 		mounts:    map[string]*mountState{},
+		usbStates: map[string]*usbState{},
 	}
 }
 
@@ -124,6 +129,11 @@ func (s *session) setWant(w want) {
 			delete(s.mounts, key)
 		}
 	}
+	for key := range s.usbStates {
+		if _, ok := w.usb[key]; !ok {
+			delete(s.usbStates, key)
+		}
+	}
 	if w.dest != "" {
 		for key := range w.forwards {
 			if s.forwards[key] == nil {
@@ -133,6 +143,11 @@ func (s *session) setWant(w want) {
 		for key := range w.mounts {
 			if s.mounts[key] == nil {
 				s.mounts[key] = &mountState{state: api.StatePending}
+			}
+		}
+		for key := range w.usb {
+			if s.usbStates[key] == nil {
+				s.usbStates[key] = &usbState{state: api.StatePending}
 			}
 		}
 		if s.state == api.StateDown {
@@ -173,10 +188,14 @@ func (s *session) setState(state api.State, err string, retryAt time.Time) {
 		for _, ms := range s.mounts {
 			*ms = mountState{state: api.StatePending}
 		}
+		for _, us := range s.usbStates {
+			*us = usbState{state: api.StatePending}
+		}
 	}
 	if s.want.dest == "" {
 		clear(s.forwards)
 		clear(s.mounts)
+		clear(s.usbStates)
 	}
 	s.mu.Unlock()
 	s.changed()
@@ -218,12 +237,14 @@ func (s *session) run(ctx context.Context) {
 		dest     string
 		applied  = map[string]forward.Spec{}
 		running  = map[string]*mount.Running{}
+		usbRT    = newUSBRuntime()
 		delay    time.Duration
 		retry    *time.Timer // pending reconnect; nil when not waiting
 		fwdRetry *time.Timer
 	)
 	defer func() {
 		if m != nil {
+			s.stopUSB(m, usbRT)
 			s.stopMounts(running)
 			s.setMaster(nil)
 			m.Stop()
@@ -231,7 +252,8 @@ func (s *session) run(ctx context.Context) {
 	}()
 	disconnect := func() {
 		if m != nil {
-			s.stopMounts(running) // unmount cleanly while still connected
+			s.stopUSB(m, usbRT) // detach and unmount cleanly while still connected
+			s.stopMounts(running)
 			s.setMaster(nil)
 			m.Stop()
 			m = nil
@@ -278,7 +300,8 @@ func (s *session) run(ctx context.Context) {
 		if m != nil {
 			fwdFailed := s.syncForwards(ctx, m, w, applied)
 			mountFailed := s.syncMounts(ctx, m, w, running)
-			if (fwdFailed || mountFailed) && fwdRetry == nil {
+			usbFailed := s.syncUSB(ctx, m, w, usbRT)
+			if (fwdFailed || mountFailed || usbFailed) && fwdRetry == nil {
 				fwdRetry = time.NewTimer(forwardRetryInterval)
 			}
 		}
@@ -304,6 +327,7 @@ func (s *session) run(ctx context.Context) {
 			err := m.Err()
 			s.log.Warn("connection lost", "err", err)
 			s.stopMounts(running) // they die with the connection; clean up after them
+			s.stopUSB(nil, usbRT)
 			s.setMaster(nil)
 			m = nil
 			clear(applied)
@@ -533,6 +557,7 @@ func (s *session) status(host config.Host) api.HostStatus {
 		})
 	}
 	hs.Mounts = s.mountStatuses()
+	hs.USB = s.usbStatuses()
 	if hs.State == api.StateUp {
 		for _, f := range hs.Forwards {
 			if f.State == api.StateError {
@@ -541,6 +566,11 @@ func (s *session) status(host config.Host) api.HostStatus {
 		}
 		for _, ms := range hs.Mounts {
 			if ms.State == api.StateError {
+				hs.State = api.StateDegraded
+			}
+		}
+		for _, us := range hs.USB {
+			if us.State == api.StateError {
 				hs.State = api.StateDegraded
 			}
 		}

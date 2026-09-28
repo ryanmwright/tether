@@ -9,7 +9,8 @@ your SSH connections to dev machines up and manages what flows over them:
   SSH agent on the remote
 - **Directory mounts** in both directions: a remote directory here, or a
   local directory on the remote (sshfs over the same connection)
-- Later: USB forwarding (USB/IP)
+- **USB devices** plugged in here, shared with a remote (USB/IP over the
+  same connection): a security key, a board you're flashing, a serial adapter
 
 You drive it from the CLI, a terminal UI, or a system tray icon. It uses your
 system OpenSSH, so everything in `~/.ssh/config` (`ProxyJump`, keys, FIDO
@@ -17,8 +18,8 @@ tokens, `known_hosts`) works as it already does.
 
 > **Status: early development.** Connections, port forwards (`L`/`R`/`D`,
 > TCP and Unix sockets), automatic reconnects, gpg-agent forwarding, directory
-> mounts, profiles, `tether doctor`, the CLI, the terminal UI and the tray icon
-> work today. See [PLAN.md](PLAN.md) for the roadmap.
+> mounts, USB sharing, profiles, `tether doctor`, the CLI, the terminal UI and
+> the tray icon work today. See [PLAN.md](PLAN.md) for the roadmap.
 
 ## Contents
 
@@ -31,6 +32,7 @@ tokens, `known_hosts`) works as it already does.
 - [Configuration file](#configuration-file)
 - [gpg-agent forwarding](#gpg-agent-forwarding)
 - [Directory mounts](#directory-mounts)
+- [USB devices](#usb-devices)
 - [Terminal UI](#terminal-ui)
 - [Tray icon](#tray-icon)
 - [CLI](#cli)
@@ -342,8 +344,8 @@ digits, `.`, `_` and `-`.
 | `ssh` | string | the host's name | Destination passed to `ssh`: an alias from `~/.ssh/config`, or `user@host`. Put bastions, ports, users and keys in `~/.ssh/config` (e.g. `ProxyJump`). |
 | `autoconnect` | bool | `false` | Connect when the daemon starts and after network changes. |
 
-**`[profiles.<name>]`**: a named bundle of forwards, gpg and mounts on one
-host. Several profiles on the same host share one SSH connection.
+**`[profiles.<name>]`**: a named bundle of forwards, gpg, mounts and USB
+devices on one host. Several profiles on the same host share one SSH connection.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -353,6 +355,7 @@ host. Several profiles on the same host share one SSH connection.
 | `gpg_ssh` | bool | `false` | Also forward gpg-agent's SSH socket, so ssh on the host can use your SSH keys. |
 | `forwards` | list of strings | `[]` | Port forwards; see below. |
 | `mounts` | list of tables | `[]` | Directory mounts; see below. |
+| `usb` | list of strings | `[]` | USB devices to share: bus IDs (`"1-2"`) or `vendor:product` (`"1050:0407"`). See [USB devices](#usb-devices). |
 
 **Forward specs** (`forwards`):
 
@@ -394,7 +397,8 @@ and on reload to hosts and profiles that are new or newly marked
 ### Remote machines
 
 Remotes need only `sshd`. gpg forwarding needs a little remote setup (below),
-and local-to-remote mounts need `sshfs` and FUSE there. Run
+local-to-remote mounts need `sshfs` and FUSE there, and USB sharing needs
+`usbip` with root access. Run
 `tether doctor HOST` to check a host.
 
 ## gpg-agent forwarding
@@ -559,6 +563,133 @@ On a non-NixOS machine where Nix provides your tools, install `sshfs` and
 `fuse3` from the distribution anyway: FUSE mounts need the distribution's
 setuid `fusermount3`, which a Nix-built one isn't.
 
+## USB devices
+
+Share a USB device plugged in here with a remote. It shows up there as if it
+were plugged in; here it's gone until you stop sharing it.
+
+```console
+$ tether usb list
+BUS ID  ID         NAME                          SHARED WITH
+1-2     1050:0407  Yubico YubiKey OTP+FIDO+CCID
+3-1     0403:6001  FTDI FT232R USB UART
+$ tether usb attach devbox 1050:0407
+1050:0407: attached to devbox
+$ tether usb detach devbox 1050:0407
+1050:0407: detached
+```
+
+Name a device by bus ID (`1-2`: whatever is plugged into that port) or by
+`vendor:product` (`1050:0407`: that device, in any port). Or share it
+whenever a profile is active:
+
+```toml
+[profiles.work]
+host = "devbox"
+usb = ["1050:0407"]
+```
+
+The tray's "USB devices" section and the terminal UI's USB DEVICES list do
+the same with a click or `enter`.
+
+A device can be shared with one host at a time. Sharing comes and goes with
+the connection, like mounts: when the connection drops, the device comes
+back here, and it's attached again after reconnecting. If the remote
+detaches it, tether attaches it again within a couple of seconds; if you
+unplug it, it's attached again when you plug it back in (for a bus ID, into
+the same port).
+
+**How it works.** tether uses USB/IP, which is built into Linux. Exporting a
+device and handing its connection to the kernel need root, so a small helper,
+`tether usbip-helper`, does that part as a system service. The helper:
+
+- exports only the devices your daemon asks for, and gives each one back as
+  soon as the daemon lets go of it or disconnects (crashes included);
+- serves USB/IP only on `127.0.0.1`, and only to connections owned by the
+  users you allow. Remotes reach it through a reverse forward on the host's
+  SSH connection, so nothing is opened to the network.
+
+On the remote, tether runs `usbip attach` through that forward, as root with
+passwordless `sudo`.
+
+### Setting up this machine
+
+The helper runs as root and needs the `usbip-host` kernel module (Fedora:
+`kernel-modules-extra`; most other distributions ship it with the kernel).
+
+On NixOS:
+
+```nix
+{
+  imports = [ tether.nixosModules.usbip-helper ];
+  services.tether-usbip = {
+    enable = true;
+    users = [ "you" ];
+  };
+}
+```
+
+Elsewhere (Fedora, Debian, or any other systemd distribution, with or
+without Nix; home-manager can't install system services), let tether set the
+service up:
+
+```sh
+tether usbip-helper install
+```
+
+It asks for your password with `sudo`, then:
+
+- copies this `tether` to `/usr/local/lib/tether/tether`, so the service
+  doesn't depend on your home directory or a Nix profile, and SELinux lets
+  systemd run it (it's relabeled with `restorecon`);
+- writes the `tether-usbip` system service, allowing the user who ran it
+  (more with `--allow-user NAME`);
+- loads `usbip-host` now and at boot (`/etc/modules-load.d/tether-usbip.conf`);
+- starts the service and checks that the helper answers.
+
+**Run it again after upgrading tether**, so the service uses the new
+version. `tether usbip-helper uninstall` stops and removes it all; shared
+devices come back to this machine. Files tether didn't write, such as a unit
+you wrote by hand, are left alone (`install` replaces such a unit, and says
+so).
+
+The copy has to be a static binary; the flake's package is one. A tether
+built against the Nix store's libraries is refused, since the copy would
+break after garbage collection.
+
+The helper listens on port 3240, USB/IP's standard port, on loopback. If
+`usbipd` already uses it, pick another with `--listen 127.0.0.1:3241` (on `install` too). The
+daemon looks for the helper at `/run/tether-usbip/helper.sock`
+(`tether daemon --usbip-helper-socket` to change it).
+
+### Setting up a remote
+
+The remote needs `usbip`, the `vhci-hcd` kernel module, and passwordless
+`sudo` for `usbip` (or you log in as root). On NixOS, with the
+[remote module](#nixos-remotes):
+
+```nix
+tether.remote = {
+  enable = true;
+  usb = {
+    enable = true;
+    users = [ "you" ];
+  };
+};
+```
+
+On Debian:
+
+```sh
+sudo apt install usbip
+echo vhci-hcd | sudo tee /etc/modules-load.d/vhci-hcd.conf
+sudo modprobe vhci-hcd
+echo "you ALL=(root) NOPASSWD: /usr/sbin/usbip" | sudo tee /etc/sudoers.d/tether-usbip
+```
+
+`tether doctor HOST` checks both sides when the host has USB devices to
+share.
+
 ## Terminal UI
 
 `tether tui` shows everything live and lets you change it with single keys:
@@ -585,7 +716,7 @@ enter toggle · a add forward · g gpg · d doctor · r reload · l log · ? hel
 | Key | Action |
 |---|---|
 | `↑`/`k`, `↓`/`j` | Move |
-| `enter`, `space` | Toggle: connect/disconnect a host, activate/deactivate a profile, remove an ad-hoc forward or mount. The footer says which |
+| `enter`, `space` | Toggle: connect/disconnect a host, activate/deactivate a profile, remove an ad-hoc forward or mount, share a USB device or stop sharing it. The footer says which |
 | `u` | Bring the selection up now; on a failed host, retry without waiting |
 | `x` | Take the selection down; on an ad-hoc host that's already down, forget it |
 | `c` | Connect to a host that isn't in the config: `NAME [SSH-DEST]` |
@@ -600,6 +731,11 @@ enter toggle · a add forward · g gpg · d doctor · r reload · l log · ? hel
 
 Forwards that come from a profile can't be removed on their own; deactivate
 the profile (or edit the config) instead.
+
+Below the profiles, **USB DEVICES** lists the devices plugged in here and
+where each one is shared. `enter` on a device shares it with the connected
+host (asking which, if several are connected), or stops sharing it. Shared
+devices also appear under their host, with their state.
 
 ## Tray icon
 
@@ -620,19 +756,22 @@ The tooltip counts hosts by state, and active profiles, e.g.
 summary heads the menu.
 
 - **Left-click** opens the terminal UI.
-- **The menu** has a submenu per host (connect or disconnect, its forwards
-  and mounts with their state, retry, toggle gpg-agent forwarding, mount a
+- **The menu** has a submenu per host (connect or disconnect, its forwards,
+  mounts and USB devices with their state, retry, toggle gpg-agent forwarding, mount a
   directory in either direction, unmount ad-hoc mounts, and forget for
   ad-hoc hosts), your profiles as checkboxes, "Connect to host…" (asks for
-  `NAME [SSH-DEST]`), and reload. Prompts use `kdialog` or `zenity`; without
+  `NAME [SSH-DEST]`), a "USB devices" section, and reload. Prompts use `kdialog` or `zenity`; without
   either, the terminal UI opens instead.
 - **Mounting from the menu**: "Mount remote directory here…" asks for the
   remote directory and a local mount point (default `~/mnt/<name>`, created
   if missing). "Mount local directory on HOST…" opens a folder picker, then
   asks where to mount it on the remote (default `~/<name>`). Like
   `tether mount add`, this connects the host if needed.
+- **USB devices**: each device plugged in here, with its state and the host
+  it's shared with. Its submenu has a "Share with HOST" checkbox per host;
+  tick one to share the device there, untick it to bring the device back.
 - **Desktop notifications** say when a connection drops or comes back, and
-  when a forward or mount fails. Later news about the same thing replaces the
+  when a forward, mount or USB device fails. Later news about the same thing replaces the
   earlier notification. Turn them off with `--no-notify`.
 
 If the daemon isn't running, the icon turns gray and the menu offers to start
@@ -686,6 +825,13 @@ tether logs [-f] [-n 50]          the daemon's recent log (it keeps 500 entries)
 tether mount add HOST SRC DST     mount SRC at DST; one side is remote:PATH
   -o OPTION                       extra sshfs option (repeatable)
 tether mount rm HOST SRC DST      unmount an ad-hoc mount
+tether usb list                   USB devices here, and where they're shared
+tether usb attach HOST DEVICE     share a device (bus ID or vendor:product)
+tether usb detach HOST DEVICE     stop sharing it
+tether usbip-helper               the privileged USB/IP helper (as root)
+  --allow-user USER               who may share devices (repeatable)
+tether usbip-helper install       set it up as a systemd service (uses sudo)
+tether usbip-helper uninstall     remove that service
 tether status [--json]            hosts, forwards and profiles
 tether status -w [--json]         keep running and show every change
 tether config check               validate the config file (no daemon needed)
@@ -693,6 +839,7 @@ tether config reload              make the daemon re-read the config
 tether daemon                     run the daemon in the foreground
   --log-level LEVEL               debug, info, warn, error (default info)
   --ssh-config FILE               use FILE instead of ~/.ssh/config (ssh -F)
+  --usbip-helper-socket PATH      the USB/IP helper's socket
 tether daemon stop                stop the running daemon
 tether version
 ```

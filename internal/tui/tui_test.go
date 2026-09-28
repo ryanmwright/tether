@@ -399,3 +399,71 @@ func TestEnterHint(t *testing.T) {
 		t.Error("ad-hoc host not marked")
 	}
 }
+
+func TestUSB(t *testing.T) {
+	m, fc := newModel(t)
+	st := sampleStatus
+	st.Hosts = append([]api.HostStatus{}, sampleStatus.Hosts...)
+	st.Hosts[0].USB = []api.USBStatus{
+		{Device: "1050:0407", BusID: "1-1", Name: "Yubico YubiKey", AdHoc: true, State: api.StateUp},
+		{Device: "0627:0001", Profiles: []string{"work"}, State: api.StateError, Error: "no USB device 0627:0001 plugged in"},
+	}
+	st.USB = []api.USBDevice{
+		{BusID: "1-1", ID: "1050:0407", Name: "Yubico YubiKey", Host: "dev"},
+		{BusID: "1-2", ID: "046d:c52b", Name: "Logitech Receiver"},
+	}
+	st.USBUnavailable = "the USB/IP helper isn't running"
+	m = update(t, m, statusMsg(st))
+
+	s := screen(m)
+	for _, want := range []string{"USB DEVICES", "usb 1050:0407", "no USB device 0627:0001 plugged in",
+		"Logitech Receiver (046d:c52b)", "Yubico YubiKey (1050:0407) · on dev", "⚠ the USB/IP helper isn't running"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("screen missing %q:\n%s", want, s)
+		}
+	}
+
+	// Enter on a shared device stops sharing it, from either row.
+	for _, row := range []string{"1-1", "1050:0407"} {
+		m = press(t, moveTo(t, m, row), "enter")
+		want := call{api.MethodUSBDetach, api.USBParams{Host: "dev", Device: "1050:0407"}}
+		if got := fc.last(); !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: got %+v, want %+v", row, got, want)
+		}
+	}
+	// A profile's device stays.
+	n := len(fc.calls)
+	m = press(t, moveTo(t, m, "0627:0001"), "x")
+	if len(fc.calls) != n || !strings.Contains(m.flash, "profile work") {
+		t.Errorf("profile device: calls %+v, flash %q", fc.calls[n:], m.flash)
+	}
+
+	// With one host connected, enter shares with it...
+	m = press(t, moveTo(t, m, "1-2"), "enter")
+	if got, want := fc.last(), (call{api.MethodUSBAttach, api.USBParams{Host: "dev", Device: "1-2"}}); !reflect.DeepEqual(got, want) {
+		t.Errorf("share: got %+v, want %+v", got, want)
+	}
+	// ...with several, it asks which.
+	st.Hosts[1].State = api.StateUp
+	m = update(t, m, statusMsg(st))
+	m = press(t, moveTo(t, m, "1-2"), "enter")
+	if !strings.Contains(screen(m), "share Logitech Receiver (046d:c52b) with which host?") {
+		t.Fatalf("share prompt not shown:\n%s", screen(m))
+	}
+	for _, r := range "lab" {
+		m = press(t, m, string(r))
+	}
+	m = press(t, m, "enter")
+	if got, want := fc.last(), (call{api.MethodUSBAttach, api.USBParams{Host: "lab", Device: "1-2"}}); !reflect.DeepEqual(got, want) {
+		t.Errorf("share with lab: got %+v, want %+v", got, want)
+	}
+
+	// Host keys do nothing on a local device.
+	n = len(fc.calls)
+	if m = press(t, moveTo(t, m, "1-2"), "u"); len(fc.calls) != n {
+		t.Errorf("u on a device called %+v", fc.calls[n:])
+	}
+	if s := screen(moveTo(t, m, "1-1")); !strings.Contains(s, "enter stop sharing ·") {
+		t.Error("footer lacks the stop-sharing hint")
+	}
+}

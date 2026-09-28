@@ -58,6 +58,8 @@ func newRootCmd() *cobra.Command {
 		newFwdCmd(g),
 		newGPGCmd(g),
 		newMountCmd(g),
+		newUSBCmd(g),
+		newUSBIPHelperCmd(),
 		newHostCmd(g),
 		newDoctorCmd(g),
 		newLogsCmd(g),

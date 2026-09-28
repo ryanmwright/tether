@@ -141,6 +141,59 @@ func TestBuild(t *testing.T) {
 	}
 }
 
+func TestBuildUSB(t *testing.T) {
+	st := api.Status{
+		Hosts: []api.HostStatus{
+			{Name: "dev", State: api.StateUp, USB: []api.USBStatus{
+				{Device: "1-1", BusID: "1-1", Name: "Yubico YubiKey", AdHoc: true, State: api.StateUp},
+			}},
+			{Name: "lab", State: api.StateUp, USB: []api.USBStatus{
+				{Device: "0627:0001", Profiles: []string{"work"}, State: api.StateError, Error: "no USB device 0627:0001 plugged in"},
+			}},
+		},
+		USB: []api.USBDevice{
+			{BusID: "1-1", ID: "1050:0407", Name: "Yubico YubiKey", Host: "dev"},
+			{BusID: "1-2", ID: "046d:c52b", Name: "Logitech Receiver"},
+		},
+	}
+	items := Build(st)
+
+	if it := find(items, "usb:1-1"); it == nil || it.Title != "● Yubico YubiKey (1050:0407) — dev" {
+		t.Errorf("shared device = %+v", it)
+	}
+	if it := find(items, "usb:1-1:dev"); it == nil || !it.Checked || it.Action.Method != api.MethodUSBDetach ||
+		it.Action.Params != (api.USBParams{Host: "dev", Device: "1-1"}) {
+		t.Errorf("unshare = %+v", it)
+	}
+	// It can't be shared with a second host while it's on dev.
+	if it := find(items, "usb:1-1:lab"); it == nil || it.Checked || it.Enabled || it.Action != nil {
+		t.Errorf("share elsewhere = %+v", it)
+	}
+	if it := find(items, "usb:1-2"); it == nil || it.Title != "○ Logitech Receiver (046d:c52b)" {
+		t.Errorf("free device = %+v", it)
+	}
+	if it := find(items, "usb:1-2:lab"); it == nil || it.Checked || it.Action.Method != api.MethodUSBAttach ||
+		it.Action.Params != (api.USBParams{Host: "lab", Device: "1-2"}) {
+		t.Errorf("share = %+v", it)
+	}
+	// Per-host rows, including a profile device that isn't plugged in.
+	if it := find(items, "host:dev:usb:1-1"); it == nil || it.Title != "● USB 1-1 — Yubico YubiKey" {
+		t.Errorf("dev usb row = %+v", it)
+	}
+	if it := find(items, "host:lab:usb:0627:0001"); it == nil || !strings.Contains(it.Title, "no USB device 0627:0001 plugged in") {
+		t.Errorf("lab usb row = %+v", it)
+	}
+	if find(items, "usb-unavailable") != nil {
+		t.Error("warning shown with the helper available")
+	}
+
+	st.USB, st.USBUnavailable = nil, "the USB/IP helper isn't running"
+	items = Build(st)
+	if find(items, "usb-unavailable") == nil || find(items, "no-usb") == nil {
+		t.Error("missing helper warning or empty-list label")
+	}
+}
+
 func TestShape(t *testing.T) {
 	base := Shape(Build(sample))
 
@@ -196,6 +249,12 @@ func TestChanges(t *testing.T) {
 	cur := st(api.HostStatus{Name: "dev", State: api.StateDegraded, Forwards: []api.ForwardStatus{{Spec: "D:1080", State: api.StateError, Error: "port in use"}}})
 	if n := Changes(prev, cur); len(n) != 1 || n[0].Summary != "dev: D:1080 failed" || n[0].Body != "port in use" {
 		t.Errorf("forward failure = %+v", n)
+	}
+
+	prev = st(api.HostStatus{Name: "dev", State: api.StateUp, USB: []api.USBStatus{{Device: "1-1", State: api.StateUp}}})
+	cur = st(api.HostStatus{Name: "dev", State: api.StateDegraded, USB: []api.USBStatus{{Device: "1-1", State: api.StateError, Error: "device unplugged"}}})
+	if n := Changes(prev, cur); len(n) != 1 || n[0].Summary != "dev: USB device 1-1 failed" || n[0].Body != "device unplugged" {
+		t.Errorf("USB failure = %+v", n)
 	}
 }
 

@@ -19,9 +19,9 @@ func newTrayCmd(g *globalFlags) *cobra.Command {
 		Use:   "tray",
 		Short: "Show the system tray icon",
 		Long: "Show a system tray icon (StatusNotifierItem: KDE, and most other Linux\n" +
-			"desktops) with the overall state, a menu to connect and disconnect hosts\n" +
-			"and activate profiles, and desktop notifications when connections drop or\n" +
-			"forwards fail. Left-click opens the terminal UI. Quitting the tray leaves\n" +
+			"desktops) with the overall state, a menu to connect and disconnect hosts,\n" +
+			"activate profiles and share USB devices, and desktop notifications when\n" +
+			"connections drop or forwards fail. Left-click opens the terminal UI. Quitting the tray leaves\n" +
 			"everything running in the daemon.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {

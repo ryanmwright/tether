@@ -154,6 +154,8 @@ func Build(st api.Status) []Item {
 		}
 	}
 
+	items = append(items, usbItems(st)...)
+
 	return append(items,
 		separator("sep-app"),
 		action("open-tui", "Open terminal UI", &Action{Local: localOpenTUI}),
@@ -182,7 +184,7 @@ func hostItem(h api.HostStatus) Item {
 		children = append(children, action(id+":retry", "Retry now", &Action{Method: api.MethodUp, Params: target, Done: "reconnect " + h.Name}))
 	}
 
-	if len(h.Forwards) > 0 || len(h.Mounts) > 0 {
+	if len(h.Forwards) > 0 || len(h.Mounts) > 0 || len(h.USB) > 0 {
 		children = append(children, separator(id+":sep-items"))
 	}
 	gpgAdHoc := false
@@ -212,6 +214,18 @@ func hostItem(h api.HostStatus) Item {
 		}
 		children = append(children, it)
 	}
+	for _, u := range h.USB {
+		title := stateMark[u.State] + " USB " + u.Device
+		switch {
+		case u.Error != "":
+			title += " — " + u.Error
+		case u.Name != "" && u.Device != u.BusID:
+			title += " — " + u.Name + " at " + u.BusID
+		case u.Name != "":
+			title += " — " + u.Name
+		}
+		children = append(children, label(id+":usb:"+u.Device, title))
+	}
 
 	children = append(children, separator(id+":sep-actions"))
 	gpg := Item{ID: id + ":gpg", Title: "Forward gpg-agent", Enabled: true, Checkable: true, Checked: gpgAdHoc}
@@ -228,6 +242,66 @@ func hostItem(h api.HostStatus) Item {
 		children = append(children, action(id+":forget", "Forget this host", &Action{Method: api.MethodHostRemove, Params: api.HostParams{Name: h.Name}, Done: "forget " + h.Name}))
 	}
 	return Item{ID: id, Title: title, Enabled: true, Children: children}
+}
+
+// usbItems is the USB section: each local device, with a checkbox per host
+// to share it there.
+func usbItems(st api.Status) []Item {
+	items := []Item{separator("sep-usb"), label("usb", "USB devices")}
+	if st.USBUnavailable != "" {
+		items = append(items, label("usb-unavailable", "⚠ "+st.USBUnavailable))
+	}
+	if len(st.USB) == 0 {
+		return append(items, label("no-usb", "No USB devices"))
+	}
+	for _, d := range st.USB {
+		id := "usb:" + d.BusID
+		title := "○ " + d.Title()
+		var children []Item
+		for _, h := range st.Hosts {
+			u, shared := sharedWith(h, d)
+			it := Item{ID: id + ":" + h.Name, Title: "Share with " + h.Name, Enabled: true, Checkable: true, Checked: shared}
+			switch {
+			case shared && !u.AdHoc:
+				it.Title += " (profile " + strings.Join(u.Profiles, ", ") + ")"
+				it.Enabled = false
+			case shared:
+				it.Action = &Action{Method: api.MethodUSBDetach, Params: api.USBParams{Host: h.Name, Device: u.Device}, Done: "stop sharing " + d.Title() + " with " + h.Name}
+			case d.Host != "":
+				it.Enabled = false // it's elsewhere
+			default:
+				it.Action = &Action{Method: api.MethodUSBAttach, Params: api.USBParams{Host: h.Name, Device: d.BusID}, Done: "share " + d.Title() + " with " + h.Name}
+			}
+			if shared {
+				title = stateMark[u.State] + " " + d.Title() + " — " + h.Name
+				if u.State != api.StateUp {
+					title += " (" + string(u.State) + ")"
+				}
+			}
+			children = append(children, it)
+		}
+		if len(children) == 0 {
+			children = append(children, label(id+":no-hosts", "No hosts to share with"))
+		}
+		items = append(items, Item{ID: id, Title: title, Enabled: true, Children: children})
+	}
+	return items
+}
+
+// sharedWith finds the entry on h, if any, that shares local device d:
+// attached to it, or asked for by its bus ID or vendor:product.
+func sharedWith(h api.HostStatus, d api.USBDevice) (api.USBStatus, bool) {
+	for _, u := range h.USB {
+		if u.BusID == d.BusID || u.Device == d.BusID {
+			return u, true
+		}
+	}
+	for _, u := range h.USB {
+		if u.Device == d.ID && u.BusID == "" {
+			return u, true
+		}
+	}
+	return api.USBStatus{}, false
 }
 
 // DisconnectedMenu is shown while the daemon isn't reachable.

@@ -20,6 +20,8 @@ const (
 	MethodMountRemove   = "mount.remove"
 	MethodHostAdd       = "host.add"
 	MethodHostRemove    = "host.remove"
+	MethodUSBAttach     = "usb.attach"
+	MethodUSBDetach     = "usb.detach"
 	MethodDoctor        = "host.doctor"
 	MethodLogs          = "daemon.logs"
 
@@ -35,7 +37,7 @@ const (
 // method or field that clients rely on is added or changed, so a client can
 // tell it's talking to an older daemon left running across an upgrade.
 // Daemons from before it existed report 0.
-const ProtocolVersion = 3
+const ProtocolVersion = 4
 
 // Application error codes (outside the range reserved by JSON-RPC).
 const (
@@ -66,6 +68,28 @@ type Status struct {
 	ConfigError string          `json:"config_error,omitempty"`
 	Hosts       []HostStatus    `json:"hosts"`
 	Profiles    []ProfileStatus `json:"profiles"`
+	// USB lists the devices plugged in here that can be shared.
+	USB []USBDevice `json:"usb"`
+	// USBUnavailable says why devices can't be shared right now, e.g. the
+	// USB/IP helper isn't running.
+	USBUnavailable string `json:"usb_unavailable,omitempty"`
+}
+
+// USBDevice is a USB device on this machine.
+type USBDevice struct {
+	BusID string `json:"busid"` // e.g. "1-2.3"
+	ID    string `json:"id"`    // vendor:product, e.g. "1050:0407"
+	Name  string `json:"name,omitempty"`
+	// Host is where the device is attached (or being attached), if anywhere.
+	Host string `json:"host,omitempty"`
+}
+
+// Title names the device for people: "YubiKey (1050:0407)".
+func (d USBDevice) Title() string {
+	if d.Name == "" {
+		return d.ID
+	}
+	return d.Name + " (" + d.ID + ")"
 }
 
 type HostStatus struct {
@@ -78,6 +102,18 @@ type HostStatus struct {
 	RetryAt     *time.Time      `json:"retry_at,omitempty"` // next reconnect attempt
 	Forwards    []ForwardStatus `json:"forwards"`
 	Mounts      []MountStatus   `json:"mounts"`
+	USB         []USBStatus     `json:"usb"`
+}
+
+// USBStatus is a USB device shared with a host.
+type USBStatus struct {
+	Device   string   `json:"device"`          // as asked for: a bus ID or vendor:product
+	BusID    string   `json:"busid,omitempty"` // the device it matched, once found
+	Name     string   `json:"name,omitempty"`
+	Profiles []string `json:"profiles,omitempty"`
+	AdHoc    bool     `json:"adhoc,omitempty"`
+	State    State    `json:"state"`
+	Error    string   `json:"error,omitempty"`
 }
 
 type MountStatus struct {
@@ -238,4 +274,17 @@ type MountResult struct {
 type HostParams struct {
 	Name string `json:"name"`
 	SSH  string `json:"ssh,omitempty"`
+}
+
+// USBParams names a device for usb.attach and usb.detach: a bus ID ("1-2.3")
+// or vendor:product ("1050:0407").
+type USBParams struct {
+	Host   string `json:"host"`
+	Device string `json:"device"`
+}
+
+type USBResult struct {
+	Host       string `json:"host"`
+	Device     string `json:"device"` // canonical form
+	Generation uint64 `json:"generation"`
 }

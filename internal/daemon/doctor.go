@@ -16,6 +16,7 @@ import (
 	"github.com/ryanmwright/tether/internal/mount"
 	"github.com/ryanmwright/tether/internal/openssh"
 	"github.com/ryanmwright/tether/internal/rpc"
+	"github.com/ryanmwright/tether/internal/usbip"
 )
 
 const doctorTimeout = 30 * time.Second
@@ -27,6 +28,8 @@ type doctor struct {
 	useGPG, gpgSSH bool
 	mountHere      bool // remote directories mounted on this machine
 	mountThere     bool // local directories mounted on the remote
+	useUSB         bool // USB devices shared with the host
+	usbHelper      func(context.Context) (int, error)
 	checks         []api.Check
 }
 
@@ -42,7 +45,7 @@ func (d *Daemon) handleDoctor(ctx context.Context, params json.RawMessage) (any,
 	d.mu.Lock()
 	host, ok := d.host(p.Host)
 	var s *session
-	dr := &doctor{host: p.Host, dest: host.SSH}
+	dr := &doctor{host: p.Host, dest: host.SSH, usbHelper: d.usb.Port}
 	if ok {
 		s = d.sessions[p.Host].s
 		// Check gpg if anything could forward it to this host.
@@ -70,6 +73,10 @@ func (d *Daemon) handleDoctor(ctx context.Context, params json.RawMessage) (any,
 		for _, spec := range specs {
 			dr.mountHere = dr.mountHere || spec.Direction == mount.RemoteToLocal
 			dr.mountThere = dr.mountThere || spec.Direction == mount.LocalToRemote
+		}
+		dr.useUSB = len(d.adhocUSB[p.Host]) > 0
+		for _, prof := range d.cfg.Profiles {
+			dr.useUSB = dr.useUSB || prof.Host == p.Host && len(prof.USB) > 0
 		}
 	}
 	d.mu.Unlock()
@@ -122,6 +129,7 @@ func (dr *doctor) checkLocal(ctx context.Context) {
 	}
 
 	dr.checkLocalMounts()
+	dr.checkLocalUSB(ctx)
 	if !dr.useGPG {
 		dr.add("local", "gpg-agent", api.CheckSkip, "no profile on "+dr.host+" forwards gpg", "")
 		return
@@ -140,7 +148,58 @@ func (dr *doctor) checkLocal(ctx context.Context) {
 
 func (dr *doctor) checkRemote(ctx context.Context, m *openssh.Master) {
 	dr.checkRemoteMounts(ctx, m)
+	dr.checkRemoteUSB(ctx, m)
 	dr.checkRemoteGPG(ctx, m)
+}
+
+// checkLocalUSB checks that the USB/IP helper answers.
+func (dr *doctor) checkLocalUSB(ctx context.Context) {
+	if !dr.useUSB {
+		return
+	}
+	port, err := dr.usbHelper(ctx)
+	if err != nil {
+		dr.add("local", "usb", api.CheckFail, err.Error(),
+			"set it up with `tether usbip-helper install` (NixOS: services.tether-usbip.enable)")
+		return
+	}
+	dr.add("local", "usb", api.CheckOK, fmt.Sprintf("USB/IP helper running, port %d", port), "")
+}
+
+// checkRemoteUSB checks what attaching devices needs on the remote.
+func (dr *doctor) checkRemoteUSB(ctx context.Context, m *openssh.Master) {
+	if !dr.useUSB {
+		return
+	}
+	out, err := m.Run(ctx, usbip.CheckScript, "sh -s")
+	if err != nil {
+		dr.add("remote", "usb", api.CheckFail, "inspecting the remote failed: "+err.Error(), "")
+		return
+	}
+	facts := map[string]string{}
+	for line := range strings.Lines(string(out)) {
+		k, v, _ := strings.Cut(strings.TrimSpace(line), "=")
+		facts[k] = v
+	}
+	var problems, fixes []string
+	if facts["usbip"] == "" {
+		problems = append(problems, "usbip not found")
+		fixes = append(fixes, "install it (Debian: apt install usbip)")
+	}
+	if facts["vhci"] != "yes" {
+		problems = append(problems, "vhci-hcd module not loaded")
+		fixes = append(fixes, "load it at boot: echo vhci-hcd | sudo tee /etc/modules-load.d/vhci-hcd.conf; sudo modprobe vhci-hcd")
+	}
+	if facts["usbip"] != "" && facts["root"] != "yes" && facts["sudo"] != "yes" {
+		problems = append(problems, "no passwordless sudo for usbip")
+		fixes = append(fixes, fmt.Sprintf("allow it in sudoers: YOUR-USER ALL=(root) NOPASSWD: %s", facts["usbip"]))
+	}
+	if len(problems) > 0 {
+		dr.add("remote", "usb", api.CheckFail, strings.Join(problems, "; ")+" on "+dr.host,
+			strings.Join(fixes, "; ")+" (NixOS: tether.remote.usb.enable)")
+		return
+	}
+	dr.add("remote", "usb", api.CheckOK, "usbip, vhci-hcd and root access available", "")
 }
 
 // checkLocalMounts checks what mounting remote directories here needs.

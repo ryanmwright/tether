@@ -74,6 +74,7 @@ func TestParseErrors(t *testing.T) {
 		},
 		{"unknown host", "[profiles.p]\nhost = \"nope\"", []string{`unknown host "nope"`}},
 		{"bad mount", "[hosts.h]\n[profiles.p]\nhost = \"h\"\n[[profiles.p.mounts]]\ndirection = \"sideways\"\nremote = \"x\"\nlocal = \"rel/path\"\n", []string{"mounts[0]: direction must be"}},
+		{"bad usb", "[hosts.h]\n[profiles.p]\nhost = \"h\"\nusb = [\"1-1\", \"yubikey\"]\n", []string{`profiles.p.usb[1]: invalid USB device "yubikey"`}},
 		{"relative mount", "[hosts.h]\n[profiles.p]\nhost = \"h\"\n[[profiles.p.mounts]]\ndirection = \"remote-to-local\"\nremote = \"x\"\nlocal = \"rel/path\"\n", []string{"must be absolute or start with ~/"}},
 	}
 	for _, tt := range tests {

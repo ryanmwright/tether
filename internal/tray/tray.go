@@ -197,9 +197,9 @@ func (t *tray) build(parent *systray.MenuItem, items []Item) {
 			mi.Disable()
 		}
 		t.items[it.ID] = mi
-		if it.Action != nil {
-			go t.watch(it.ID, mi, t.buildDone)
-		}
+		// Watch every item: one without an action now may get one in an
+		// in-place update.
+		go t.watch(it.ID, mi, t.buildDone)
 		t.build(mi, it.Children)
 	}
 }

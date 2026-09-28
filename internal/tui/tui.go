@@ -48,7 +48,9 @@ const (
 	rowHost rowKind = iota
 	rowForward
 	rowMount
+	rowUSB // a device shared with a host
 	rowProfile
+	rowUSBDevice // a device plugged in here
 )
 
 // row is one selectable line. Its identity (kind, host, name) survives status
@@ -56,7 +58,7 @@ const (
 type row struct {
 	kind rowKind
 	host string
-	name string // forward spec, mount key or profile name
+	name string // forward spec, mount key, USB device, profile name or bus ID
 }
 
 type Model struct {
@@ -76,6 +78,7 @@ type Model struct {
 	input     textinput.Model
 	inputHost string
 	inputKind inputKind
+	inputUSB  api.USBDevice // the device to share, for inputShare
 
 	doctorHost    string
 	doctor        *api.DoctorResult
@@ -102,12 +105,14 @@ const (
 	inputForward inputKind = iota
 	inputMount
 	inputConnect
+	inputShare
 )
 
 var prompts = map[inputKind]struct{ prompt, placeholder, title string }{
 	inputForward: {"forward> ", "L:8080:localhost:80   R:0:localhost:3000   D:1080   gpg-agent", "add a forward to %s"},
 	inputMount:   {"mount> ", "remote:~/src ~/mnt/src   or   ~/proj remote:~/proj", "add a mount on %s"},
 	inputConnect: {"connect> ", "NAME [SSH-DEST]   e.g. devbox2   or   scratch me@10.0.0.5", "connect to a host that isn't in the config"},
+	inputShare:   {"host> ", "HOST", "share %s with which host?"},
 }
 
 type (
@@ -214,9 +219,15 @@ func (m *Model) setStatus(st api.Status) {
 		for _, mt := range h.Mounts {
 			m.rows = append(m.rows, row{kind: rowMount, host: h.Name, name: mt.Key})
 		}
+		for _, u := range h.USB {
+			m.rows = append(m.rows, row{kind: rowUSB, host: h.Name, name: u.Device})
+		}
 	}
 	for _, p := range st.Profiles {
 		m.rows = append(m.rows, row{kind: rowProfile, host: p.Host, name: p.Name})
+	}
+	for _, d := range st.USB {
+		m.rows = append(m.rows, row{kind: rowUSBDevice, name: d.BusID})
 	}
 	if i := slices.Index(m.rows, selected); i >= 0 {
 		m.cursor = i
@@ -257,6 +268,8 @@ func (m Model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				return m.addMount(value)
 			case inputConnect:
 				return m.addHost(value)
+			case inputShare:
+				return m, m.share(m.inputUSB, value)
 			}
 			return m, m.call("added "+value+" on "+m.inputHost, api.MethodForwardAdd, api.ForwardParams{Host: m.inputHost, Spec: value})
 		}
@@ -267,6 +280,8 @@ func (m Model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	m.flash = ""
 	sel, ok := m.selected()
+	// Host keys act on the selection's host; local USB devices have none.
+	hostOK := ok && sel.kind != rowUSBDevice
 	switch k {
 	case "q":
 		return m, tea.Quit
@@ -289,7 +304,7 @@ func (m Model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m.toggle(sel)
 		}
 	case "u":
-		if ok {
+		if hostOK {
 			return m, m.up(sel)
 		}
 	case "x":
@@ -297,7 +312,7 @@ func (m Model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m.remove(sel)
 		}
 	case "a", "m":
-		if ok {
+		if hostOK {
 			kind := inputForward
 			if k == "m" {
 				kind = inputMount
@@ -309,11 +324,11 @@ func (m Model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		cmd := m.prompt(inputConnect, "")
 		return m, cmd
 	case "g":
-		if ok {
+		if hostOK {
 			return m, m.toggleGPG(sel.host)
 		}
 	case "d":
-		if ok {
+		if hostOK {
 			m.mode, m.doctorHost, m.doctor, m.doctorErr, m.doctorRunning = modeDoctor, sel.host, nil, nil, true
 			return m, m.runDoctor(sel.host)
 		}
@@ -350,9 +365,41 @@ func (m Model) toggle(r row) (tea.Model, tea.Cmd) {
 			return m, m.down(r)
 		}
 		return m, m.up(r)
+	case rowUSBDevice:
+		return m.toggleUSB(r.name)
 	default:
 		return m.remove(r)
 	}
+}
+
+// toggleUSB stops sharing a local device, or shares it: with the only
+// connected host, or one the user names.
+func (m Model) toggleUSB(busid string) (tea.Model, tea.Cmd) {
+	d := m.usbDevice(busid)
+	if d.Host != "" {
+		u := m.sharedUSB(d)
+		if !u.AdHoc {
+			m.flash, m.flashErr = fmt.Sprintf("%s is shared by profile %s; deactivate the profile to stop sharing it", d.Title(), strings.Join(u.Profiles, ", ")), true
+			return m, nil
+		}
+		return m, m.call("stopped sharing "+d.Title(), api.MethodUSBDetach, api.USBParams{Host: d.Host, Device: u.Device})
+	}
+	var connected []string
+	for _, h := range m.status.Hosts {
+		if h.State == api.StateUp || h.State == api.StateDegraded {
+			connected = append(connected, h.Name)
+		}
+	}
+	if len(connected) == 1 {
+		return m, m.share(d, connected[0])
+	}
+	m.inputUSB = d
+	cmd := m.prompt(inputShare, "")
+	return m, cmd
+}
+
+func (m Model) share(d api.USBDevice, host string) tea.Cmd {
+	return m.call("sharing "+d.Title()+" with "+host, api.MethodUSBAttach, api.USBParams{Host: host, Device: d.BusID})
 }
 
 func (m Model) up(r row) tea.Cmd {
@@ -372,6 +419,20 @@ func (m Model) down(r row) tea.Cmd {
 // remove takes down what the selection names: an ad-hoc forward or mount,
 // a profile or a host.
 func (m Model) remove(r row) (tea.Model, tea.Cmd) {
+	switch r.kind {
+	case rowUSBDevice:
+		if m.usbDevice(r.name).Host == "" {
+			return m, nil
+		}
+		return m.toggleUSB(r.name)
+	case rowUSB:
+		u := m.usbStatus(r.host, r.name)
+		if !u.AdHoc {
+			m.flash, m.flashErr = fmt.Sprintf("USB %s comes from profile %s; deactivate the profile to stop sharing it", r.name, strings.Join(u.Profiles, ", ")), true
+			return m, nil
+		}
+		return m, m.call("stopped sharing "+r.name, api.MethodUSBDetach, api.USBParams{Host: r.host, Device: r.name})
+	}
 	if r.kind == rowMount {
 		mt := m.mountStatus(r.host, r.name)
 		if !mt.AdHoc {
@@ -484,6 +545,34 @@ func (m Model) mountStatus(host, key string) api.MountStatus {
 	return api.MountStatus{Key: key}
 }
 
+func (m Model) usbStatus(host, device string) api.USBStatus {
+	for _, u := range m.hostStatus(host).USB {
+		if u.Device == device {
+			return u
+		}
+	}
+	return api.USBStatus{Device: device}
+}
+
+func (m Model) usbDevice(busid string) api.USBDevice {
+	for _, d := range m.status.USB {
+		if d.BusID == busid {
+			return d
+		}
+	}
+	return api.USBDevice{BusID: busid}
+}
+
+// sharedUSB is the host's entry for a local device that is shared.
+func (m Model) sharedUSB(d api.USBDevice) api.USBStatus {
+	for _, u := range m.hostStatus(d.Host).USB {
+		if u.BusID == d.BusID {
+			return u
+		}
+	}
+	return api.USBStatus{}
+}
+
 func (m Model) forwardStatus(host, spec string) api.ForwardStatus {
 	for _, f := range m.hostStatus(host).Forwards {
 		if f.Spec == spec {
@@ -545,7 +634,10 @@ func (m Model) render() string {
 	var bottom []string
 	if m.mode == modeInput {
 		title := prompts[m.inputKind].title
-		if strings.Contains(title, "%s") {
+		switch {
+		case m.inputKind == inputShare:
+			title = fmt.Sprintf(title, m.inputUSB.Title())
+		case strings.Contains(title, "%s"):
 			title = fmt.Sprintf(title, m.inputHost)
 		}
 		bottom = append(bottom, title+" (enter to confirm, esc to cancel)", m.input.View())
@@ -631,6 +723,18 @@ func (m Model) enterHint() string {
 		if m.mountStatus(r.host, r.name).AdHoc {
 			return "enter unmount"
 		}
+	case rowUSB:
+		if m.usbStatus(r.host, r.name).AdHoc {
+			return "enter stop sharing"
+		}
+	case rowUSBDevice:
+		d := m.usbDevice(r.name)
+		if d.Host == "" {
+			return "enter share"
+		}
+		if m.sharedUSB(d).AdHoc {
+			return "enter stop sharing"
+		}
 	}
 	return "enter —"
 }
@@ -652,18 +756,17 @@ func (m Model) rowLines(height int) []string {
 
 	var lines []string
 	cursorLine := 0
-	section := rowKind(-1)
+	section := ""
 	for i, r := range m.rows {
-		if (r.kind == rowProfile) != (section == rowProfile) || section == -1 {
-			if section != -1 {
+		if title := sectionTitle(r.kind); title != section {
+			if section != "" {
 				lines = append(lines, "")
 			}
-			title := "HOSTS"
-			if r.kind == rowProfile {
-				title = "PROFILES"
-			}
 			lines = append(lines, styleSection.Render(title))
-			section = r.kind
+			if r.kind == rowUSBDevice && m.status.USBUnavailable != "" {
+				lines = append(lines, "  "+styleWarn.Render("⚠ "+m.status.USBUnavailable))
+			}
+			section = title
 		}
 		if i == m.cursor {
 			cursorLine = len(lines)
@@ -677,6 +780,16 @@ func (m Model) rowLines(height int) []string {
 		start = cursorLine - height + 1
 	}
 	return lines[start:min(start+height, len(lines))]
+}
+
+func sectionTitle(k rowKind) string {
+	switch k {
+	case rowProfile:
+		return "PROFILES"
+	case rowUSBDevice:
+		return "USB DEVICES"
+	}
+	return "HOSTS"
 }
 
 func (m Model) rowLine(r row, selected bool, nameW int) string {
@@ -701,6 +814,20 @@ func (m Model) rowLine(r row, selected bool, nameW int) string {
 		mt := m.mountStatus(r.host, r.name)
 		state, name, info = mt.State, "  "+mt.Key, source(mt.Profiles, mt.AdHoc)
 		extra = mt.Error
+	case rowUSB:
+		u := m.usbStatus(r.host, r.name)
+		state, name, info = u.State, "  usb "+u.Device, source(u.Profiles, u.AdHoc)
+		extra = u.Error
+		if extra == "" && u.Name != "" {
+			extra = u.Name
+		}
+	case rowUSBDevice:
+		d := m.usbDevice(r.name)
+		state, name, info = api.StateDown, d.BusID, d.Title()
+		if d.Host != "" {
+			state = m.sharedUSB(d).State
+			info += " · on " + d.Host
+		}
 	case rowProfile:
 		p := m.profileStatus(r.name)
 		state, name, info = p.State, p.Name, "on "+p.Host
@@ -779,6 +906,16 @@ func (m Model) detail() string {
 		if e := m.mountStatus(r.host, r.name).Error; e != "" {
 			return styleErr.Render(r.name + ": " + e)
 		}
+	case rowUSB:
+		if e := m.usbStatus(r.host, r.name).Error; e != "" {
+			return styleErr.Render("USB " + r.name + ": " + e)
+		}
+	case rowUSBDevice:
+		if d := m.usbDevice(r.name); d.Host != "" {
+			if e := m.sharedUSB(d).Error; e != "" {
+				return styleErr.Render(d.Title() + ": " + e)
+			}
+		}
 	case rowProfile:
 		if e := m.profileStatus(r.name).Error; e != "" {
 			return styleErr.Render(r.name + ": " + e)
@@ -838,7 +975,8 @@ var helpLines = []string{
 	styleSection.Render("KEYS"),
 	"  ↑/k ↓/j      move",
 	"  enter/space  toggle: connect/disconnect a host, activate/deactivate a profile,",
-	"               remove an ad-hoc forward or mount",
+	"               remove an ad-hoc forward or mount; on a USB device, share it with a",
+	"               host (the connected one, or asks which) or stop sharing it",
 	"  u            bring up the selection now (also retries a failed connection)",
 	"  x            take down the selection; on an ad-hoc host that's down, forget it",
 	"  c            connect to a host that isn't in the config (NAME [SSH-DEST])",

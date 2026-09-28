@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -47,7 +48,9 @@ func start(t *testing.T, configTOML string, sshOpts ...openssh.Options) *harness
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		h.done <- Run(ctx, Options{SocketPath: h.socket, ConfigPath: h.config, Version: "test", Logger: testLogger(t), SSH: ssh})
+		// Only the USB test talks to a real USB/IP helper.
+		helper := cmp.Or(os.Getenv("TETHER_TEST_USBIP_HELPER"), filepath.Join(dir, "no-usbip-helper.sock"))
+		h.done <- Run(ctx, Options{SocketPath: h.socket, ConfigPath: h.config, Version: "test", Logger: testLogger(t), SSH: ssh, USBHelperSocket: helper})
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -215,5 +218,54 @@ func TestLogs(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("no log event for the reload")
 		}
+	}
+}
+
+func TestUSBRequests(t *testing.T) {
+	h := start(t, "[hosts.devbox]\nssh = \"devbox.invalid\"\n[profiles.work]\nhost = \"devbox\"\nusb = [\"1050:0407\"]\n")
+	c := h.client(t)
+	ctx := context.Background()
+	code := func(err error) int {
+		if rpcErr, ok := errors.AsType[*rpc.Error](err); ok {
+			return rpcErr.Code
+		}
+		return 0
+	}
+
+	if err := c.Call(ctx, api.MethodUSBAttach, api.USBParams{Host: "devbox", Device: "yubikey"}, nil); code(err) != rpc.CodeInvalidParams {
+		t.Errorf("bad device: %v", err)
+	}
+	if err := c.Call(ctx, api.MethodUSBAttach, api.USBParams{Host: "nope", Device: "1-1"}, nil); code(err) != api.CodeNotFound {
+		t.Errorf("unknown host: %v", err)
+	}
+	if err := c.Call(ctx, api.MethodUSBDetach, api.USBParams{Host: "devbox", Device: "1-1"}, nil); code(err) != api.CodeNotFound {
+		t.Errorf("detach unknown: %v", err)
+	}
+
+	var res api.USBResult
+	if err := c.Call(ctx, api.MethodUSBAttach, api.USBParams{Host: "devbox", Device: "1050:ABCD"}, &res); err != nil || res.Device != "1050:abcd" {
+		t.Fatalf("attach: %+v %v", res, err)
+	}
+	c.Call(ctx, api.MethodUp, api.TargetParams{Name: "work"}, nil)
+	var st api.Status
+	c.Call(ctx, api.MethodStatus, nil, &st)
+	usb := st.Hosts[0].USB
+	if len(usb) != 2 || usb[0].Device != "1050:0407" || len(usb[0].Profiles) != 1 || usb[1].Device != "1050:abcd" || !usb[1].AdHoc {
+		t.Errorf("host USB = %+v", usb)
+	}
+	// This test's daemon has no helper (and in a build sandbox, no USB).
+	if os.Getenv("TETHER_TEST_USBIP_HELPER") == "" && st.USBUnavailable == "" {
+		t.Errorf("usb_unavailable = %q", st.USBUnavailable)
+	}
+
+	if err := c.Call(ctx, api.MethodUSBDetach, api.USBParams{Host: "devbox", Device: "1050:abcd"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Taking the profile down leaves nothing.
+	c.Call(ctx, api.MethodDown, api.TargetParams{Name: "work"}, nil)
+	st = api.Status{}
+	c.Call(ctx, api.MethodStatus, nil, &st)
+	if len(st.Hosts[0].USB) != 0 {
+		t.Errorf("after down: %+v", st.Hosts[0].USB)
 	}
 }

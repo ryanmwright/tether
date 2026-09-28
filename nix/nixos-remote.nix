@@ -22,6 +22,21 @@ in
       '';
     };
 
+    usb = {
+      enable = lib.mkEnableOption ''
+        attaching USB devices shared with tether (USB/IP): installs usbip,
+        loads the vhci-hcd kernel module, and lets {option}`tether.remote.usb.users`
+        run usbip as root without a password
+      '';
+
+      users = lib.mkOption {
+        type = with lib.types; listOf str;
+        default = [ ];
+        example = [ "alice" ];
+        description = "Users who may attach devices (run usbip through passwordless sudo).";
+      };
+    };
+
     gpg = {
       enable = lib.mkOption {
         type = lib.types.bool;
@@ -52,6 +67,37 @@ in
         environment.systemPackages = [ pkgs.sshfs ];
         programs.fuse.enable = true;
       })
+
+      (lib.mkIf cfg.usb.enable (
+        let
+          usbip = config.boot.kernelPackages.usbip;
+        in
+        {
+          assertions = [
+            {
+              assertion = cfg.usb.users != [ ];
+              message = "tether.remote.usb.users: name the users who may attach USB devices.";
+            }
+          ];
+          environment.systemPackages = [ usbip ];
+          boot.kernelModules = [ "vhci-hcd" ];
+          security.sudo.extraRules = [
+            {
+              users = cfg.usb.users;
+              commands =
+                map
+                  (command: {
+                    inherit command;
+                    options = [ "NOPASSWD" ];
+                  })
+                  [
+                    "${usbip}/bin/usbip"
+                    "/run/current-system/sw/bin/usbip"
+                  ];
+            }
+          ];
+        }
+      ))
 
       (lib.mkIf cfg.gpg.enable {
         assertions = [

@@ -18,7 +18,8 @@ type Notice struct {
 }
 
 // Changes lists what's worth telling the user between two snapshots: hosts
-// losing or regaining their connection, and forwards or mounts failing.
+// losing or regaining their connection, and forwards, mounts or USB
+// devices failing.
 // Things the user just asked for (connecting, going down) aren't news.
 func Changes(prev, cur api.Status) []Notice {
 	before := map[string]api.HostStatus{}
@@ -59,6 +60,15 @@ func Changes(prev, cur api.Status) []Notice {
 		for _, m := range h.Mounts {
 			if m.State == api.StateError && oldMnt[m.Key].State != api.StateError {
 				notices = append(notices, Notice{Key: key + ":mount:" + m.Key, Summary: h.Name + ": mount failed", Body: m.Key + "\n" + m.Error})
+			}
+		}
+		oldUSB := map[string]api.USBStatus{}
+		for _, u := range old.USB {
+			oldUSB[u.Device] = u
+		}
+		for _, u := range h.USB {
+			if u.State == api.StateError && oldUSB[u.Device].State != api.StateError {
+				notices = append(notices, Notice{Key: key + ":usb:" + u.Device, Summary: h.Name + ": USB device " + u.Device + " failed", Body: u.Error})
 			}
 		}
 	}

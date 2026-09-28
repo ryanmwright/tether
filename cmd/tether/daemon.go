@@ -9,11 +9,12 @@ import (
 	"github.com/ryanmwright/tether/internal/api"
 	"github.com/ryanmwright/tether/internal/daemon"
 	"github.com/ryanmwright/tether/internal/openssh"
+	"github.com/ryanmwright/tether/internal/usbip"
 )
 
 func newDaemonCmd(g *globalFlags) *cobra.Command {
 	var logLevel slog.Level
-	var sshConfig string
+	var sshConfig, usbHelper string
 	cmd := &cobra.Command{
 		Use:   "daemon",
 		Short: "Run the tether daemon in the foreground",
@@ -23,16 +24,18 @@ func newDaemonCmd(g *globalFlags) *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel}))
 			return daemon.Run(cmd.Context(), daemon.Options{
-				SocketPath: g.socket,
-				ConfigPath: g.config,
-				Version:    version,
-				Logger:     log,
-				SSH:        openssh.Options{ConfigFile: sshConfig},
+				SocketPath:      g.socket,
+				ConfigPath:      g.config,
+				Version:         version,
+				Logger:          log,
+				SSH:             openssh.Options{ConfigFile: sshConfig},
+				USBHelperSocket: usbHelper,
 			})
 		},
 	}
 	cmd.Flags().TextVar(&logLevel, "log-level", slog.LevelInfo, "log level: debug, info, warn, error")
 	cmd.Flags().StringVar(&sshConfig, "ssh-config", "", "ssh config file to use instead of ~/.ssh/config (ssh -F)")
+	cmd.Flags().StringVar(&usbHelper, "usbip-helper-socket", usbip.DefaultHelperSocket, "the USB/IP helper's control socket")
 
 	cmd.AddCommand(&cobra.Command{
 		Use:   "stop",

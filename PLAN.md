@@ -11,7 +11,7 @@ One binary, `tether`. `tether daemon` runs the daemon; every other subcommand is
 | SSH layer | Wrap system OpenSSH (one ControlMaster per host) |
 | Mounts | Live FUSE mounts (sshfs; reverse sshfs for local→remote) |
 | Platform (local side) | Linux only (systemd --user, D-Bus, FUSE available) |
-| Remote requirements | `sshd` only; `sshfs` + FUSE only for local→remote mounts. No remote agent. |
+| Remote requirements | `sshd` only; `sshfs` + FUSE only for local→remote mounts; `usbip` + `vhci-hcd` + sudo only for USB. No remote agent. |
 | Local machine | Fedora + Nix + home-manager (primary). Also installable without Nix (`go install` / release binary). |
 | Remotes | Mostly NixOS (we ship a NixOS module for remote-side setup), some Debian (`doctor` prints manual fixes). |
 | GPG | Commit signing, `pass`/decryption, **and** gpg-agent as the SSH agent (forward the ssh socket too). |
@@ -70,8 +70,12 @@ One binary, `tether`. `tether daemon` runs the daemon; every other subcommand is
 - The `sshfs` flags are set per mount (`reconnect`, `ServerAliveInterval`, cache options).
 - **Fedora + Nix gotcha:** an `sshfs` built by Nix on a non-NixOS system still needs the setuid `/usr/bin/fusermount3` from the host. Resolve `fusermount3` from the system path first and check this in `doctor`.
 
-### 4. USB forwarding (future)
-- USB/IP: the local `usbipd` is exported through a reverse forward on port 3240, and the remote runs `usbip attach`. Both sides need root and kernel modules, so this is kept behind a separate privileged helper.
+### 4. USB forwarding (USB/IP)
+- **Privileged helper** (`tether usbip-helper`, root system service; `internal/usbip`): binds devices to `usbip-host` and serves the USB/IP setup protocol itself on `127.0.0.1:3240` instead of running `usbipd` (which can't bind to loopback only). An import hands the accepted socket to the kernel through `usbip_sockfd`.
+- **Access control:** the daemon talks to the helper over a Unix socket checked with `SO_PEERCRED`; USB/IP connections are accepted only from allowed users, found by looking the peer socket up in `/proc/net/tcp`, and each user can import only the devices it exported.
+- **Lifetime:** exports are tied to the daemon's control connection, so devices come back to this machine when the daemon detaches them, disconnects or dies.
+- **Daemon (unprivileged):** lists devices from sysfs (polled every 2s; also how it notices a dropped attachment, from `usbip_status`), adds `R:127.0.0.1:0:127.0.0.1:<helper port>` on the host's master, and runs `sudo -n usbip --tcp-port <port> attach -r 127.0.0.1` on the remote. Detach finds the vhci port in `usbip port`.
+- Remote needs `usbip`, `vhci-hcd` and passwordless sudo for usbip (NixOS: `tether.remote.usb`). Devices are named by bus ID or `vendor:product`.
 
 ## Config (`~/.config/tether/config.toml`)
 
@@ -128,6 +132,7 @@ internal/ssh/        ControlMaster mgmt, -O forward/cancel, remote exec
 internal/forward/    forward spec parsing + lifecycle
 internal/gpg/        gpg socket discovery + forwarding
 internal/mount/      sshfs + reverse-sshfs
+internal/usbip/      USB/IP: sysfs devices, the privileged helper, remote scripts
 internal/tui/        Bubble Tea app
 nix/                 package, home-manager module (flake.nix at the root)
 ```
@@ -142,7 +147,7 @@ Libraries: `cobra` (CLI), `bubbletea`/`lipgloss`/`bubbles` (TUI), `BurntSushi/to
 3. ✅ **TUI:** host and profile tree, live status, toggles, log pane.
 4. ✅ **Mounts:** sshfs in both directions, cleanup and recovery.
 5. ✅ **Tray:** KDE StatusNotifierItem client (`tether tray`, via `fyne.io/systray`), desktop notifications, home-manager `programs.tether.tray`.
-6. **USB/IP.**
+6. ✅ **USB/IP:** privileged helper, `tether usb`, profile `usb = [...]`, TUI and tray sections, doctor checks, NixOS modules.
 
 ## Testing
 - Unit tests: spec parsing, config validation, reconciler (with a fake SSH layer behind an interface).

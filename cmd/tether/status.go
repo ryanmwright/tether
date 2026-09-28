@@ -136,6 +136,23 @@ func printStatus(out io.Writer, st *api.Status) {
 		}
 	}
 
+	var usb bool
+	for _, h := range st.Hosts {
+		usb = usb || len(h.USB) > 0
+	}
+	if usb {
+		fmt.Fprintln(tw, "\nUSB\tHOST\tFROM\tSTATE\tDETAIL")
+		for _, h := range st.Hosts {
+			for _, u := range h.USB {
+				detail := u.Error
+				if detail == "" && u.BusID != "" {
+					detail = strings.TrimSpace(u.Name + " at " + u.BusID)
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", u.Device, h.Name, source(u.Profiles, u.AdHoc), u.State, detail)
+			}
+		}
+	}
+
 	if len(st.Profiles) > 0 {
 		fmt.Fprintln(tw, "\nPROFILE\tHOST\tAUTO\tSTATE\tDETAIL")
 		for _, p := range st.Profiles {

@@ -38,6 +38,8 @@
 
       # For the machines you connect to.
       nixosModules.remote = import ./nix/nixos-remote.nix;
+      # For the machine you share USB devices from.
+      nixosModules.usbip-helper = import ./nix/nixos-usbip-helper.nix self;
 
       checks = forAllSystems (pkgs: {
         tether = self.packages.${pkgs.stdenv.hostPlatform.system}.tether;
