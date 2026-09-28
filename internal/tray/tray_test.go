@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"image/png"
 	"os/exec"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -100,8 +101,23 @@ func TestBuild(t *testing.T) {
 	if find(items, "host:scratch:forget") == nil || find(items, "host:dev:forget") != nil {
 		t.Error("forget should appear only on ad-hoc hosts")
 	}
-	if it := find(items, "host:dev:mount:remote:~/src -> /home/me/src"); it == nil || !strings.Contains(it.Title, "sshfs not found") {
+	if it := find(items, "host:dev:mount:remote:~/src -> /home/me/src"); it == nil || !strings.Contains(it.Title, "sshfs not found") || len(it.Children) != 0 {
 		t.Errorf("mount row = %+v", it)
+	}
+	if it := find(items, "host:lab:mount-here"); it == nil || *it.Action != (Action{Local: localMountHere, Host: "lab"}) {
+		t.Errorf("lab mount here = %+v", it)
+	}
+	if it := find(items, "host:lab:mount-there"); it == nil || *it.Action != (Action{Local: localMountThere, Host: "lab"}) {
+		t.Errorf("lab mount there = %+v", it)
+	}
+
+	// Ad-hoc mounts can be unmounted; profile mounts (above) can't.
+	adhoc := api.Status{Hosts: []api.HostStatus{{Name: "dev", State: api.StateUp, Mounts: []api.MountStatus{
+		{Key: "/home/me/proj -> remote:~/proj", Direction: "local-to-remote", Remote: "~/proj", Local: "/home/me/proj", AdHoc: true, State: api.StateUp},
+	}}}}
+	want := api.MountParams{Host: "dev", Direction: "local-to-remote", Remote: "~/proj", Local: "/home/me/proj"}
+	if it := find(Build(adhoc), "host:dev:mount:/home/me/proj -> remote:~/proj:rm"); it == nil || it.Action.Method != api.MethodMountRemove || !reflect.DeepEqual(it.Action.Params, want) {
+		t.Errorf("unmount = %+v", it)
 	}
 
 	// gpg toggle reflects the ad-hoc gpg-agent forward.

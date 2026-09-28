@@ -621,9 +621,16 @@ summary heads the menu.
 
 - **Left-click** opens the terminal UI.
 - **The menu** has a submenu per host (connect or disconnect, its forwards
-  and mounts with their state, retry, toggle gpg-agent forwarding, and forget
-  for ad-hoc hosts), your profiles as checkboxes, "Connect to host…" (asks
-  for `NAME [SSH-DEST]` with `kdialog` or `zenity`), and reload.
+  and mounts with their state, retry, toggle gpg-agent forwarding, mount a
+  directory in either direction, unmount ad-hoc mounts, and forget for
+  ad-hoc hosts), your profiles as checkboxes, "Connect to host…" (asks for
+  `NAME [SSH-DEST]`), and reload. Prompts use `kdialog` or `zenity`; without
+  either, the terminal UI opens instead.
+- **Mounting from the menu**: "Mount remote directory here…" asks for the
+  remote directory and a local mount point (default `~/mnt/<name>`, created
+  if missing). "Mount local directory on HOST…" opens a folder picker, then
+  asks where to mount it on the remote (default `~/<name>`). Like
+  `tether mount add`, this connects the host if needed.
 - **Desktop notifications** say when a connection drops or comes back, and
   when a forward or mount fails. Later news about the same thing replaces the
   earlier notification. Turn them off with `--no-notify`.

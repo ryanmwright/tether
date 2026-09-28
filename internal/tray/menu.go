@@ -28,12 +28,15 @@ type Action struct {
 	Method string // api method; empty for Local
 	Params any
 	Done   string // said in a notification if the call fails ("connect devbox")
-	Local  string // localOpenTUI, localConnectPrompt, localQuit, localStartDaemon
+	Local  string // localOpenTUI, localConnectPrompt, localMountHere, localMountThere, localQuit, localStartDaemon
+	Host   string // the host a local action is for
 }
 
 const (
 	localOpenTUI       = "open-tui"
 	localConnectPrompt = "connect-prompt"
+	localMountHere     = "mount-here"  // a remote directory, mounted here
+	localMountThere    = "mount-there" // a local directory, mounted on the remote
 	localQuit          = "quit"
 	localStartDaemon   = "start-daemon"
 )
@@ -198,7 +201,16 @@ func hostItem(h api.HostStatus) Item {
 		if m.Error != "" {
 			title += " — " + m.Error
 		}
-		children = append(children, label(id+":mount:"+m.Key, title))
+		it := label(id+":mount:"+m.Key, title)
+		if m.AdHoc {
+			it.Enabled = true
+			it.Children = []Item{action(it.ID+":rm", "Unmount", &Action{
+				Method: api.MethodMountRemove,
+				Params: api.MountParams{Host: h.Name, Direction: m.Direction, Remote: m.Remote, Local: m.Local},
+				Done:   "unmount " + m.Key,
+			})}
+		}
+		children = append(children, it)
 	}
 
 	children = append(children, separator(id+":sep-actions"))
@@ -208,7 +220,10 @@ func hostItem(h api.HostStatus) Item {
 	} else {
 		gpg.Action = &Action{Method: api.MethodForwardAdd, Params: api.ForwardParams{Host: h.Name, Spec: "gpg-agent"}, Done: "forward gpg-agent to " + h.Name}
 	}
-	children = append(children, gpg)
+	children = append(children, gpg,
+		action(id+":mount-here", "Mount remote directory here…", &Action{Local: localMountHere, Host: h.Name}),
+		action(id+":mount-there", "Mount local directory on "+h.Name+"…", &Action{Local: localMountThere, Host: h.Name}),
+	)
 	if h.AdHoc {
 		children = append(children, action(id+":forget", "Forget this host", &Action{Method: api.MethodHostRemove, Params: api.HostParams{Name: h.Name}, Done: "forget " + h.Name}))
 	}

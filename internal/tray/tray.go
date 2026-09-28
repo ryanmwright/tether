@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -15,6 +17,7 @@ import (
 	"fyne.io/systray"
 
 	"github.com/ryanmwright/tether/internal/api"
+	"github.com/ryanmwright/tether/internal/mount"
 	"github.com/ryanmwright/tether/internal/rpc"
 )
 
@@ -256,6 +259,9 @@ func (t *tray) run(a *Action) {
 	case localConnectPrompt:
 		t.report("connect", t.connectPrompt())
 		return
+	case localMountHere, localMountThere:
+		t.report("mount on "+a.Host, t.mountPrompt(a.Host, a.Local == localMountThere))
+		return
 	}
 	t.report(a.Done, t.call(a.Method, a.Params))
 }
@@ -294,21 +300,12 @@ func (t *tray) openTUI() error {
 // connectPrompt asks for "NAME [SSH-DEST]" with the desktop's dialog tool,
 // or opens the terminal UI (where c does the same) if there's none.
 func (t *tray) connectPrompt() error {
-	var dialog []string
-	switch {
-	case lookPath("kdialog"):
-		dialog = []string{"kdialog", "--title", "tether", "--inputbox", "Connect to host (NAME, or NAME SSH-DEST):"}
-	case lookPath("zenity"):
-		dialog = []string{"zenity", "--entry", "--title=tether", "--text=Connect to host (NAME, or NAME SSH-DEST):"}
-	default:
+	if dialogTool() == "" {
 		return t.openTUI()
 	}
-	out, err := exec.Command(dialog[0], dialog[1:]...).Output()
-	if err != nil {
-		return nil // cancelled
-	}
-	fields := strings.Fields(string(out))
-	if len(fields) == 0 || len(fields) > 2 {
+	answer, ok := inputDialog("Connect to host (NAME, or NAME SSH-DEST):", "")
+	fields := strings.Fields(answer)
+	if !ok || len(fields) == 0 || len(fields) > 2 {
 		return nil
 	}
 	p := api.HostParams{Name: fields[0]}
@@ -316,6 +313,91 @@ func (t *tray) connectPrompt() error {
 		p.SSH = fields[1]
 	}
 	return t.call(api.MethodHostAdd, p)
+}
+
+// mountPrompt asks for the two sides of a mount on host: the local directory
+// with a folder picker when it must exist (mounting it on the remote), and
+// the rest in input boxes. Without a dialog tool it opens the terminal UI
+// (where m does the same).
+func (t *tray) mountPrompt(host string, localToRemote bool) error {
+	if dialogTool() == "" {
+		return t.openTUI()
+	}
+	home, _ := os.UserHomeDir()
+	p := api.MountParams{Host: host, Direction: string(mount.RemoteToLocal)}
+	var ok bool
+	if localToRemote {
+		p.Direction = string(mount.LocalToRemote)
+		if p.Local, ok = directoryDialog("Local directory to mount on "+host, home); !ok {
+			return nil
+		}
+		if p.Remote, ok = inputDialog("Mount "+p.Local+" on "+host+" at:", "~/"+filepath.Base(p.Local)); !ok {
+			return nil
+		}
+	} else {
+		if p.Remote, ok = inputDialog("Directory on "+host+" to mount here (relative to the remote home unless absolute):", "~/"); !ok {
+			return nil
+		}
+		base := path.Base(strings.TrimRight(p.Remote, "/"))
+		if base == "~" || base == "." || base == "/" {
+			base = host
+		}
+		if p.Local, ok = inputDialog("Mount "+host+":"+p.Remote+" here at:", "~/mnt/"+base); !ok {
+			return nil
+		}
+	}
+	// The daemon expands ~/; other relative paths are from our home, as the
+	// tray has no meaningful working directory.
+	if p.Local != "~" && !strings.HasPrefix(p.Local, "~/") && !filepath.IsAbs(p.Local) {
+		p.Local = filepath.Join(home, p.Local)
+	}
+	return t.call(api.MethodMountAdd, p)
+}
+
+// dialogTool is the desktop's dialog program: kdialog or zenity, or "".
+func dialogTool() string {
+	for _, name := range []string{"kdialog", "zenity"} {
+		if lookPath(name) {
+			return name
+		}
+	}
+	return ""
+}
+
+// inputDialog asks for a line of text; ok is false if cancelled or empty.
+func inputDialog(text, initial string) (answer string, ok bool) {
+	var argv []string
+	switch dialogTool() {
+	case "kdialog":
+		argv = []string{"kdialog", "--title", "tether", "--inputbox", text, initial}
+	case "zenity":
+		argv = []string{"zenity", "--entry", "--title=tether", "--text=" + text, "--entry-text=" + initial}
+	default:
+		return "", false
+	}
+	return runDialog(argv)
+}
+
+// directoryDialog picks an existing directory, starting in start.
+func directoryDialog(title, start string) (dir string, ok bool) {
+	var argv []string
+	switch dialogTool() {
+	case "kdialog":
+		argv = []string{"kdialog", "--title", title, "--getexistingdirectory", start}
+	case "zenity":
+		argv = []string{"zenity", "--file-selection", "--directory", "--title=" + title, "--filename=" + start + "/"}
+	default:
+		return "", false
+	}
+	return runDialog(argv)
+}
+
+// runDialog runs a dialog and returns what it printed; a non-zero exit is a
+// cancel.
+func runDialog(argv []string) (string, bool) {
+	out, err := exec.Command(argv[0], argv[1:]...).Output()
+	answer := strings.TrimSpace(string(out))
+	return answer, err == nil && answer != ""
 }
 
 // terminalCommand is the prefix that runs a command in a terminal window.
