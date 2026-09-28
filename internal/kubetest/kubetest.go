@@ -154,20 +154,21 @@ create)
 	echo "$ns/$claim" > "$state/pods/$name.claim"
 	touch "$state/pods/$name"
 	echo "pod/$name created" ;;
-attach)
-	pod="$state/pods/$1"
-	[ -e "$pod" ] || { echo "error: pod $1 not found" >&2; exit 1; }
-	# Background jobs get /dev/null as stdin unless it's redirected.
-	exec 3<&0
-	cat <&3 >/dev/null &
-	c=$!
-	while kill -0 $c 2>/dev/null && [ -e "$pod" ]; do sleep 0.1; done
-	kill $c 2>/dev/null
-	rm -f "$pod"
-	[ -e "$pod.claim" ] && exit 0 ;;
 exec)
 	pod="$state/pods/$1"
 	[ -e "$pod" ] || { echo "error: pod $1 not found" >&2; exit 1; }
+	if [ "$2" = sh ]; then
+		# The heartbeat session: the pod lives while it's open. (Unlike a
+		# real pod, which waits for the heartbeats to stop, the fake pod ends
+		# at once.)
+		exec 3<&0
+		cat <&3 >/dev/null &
+		c=$!
+		while kill -0 $c 2>/dev/null && [ -e "$pod" ]; do sleep 0.1; done
+		kill $c 2>/dev/null
+		rm -f "$pod"
+		exit 0
+	fi
 	exec @SFTP@ -d "$state/pvcs/$(cat "$pod.claim")" ;;
 delete)
 	if [ "$1" = pods ] || [ "$1" = pod ] && [ -z "$2" ]; then exit 0; fi

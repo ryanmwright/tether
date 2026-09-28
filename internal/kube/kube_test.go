@@ -134,8 +134,6 @@ func TestPodManifest(t *testing.T) {
 			SecurityContext map[string]any
 			Containers      []struct {
 				Image, Name  string
-				Stdin        bool
-				StdinOnce    bool
 				VolumeMounts []map[string]any
 			}
 			Volumes []struct {
@@ -150,7 +148,7 @@ func TestPodManifest(t *testing.T) {
 	switch {
 	case pod.Metadata.Namespace != "db" || pod.Metadata.Labels[labelOwner] != Owner || pod.Metadata.Labels[labelInstance] != instance:
 		t.Errorf("metadata = %+v", pod.Metadata)
-	case c.Image != "reg/sftp:1" || !c.Stdin || !c.StdinOnce:
+	case c.Image != "reg/sftp:1" || len(c.VolumeMounts) != 2:
 		t.Errorf("container = %+v", c)
 	case c.VolumeMounts[0]["subPath"] != "pgdata" || c.VolumeMounts[0]["readOnly"] != true || c.VolumeMounts[0]["mountPath"] != DataPath:
 		t.Errorf("volume mount = %+v", c.VolumeMounts)

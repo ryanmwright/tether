@@ -299,7 +299,7 @@ func (dr *doctor) checkKube(ctx context.Context, m *openssh.Master) {
 			dr.add(section, "kube access", api.CheckFail, where+": "+err.Error(), "")
 		case len(missing) > 0:
 			dr.add(section, "kube access", api.CheckFail, where+": not allowed to "+strings.Join(missing, ", "),
-				"helper pods need create/get/delete on pods and create on pods/exec and pods/attach in the claim's namespace")
+				"helper pods need create/get/delete on pods and create on pods/exec in the claim's namespace")
 		default:
 			dr.add(section, "kube access", api.CheckOK, where+": may run helper pods", "")
 		}

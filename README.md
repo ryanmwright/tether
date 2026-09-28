@@ -599,9 +599,9 @@ click to mount one again).
 that mounts the claim at `/data`, then runs `sshfs` here piped to
 `kubectl exec -i <pod> -- sftp-server` over the host's SSH connection, the
 same way remote directories are mounted. The pod lives only as long as
-tether holds a `kubectl attach` session to it, so if the daemon, the
-connection or the jump box goes away, the pod exits by itself. Unmounting
-deletes it. When mounting, tether also deletes its own finished pods in that
+tether keeps sending it heartbeats (a `kubectl exec` session touching a file
+every 10 seconds), so if the daemon, the connection or the jump box goes
+away, the pod exits by itself within a minute. Unmounting deletes it. When mounting, tether also deletes its own finished pods in that
 namespace; `tether kube gc HOST` does every namespace.
 
 **Which claims can be mounted:**
@@ -652,7 +652,7 @@ Watch out for:
   reach it, build the flake's `sftp-image` (busybox and sftp-server), push it
   to your registry and set `image`.
 - **Permissions.** You need to create, get and delete pods, and create
-  `pods/exec` and `pods/attach`, in the claim's namespace.
+  `pods/exec`, in the claim's namespace.
   `tether doctor HOST` checks this, along with `kubectl` and your contexts.
 - **kubectl on the jump box** must work in a non-interactive `ssh` session
   (no `.bashrc` aliases, no interactive login plugins). If `kubectl` or

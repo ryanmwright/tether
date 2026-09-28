@@ -23,25 +23,43 @@ const (
 	containerName = "sftp"
 	pollInterval  = time.Second
 	stopTimeout   = 10 * time.Second
+
+	// The pod's main process exits unless tether refreshes aliveFile at
+	// least every aliveGrace; it does so every heartbeatInterval.
+	aliveDir          = "/tether"
+	aliveFile         = aliveDir + "/alive"
+	aliveGrace        = 45 // seconds
+	heartbeatInterval = 10 * time.Second
 )
 
-// Pod is a running helper pod that mounts a claim. It lives as long as its
-// attach session: tether holds `kubectl attach -i` open, and the pod's only
-// process exits when that stdin closes. If the daemon, the connection or
-// kubectl dies, the pod finishes on its own instead of lingering.
+// keepAliveScript is the pod's main process: it removes the heartbeat file
+// and exits if it hasn't come back after aliveGrace.
+var keepAliveScript = fmt.Sprintf(`touch %[1]s; while [ -e %[1]s ]; do rm -f %[1]s; sleep %[2]d; done`, aliveFile, aliveGrace)
+
+// heartbeatScript runs in the pod through `kubectl exec -i`: it refreshes
+// the heartbeat file for every line tether sends, and ends when the stream
+// does.
+var heartbeatScript = fmt.Sprintf(`while read -r _; do touch %s; done`, aliveFile)
+
+// Pod is a running helper pod that mounts a claim. It lives as long as
+// tether keeps it alive: a `kubectl exec -i` session refreshes a heartbeat
+// file every few seconds, and the pod exits once the heartbeats stop. So if
+// the daemon, the connection or the jump box goes away, the pod finishes on
+// its own instead of lingering.
 type Pod struct {
 	Name, Namespace, Node string
 
-	m      *openssh.Master
-	src    Source
-	attach *exec.Cmd
-	stdin  io.WriteCloser
-	done   chan struct{}
-	once   sync.Once
-	err    error
+	m     *openssh.Master
+	src   Source
+	beat  *exec.Cmd
+	stdin io.WriteCloser
+	stop  chan struct{}
+	done  chan struct{}
+	once  sync.Once
+	err   error
 }
 
-// Done is closed when the pod goes away (its attach session ended).
+// Done is closed when the pod goes away (its heartbeat session ended).
 func (p *Pod) Done() <-chan struct{} { return p.done }
 
 // Err says why the pod went away. Only valid after Done is closed.
@@ -54,13 +72,15 @@ func (p *Pod) SFTPCommand() *exec.Cmd {
 		p.src.Opts.WithDefaults().SFTPServer, "-d", DataPath))
 }
 
-// Stop ends the attach session and deletes the pod.
+// Stop ends the heartbeat session and deletes the pod.
 func (p *Pod) Stop(ctx context.Context) error {
-	p.stdin.Close() // the pod's process sees EOF and exits
+	p.once.Do(func() { p.err = fmt.Errorf("helper pod %s stopped", p.Name) })
+	close(p.stop)
+	p.stdin.Close() // the heartbeat script sees EOF and exits
 	select {
 	case <-p.done:
 	case <-time.After(stopTimeout):
-		p.attach.Process.Kill()
+		p.beat.Process.Kill()
 		<-p.done
 	}
 	ctx, cancel := context.WithTimeout(ctx, stopTimeout)
@@ -113,34 +133,53 @@ func StartPod(ctx context.Context, m *openssh.Master, s Source, log *slog.Logger
 		return nil, err
 	}
 
-	p := &Pod{Name: name, Namespace: s.Namespace, Node: node, m: m, src: s, done: make(chan struct{})}
-	p.attach = m.Command(nil, kubectl(s.Opts, s.Context, "attach", "-i", "-q", "-n", s.Namespace, name, "-c", containerName))
-	attachErr := linelog.New(log, "kubectl attach output")
-	p.attach.Stderr = attachErr
-	if p.stdin, err = p.attach.StdinPipe(); err != nil {
+	p := &Pod{Name: name, Namespace: s.Namespace, Node: node, m: m, src: s, stop: make(chan struct{}), done: make(chan struct{})}
+	p.beat = m.Command(nil, kubectl(s.Opts, s.Context, "exec", "-i", "-n", s.Namespace, name, "-c", containerName, "--", "sh", "-c", heartbeatScript))
+	beatErr := linelog.New(log, "kubectl exec (heartbeat) output")
+	p.beat.Stderr = beatErr
+	if p.stdin, err = p.beat.StdinPipe(); err != nil {
 		del()
 		return nil, err
 	}
-	if err := p.attach.Start(); err != nil {
+	if err := p.beat.Start(); err != nil {
 		del()
 		return nil, err
 	}
 	go func() {
-		err := p.attach.Wait()
+		err := p.beat.Wait()
 		p.once.Do(func() {
-			msg := attachErr.Last()
+			msg := beatErr.Last()
 			switch {
 			case msg != "":
 				p.err = fmt.Errorf("helper pod %s: %s", name, msg)
 			case err != nil:
-				p.err = fmt.Errorf("helper pod %s: attach exited: %w", name, err)
+				p.err = fmt.Errorf("helper pod %s: heartbeat session exited: %w", name, err)
 			default:
-				p.err = fmt.Errorf("helper pod %s exited", name)
+				p.err = fmt.Errorf("helper pod %s: heartbeat session ended", name)
 			}
-			close(p.done)
 		})
+		close(p.done)
 	}()
+	go p.heartbeat()
 	return p, nil
+}
+
+// heartbeat keeps the pod alive until it's stopped or the session ends.
+func (p *Pod) heartbeat() {
+	tick := time.NewTicker(heartbeatInterval)
+	defer tick.Stop()
+	for {
+		if _, err := io.WriteString(p.stdin, "\n"); err != nil {
+			return // the session ended; Wait reports why
+		}
+		select {
+		case <-p.stop:
+			return
+		case <-p.done:
+			return
+		case <-tick.C:
+		}
+	}
 }
 
 // podName is "tether-<claim>-<random>", within the 63 characters a pod's
@@ -154,7 +193,8 @@ func podName(pvc string) string {
 }
 
 // podManifest describes the helper pod. It holds the claim at DataPath and
-// runs `cat` on a stdin that closes when tether's attach session ends.
+// runs keepAliveScript, with an emptyDir for the heartbeat file (writable
+// whatever the image and user).
 func podManifest(name string, s Source, node string) map[string]any {
 	opts := s.Opts.WithDefaults()
 	mnt := map[string]any{"name": "data", "mountPath": DataPath}
@@ -177,10 +217,8 @@ func podManifest(name string, s Source, node string) map[string]any {
 			"name":            containerName,
 			"image":           opts.Image,
 			"imagePullPolicy": "IfNotPresent",
-			"command":         []string{"sh", "-c", "cat >/dev/null"},
-			"stdin":           true,
-			"stdinOnce":       true,
-			"volumeMounts":    []any{mnt},
+			"command":         []string{"sh", "-c", keepAliveScript},
+			"volumeMounts":    []any{mnt, map[string]any{"name": "tether", "mountPath": aliveDir}},
 			"resources": map[string]any{
 				"requests": map[string]string{"cpu": "10m", "memory": "16Mi"},
 			},
@@ -189,7 +227,10 @@ func podManifest(name string, s Source, node string) map[string]any {
 				"seccompProfile":           map[string]string{"type": "RuntimeDefault"},
 			},
 		}},
-		"volumes": []any{map[string]any{"name": "data", "persistentVolumeClaim": claim}},
+		"volumes": []any{
+			map[string]any{"name": "data", "persistentVolumeClaim": claim},
+			map[string]any{"name": "tether", "emptyDir": map[string]any{"medium": "Memory", "sizeLimit": "1Mi"}},
+		},
 	}
 	psc := map[string]any{}
 	if opts.RunAsUser != nil {
@@ -339,8 +380,8 @@ func gc(ctx context.Context, m *openssh.Master, opts Options, kctx, ns string) (
 	finished := append([]string{"delete", "pods", "-l", mine, "--field-selector", "status.phase!=Running,status.phase!=Pending", "--wait=false", "--ignore-not-found", "-o", "name"}, scope...)
 	out, err1 := run(ctx, m, opts, kctx, "", finished...)
 	deleted += countLines(out)
-	// Pods from earlier daemons, still running (e.g. the connection died
-	// before the attach session started).
+	// Pods from earlier daemons, still running (they exit by themselves once
+	// the heartbeats stop, but not at once).
 	stale := append([]string{"delete", "pods", "-l", mine + "," + labelInstance + "!=" + instance, "--wait=false", "--ignore-not-found", "-o", "name"}, scope...)
 	out, err2 := run(ctx, m, opts, kctx, "", stale...)
 	deleted += countLines(out)

@@ -151,11 +151,11 @@ read_only = true
 	if readFile(filepath.Join(mp, "c.txt")) != "cached" {
 		t.Fatal("volume not visible through the mount")
 	}
-	if !strings.Contains(fake.Calls(), "attach -i -q -n apps tether-cache-") {
-		t.Errorf("no attach session for the helper pod; calls:\n%s", fake.Calls())
+	if !strings.Contains(fake.Calls(), "exec -i -n apps tether-cache-") || !strings.Contains(fake.Calls(), "touch /tether/alive") {
+		t.Errorf("no heartbeat session for the helper pod; calls:\n%s", fake.Calls())
 	}
 
-	// Losing the connection ends the pod (its attach session closes) and
+	// Losing the connection ends the pod (its heartbeats stop) and
 	// the mount; both come back with the connection.
 	pod := mountOf(st, "dev", key).Kube.Pod
 	h.srv.Stop()

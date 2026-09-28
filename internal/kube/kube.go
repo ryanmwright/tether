@@ -281,7 +281,7 @@ func ClientVersion(ctx context.Context, m *openssh.Master, opts Options) (string
 // resource for `kubectl auth can-i`.
 var helperPermissions = [][2]string{
 	{"create", "pods"}, {"get", "pods"}, {"delete", "pods"},
-	{"create", "pods/exec"}, {"create", "pods/attach"},
+	{"create", "pods/exec"},
 }
 
 // MissingPermissions lists what the user can't do in namespace ns (the
