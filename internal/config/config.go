@@ -62,15 +62,16 @@ func (h Host) Dest() string {
 // Kube says how to run kubectl on a host and what helper pods look like;
 // see kube.Options.
 type Kube struct {
-	Kubectl      string   `toml:"kubectl"`
-	Kubeconfig   string   `toml:"kubeconfig"`
-	Image        string   `toml:"image"`
-	SFTPServer   string   `toml:"sftp_server"`
-	RunAsUser    *int64   `toml:"run_as_user"`
-	RunAsGroup   *int64   `toml:"run_as_group"`
-	FSGroup      *int64   `toml:"fs_group"`
-	MountRoot    string   `toml:"mount_root"`
-	StartTimeout Duration `toml:"start_timeout"`
+	Kubectl      string            `toml:"kubectl"`
+	Kubeconfig   string            `toml:"kubeconfig"`
+	Image        string            `toml:"image"`
+	SFTPServer   string            `toml:"sftp_server"`
+	RunAsUser    *int64            `toml:"run_as_user"`
+	RunAsGroup   *int64            `toml:"run_as_group"`
+	FSGroup      *int64            `toml:"fs_group"`
+	MountRoot    string            `toml:"mount_root"`
+	StartTimeout Duration          `toml:"start_timeout"`
+	Env          map[string]string `toml:"env"`
 }
 
 func (k Kube) Options() kube.Options {
@@ -84,6 +85,7 @@ func (k Kube) Options() kube.Options {
 		FSGroup:      k.FSGroup,
 		MountRoot:    k.MountRoot,
 		StartTimeout: time.Duration(k.StartTimeout),
+		Env:          k.Env,
 	}.WithDefaults()
 }
 

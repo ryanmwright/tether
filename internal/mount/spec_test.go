@@ -116,3 +116,13 @@ func TestParsePVC(t *testing.T) {
 		t.Errorf("default mount point = %q", got)
 	}
 }
+
+func TestPVCCaching(t *testing.T) {
+	if got := strings.Join(withPVCCaching(nil), ","); got != "auto_cache,attr_timeout=10,entry_timeout=10,negative_timeout=5,dcache_timeout=60" {
+		t.Errorf("defaults = %s", got)
+	}
+	got := strings.Join(withPVCCaching([]string{"ro", "attr_timeout=1", "kernel_cache"}), ",")
+	if got != "entry_timeout=10,negative_timeout=5,dcache_timeout=60,ro,attr_timeout=1,kernel_cache" {
+		t.Errorf("with user options = %s", got)
+	}
+}

@@ -44,6 +44,12 @@ func TestKubectlCommand(t *testing.T) {
 	if got != want {
 		t.Errorf("kubectl = %s\nwant      %s", got, want)
 	}
+	if got := kubectl(Options{Env: map[string]string{"B": "2", "A": "x y"}}, "", "version"); got != `A='x y' B='2' 'kubectl' 'version'` {
+		t.Errorf("kubectl with env = %s", got)
+	}
+	if err := (Options{Env: map[string]string{"1BAD": "x"}}).Validate(); err == nil {
+		t.Error("bad env name accepted")
+	}
 	if got := kubectl(Options{}, "", "version"); got != `'kubectl' 'version'` {
 		t.Errorf("default kubectl = %s", got)
 	}

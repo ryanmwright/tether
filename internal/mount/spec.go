@@ -158,6 +158,34 @@ func sshfsOptions(user []string) string {
 	return strings.Join(append(opts, user...), ",")
 }
 
+// pvcCaching is extra caching for PVC mounts, where every request goes
+// through ssh, kubectl exec, the API server and the kubelet, so round trips
+// are slow: attributes and names are kept 10s (not 1s), lookups of missing
+// files 5s, directory listings 60s, and file contents across opens until the
+// file's mtime changes. Changes made in the cluster can take that long to
+// show up here.
+var pvcCaching = []string{"auto_cache", "attr_timeout=10", "entry_timeout=10", "negative_timeout=5", "dcache_timeout=60"}
+
+// withPVCCaching adds pvcCaching to the user's options, except for what
+// they set themselves.
+func withPVCCaching(user []string) []string {
+	key := func(o string) string { k, _, _ := strings.Cut(o, "="); return k }
+	set := map[string]bool{}
+	for _, o := range user {
+		set[key(o)] = true
+	}
+	// Options that decide file caching another way replace auto_cache.
+	contentSet := set["kernel_cache"] || set["noauto_cache"] || set["auto_cache"] || set["direct_io"]
+	var opts []string
+	for _, o := range pvcCaching {
+		if o == "auto_cache" && contentSet || set[key(o)] {
+			continue
+		}
+		opts = append(opts, o)
+	}
+	return append(opts, user...)
+}
+
 // DefaultPVCLocal is where a claim is mounted when no mount point is given:
 // root/<context>/<namespace>/<claim>, with slashes in the context name
 // replaced.

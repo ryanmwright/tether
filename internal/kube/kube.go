@@ -10,9 +10,11 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/user"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -43,6 +45,9 @@ type Options struct {
 	// MountRoot/<context>/<namespace>/<claim>.
 	MountRoot    string
 	StartTimeout time.Duration // for the helper pod to become ready
+	// Env is set for kubectl, e.g. KUBECTL_REMOTE_COMMAND_WEBSOCKETS=true,
+	// which can make exec streams (and so mounts) faster.
+	Env map[string]string
 }
 
 func (o Options) WithDefaults() Options {
@@ -70,6 +75,11 @@ func (o Options) Validate() error {
 	for name, v := range map[string]string{"kubectl": o.Kubectl, "kubeconfig": o.Kubeconfig, "image": o.Image, "sftp_server": o.SFTPServer, "mount_root": o.MountRoot} {
 		if strings.ContainsFunc(v, unicode.IsControl) {
 			errs = append(errs, fmt.Errorf("%s: invalid value %q", name, v))
+		}
+	}
+	for k, v := range o.Env {
+		if !envName.MatchString(k) || strings.ContainsFunc(v, unicode.IsControl) {
+			errs = append(errs, fmt.Errorf("env: invalid variable %s=%q", k, v))
 		}
 	}
 	if o.SFTPServer != "" && !strings.HasPrefix(o.SFTPServer, "/") {
@@ -110,6 +120,8 @@ func ParseRef(ref string) (Source, error) {
 	return s, s.Validate()
 }
 
+var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
 var (
 	dnsLabel     = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 	dnsSubdomain = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
@@ -142,7 +154,11 @@ func (s Source) Validate() error {
 // if set, with args.
 func kubectl(opts Options, kctx string, args ...string) string {
 	opts = opts.WithDefaults()
-	cmd := []string{shellPath(opts.Kubectl)}
+	var cmd []string
+	for _, k := range slices.Sorted(maps.Keys(opts.Env)) {
+		cmd = append(cmd, k+"="+Quote(opts.Env[k]))
+	}
+	cmd = append(cmd, shellPath(opts.Kubectl))
 	if opts.Kubeconfig != "" {
 		cmd = append(cmd, "--kubeconfig", shellPath(opts.Kubeconfig))
 	}

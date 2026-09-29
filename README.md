@@ -640,7 +640,18 @@ sftp_server = "/usr/lib/ssh/sftp-server"
 run_as_user = 999                 # helper pod securityContext: run_as_user, run_as_group, fs_group
 mount_root = "~/mnt/k8s"
 start_timeout = "2m"              # for the pod to start (image pull, volume attach)
+env = { KUBECTL_REMOTE_COMMAND_WEBSOCKETS = "true" }  # environment for kubectl
 ```
+
+**Speed.** Every request goes through `kubectl exec`, and so through the API
+server and the kubelet. That stream is the limit: expect roughly 10–20 MB/s
+for big files, however fast the network is, and higher latency for small
+ones. PVC mounts cache attributes, names and file contents longer than other
+mounts to make up for it; pass `-o attr_timeout=1` and so on to change that.
+Recent kubectl versions can use WebSockets for exec instead of SPDY, which
+was about 20% faster in one test; if your kubectl doesn't by default, turn it
+on with `env = { KUBECTL_REMOTE_COMMAND_WEBSOCKETS = "true" }`. Measure the ceiling:
+`ssh HOST "kubectl exec -i -n NS POD -c sftp -- cat /data/FILE" | dd of=/dev/null bs=1M`.
 
 Watch out for:
 

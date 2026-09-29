@@ -86,6 +86,7 @@ func startPVC(ctx context.Context, m *openssh.Master, s Spec, log *slog.Logger) 
 	if err != nil {
 		return nil, err
 	}
+	s.Options = withPVCCaching(s.Options)
 	r, err := startSSHFS(ctx, pod.SFTPCommand(), "kubectl exec", ".", s, log, pod)
 	if err != nil {
 		pod.Stop(context.Background())

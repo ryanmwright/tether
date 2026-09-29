@@ -114,6 +114,7 @@ kubeconfig = "~/.kube/prod"
 image = "registry.internal/sftp:1"
 run_as_user = 1000
 start_timeout = "5m"
+env = { KUBECTL_REMOTE_COMMAND_WEBSOCKETS = "true" }
 
 [hosts.box]
 local = true
@@ -137,6 +138,9 @@ local = "~/mnt/cache"
 	opts := c.Hosts["jump"].Kube.Options()
 	if opts.Kubeconfig != "~/.kube/prod" || opts.Image != "registry.internal/sftp:1" || *opts.RunAsUser != 1000 || opts.StartTimeout != 5*time.Minute || opts.Kubectl != "kubectl" {
 		t.Errorf("kube options = %+v", opts)
+	}
+	if opts.Env["KUBECTL_REMOTE_COMMAND_WEBSOCKETS"] != "true" {
+		t.Errorf("kube env = %v", opts.Env)
 	}
 	if h := c.Hosts["box"]; !h.Local || h.SSH != "" || h.Dest() == "" {
 		t.Errorf("local host = %+v", h)
