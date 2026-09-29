@@ -386,6 +386,44 @@ func (t *tray) addPrompt(host, kind string) error {
 	return fmt.Errorf("unknown kind %q", kind)
 }
 
+// remoteDirDialog browses host's directories with list dialogs, one level
+// at a time, starting in its home; the user can also type a path.
+func (t *tray) remoteDirDialog(host string) (string, bool) {
+	dir := "~"
+	for {
+		var res api.FSListResult
+		if err := t.callResult(api.MethodFSList, api.FSListParams{Host: host, Path: dir}, &res); err != nil {
+			t.report("list "+dir+" on "+host, err)
+			return inputDialog("Directory on "+host+" to mount here (relative to the remote home unless absolute):", "~/")
+		}
+		items := []string{"✓ Mount " + res.Path, "✎ Type a path…"}
+		if res.Path != "/" {
+			items = append(items, "↑ ..")
+		}
+		var dirs []string
+		for _, d := range res.Dirs {
+			if !strings.HasPrefix(d, ".") {
+				dirs = append(dirs, d)
+				items = append(items, d+"/")
+			}
+		}
+		i, ok := listDialog("Directory on "+host+" to mount here:", items)
+		if !ok {
+			return "", false
+		}
+		switch {
+		case i == 0:
+			return res.Path, true
+		case i == 1:
+			return inputDialog("Directory on "+host+" to mount here (relative to the remote home unless absolute):", res.Path)
+		case items[i] == "↑ ..":
+			dir = path.Dir(res.Path)
+		default:
+			dir = path.Join(res.Path, dirs[i-len(items)+len(dirs)])
+		}
+	}
+}
+
 // kubeForwardPrompt picks a service or pod kubectl on host can reach, and a
 // port, and forwards it here.
 func (t *tray) kubeForwardPrompt(host string) error {
@@ -534,7 +572,7 @@ func (t *tray) mountPrompt(host string, localToRemote bool) error {
 			return nil
 		}
 	} else {
-		if p.Remote, ok = inputDialog("Directory on "+host+" to mount here (relative to the remote home unless absolute):", "~/"); !ok {
+		if p.Remote, ok = t.remoteDirDialog(host); !ok {
 			return nil
 		}
 		base := path.Base(strings.TrimRight(p.Remote, "/"))

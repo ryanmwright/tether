@@ -27,9 +27,11 @@ type formField struct {
 	label string
 	help  string // shown next to the focused field
 	input textinput.Model
-	// choices makes it a choice field, cycled with ←/→.
+	// choices makes it a choice field: all shown, picked with ←/→.
 	choices []string
 	choice  int
+	// browse lists directories for a path field.
+	browse *pathBrowser
 }
 
 type formValues []string
@@ -61,6 +63,14 @@ func choiceField(label, help string, choices ...string) formField {
 	return formField{label: label, help: help, choices: choices}
 }
 
+// pathField is a text field for a directory, with a browser listing the
+// directories matching what's typed: on host if remote, else here.
+func pathField(label, placeholder, value, help string, remote bool, host string) formField {
+	f := textField(label, placeholder, value, help)
+	f.browse = &pathBrowser{remote: remote, host: host}
+	return f
+}
+
 func (f *form) values() formValues {
 	v := make(formValues, len(f.fields))
 	for i, fl := range f.fields {
@@ -90,6 +100,9 @@ func (f *form) setFocus(i int) tea.Cmd {
 func (f *form) key(msg tea.KeyPressMsg) (cmd tea.Cmd, submit bool) {
 	fl := &f.fields[f.focus]
 	last := f.focus == len(f.fields)-1
+	if fl.browse != nil && fl.browseKey(msg.String()) {
+		return nil, false
+	}
 	switch msg.String() {
 	case "tab", "down":
 		if !last {
@@ -136,10 +149,19 @@ func (f *form) view() []string {
 		}
 		var value string
 		if fl.choices != nil {
-			value = "‹ " + fl.choices[fl.choice] + " ›"
-			if i == f.focus {
-				value = styleSelected.Render(value)
+			// Every choice shown, radio-style.
+			var opts []string
+			for j, c := range fl.choices {
+				opt := "( ) " + c
+				if j == fl.choice {
+					opt = "(•) " + c
+					if i == f.focus {
+						opt = styleSelected.Render(opt)
+					}
+				}
+				opts = append(opts, opt)
 			}
+			value = strings.Join(opts, "   ")
 		} else {
 			value = fl.input.View()
 		}
@@ -148,6 +170,9 @@ func (f *form) view() []string {
 			line += "   " + styleFaint.Render(fl.help)
 		}
 		lines = append(lines, line)
+		if i == f.focus && fl.browse != nil {
+			lines = append(lines, fl.browse.view(fl.input.Value())...)
+		}
 	}
 	lines = append(lines, "")
 	if res, err := f.build(f.values()); err != nil {

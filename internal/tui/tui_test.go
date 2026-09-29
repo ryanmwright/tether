@@ -3,6 +3,9 @@ package tui
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -37,6 +40,18 @@ func (f *fakeClient) Call(_ context.Context, method string, params, result any) 
 			{Section: "local", Name: "ssh", Status: api.CheckOK, Detail: "OpenSSH_10"},
 			{Section: "remote", Name: "public keys", Status: api.CheckWarn, Detail: "1 of 1 missing", Fix: "gpg --export X | ssh dev gpg --import"},
 		}}
+	}
+	if method == api.MethodFSList && f.err == nil {
+		p := params.(api.FSListParams).Path
+		res := result.(*api.FSListResult)
+		switch p {
+		case "~", "~/":
+			*res = api.FSListResult{Path: "/home/me", Dirs: []string{".cache", "notes", "src"}}
+		case "~/src/":
+			*res = api.FSListResult{Path: "/home/me/src", Dirs: []string{"tether", "web"}}
+		default:
+			return fmt.Errorf("no such directory: %s", p)
+		}
 	}
 	if method == api.MethodKubeTargets && f.err == nil {
 		*result.(*api.KubeTargetsResult) = api.KubeTargetsResult{
@@ -121,11 +136,27 @@ func press(t *testing.T, m Model, key string) Model {
 	if cmd == nil {
 		return m
 	}
+	return runCmd(t, m, cmd)
+}
+
+// runCmd runs cmd (each of a batch) and feeds back what it returns, skipping
+// commands that don't finish promptly (cursor blink timers).
+func runCmd(t *testing.T, m Model, cmd tea.Cmd) Model {
+	t.Helper()
+	if cmd == nil {
+		return m
+	}
 	done := make(chan tea.Msg, 1)
 	go func() { done <- cmd() }()
 	select {
 	case msg := <-done:
-		if _, isBatch := msg.(tea.BatchMsg); msg != nil && !isBatch {
+		switch msg := msg.(type) {
+		case nil:
+		case tea.BatchMsg:
+			for _, c := range msg {
+				m = runCmd(t, m, c)
+			}
+		default:
 			m = update(t, m, msg)
 		}
 	case <-time.After(50 * time.Millisecond):
@@ -716,5 +747,99 @@ func TestForwardRowActions(t *testing.T) {
 	next, cmd := m.Update(keyMsg("y"))
 	if m = next.(Model); cmd == nil || m.flash != "copied localhost:5432" {
 		t.Errorf("copy: flash %q", m.flash)
+	}
+}
+
+func TestChoicesAllShown(t *testing.T) {
+	m, _ := newModel(t)
+	m = press(t, press(t, moveTo(t, m, "dev"), "a"), "l")
+	if s := screen(m); !strings.Contains(s, "(•) localhost only   ( ) all interfaces (others can connect)") {
+		t.Errorf("choices not all shown:\n%s", s)
+	}
+}
+
+func TestUSBList(t *testing.T) {
+	m, fc := newModel(t)
+	st := sampleStatus
+	st.USB = []api.USBDevice{
+		{BusID: "1-1", ID: "046d:0a64", Name: "Headset", Host: "lab"},
+		{BusID: "1-2", ID: "1050:0407", Name: "YubiKey"},
+		{BusID: "2-4", ID: "0403:6001", Name: "FT232 Serial"},
+	}
+	m = update(t, m, statusMsg(st))
+	m = press(t, press(t, moveTo(t, m, "dev"), "a"), "u")
+	s := screen(m)
+	for _, want := range []string{"SHARE A USB DEVICE WITH dev", "Headset  (shared with lab)", "1050:0407  YubiKey", "FT232 Serial"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("list missing %q:\n%s", want, s)
+		}
+	}
+	// It starts on the first free device.
+	if m.usb.cursor != 1 {
+		t.Errorf("cursor = %d", m.usb.cursor)
+	}
+	m = press(t, m, "up") // the shared one: can't share it again
+	m = press(t, m, "enter")
+	if !m.flashErr || !strings.Contains(m.flash, "already shared with lab") || len(fc.calls) != 0 {
+		t.Errorf("sharing a shared device: flash %q calls %+v", m.flash, fc.calls)
+	}
+	m = press(t, press(t, press(t, m, "down"), "down"), "enter")
+	if got := fc.last(); got != (call{api.MethodUSBAttach, api.USBParams{Host: "dev", Device: "2-4"}}) {
+		t.Errorf("got %+v", got)
+	}
+}
+
+func TestBrowseRemote(t *testing.T) {
+	m, fc := newModel(t)
+	m = press(t, press(t, moveTo(t, m, "dev"), "a"), "d") // mount a directory from dev here
+	s := screen(m)
+	if !strings.Contains(s, "in dev:/home/me: 2 directories") || !strings.Contains(s, "notes/") || strings.Contains(s, ".cache") {
+		t.Fatalf("remote listing:\n%s", s)
+	}
+	// Typing filters; → opens the one picked, and lists it.
+	m = press(t, m, "s")
+	if s := screen(m); strings.Contains(s, "notes/") || !strings.Contains(s, "src/") {
+		t.Errorf("filtered:\n%s", s)
+	}
+	m = press(t, m, "right")
+	if v := m.form.fields[0].input.Value(); v != "~/src/" {
+		t.Fatalf("after →: %q", v)
+	}
+	if s := screen(m); !strings.Contains(s, "in dev:/home/me/src: 2 directories") || !strings.Contains(s, "tether/") {
+		t.Errorf("after opening src:\n%s", s)
+	}
+	m = press(t, press(t, m, "down"), "right") // web
+	m = press(t, m, "left")                    // back up to ~/src/
+	if v := m.form.fields[0].input.Value(); v != "~/src/" {
+		t.Errorf("after ←: %q", v)
+	}
+	m = press(t, press(t, m, "down"), "right") // web again
+	m = press(t, m, "enter")                   // on to the mount point
+	m = press(t, m, "enter")                   // default: ~/mnt/web
+	want := call{api.MethodMountAdd, api.MountParams{Host: "dev", Direction: "remote-to-local", Remote: "~/src/web", Local: "~/mnt/web"}}
+	if got := fc.last(); !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
+func TestBrowseLocal(t *testing.T) {
+	dir := t.TempDir()
+	for _, d := range []string{"alpha", "beta", ".git"} {
+		os.Mkdir(filepath.Join(dir, d), 0o755)
+	}
+	os.WriteFile(filepath.Join(dir, "file.txt"), nil, 0o644)
+	os.Symlink(filepath.Join(dir, "beta"), filepath.Join(dir, "link"))
+	t.Chdir(dir)
+
+	m, _ := newModel(t)
+	m = press(t, press(t, moveTo(t, m, "dev"), "a"), "t") // mount a local directory on dev
+	s := screen(m)
+	if !strings.Contains(s, "in "+dir+": 3 directories") || !strings.Contains(s, "alpha/") || !strings.Contains(s, "link/") ||
+		strings.Contains(s, "file.txt") || strings.Contains(s, ".git") {
+		t.Fatalf("local listing:\n%s", s)
+	}
+	m = press(t, m, ".")
+	if s := screen(m); !strings.Contains(s, ".git/") {
+		t.Errorf("hidden directories once . is typed:\n%s", s)
 	}
 }

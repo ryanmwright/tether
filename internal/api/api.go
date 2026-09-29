@@ -27,6 +27,7 @@ const (
 	MethodKubeList      = "kube.list"
 	MethodKubeGC        = "kube.gc"
 	MethodKubeTargets   = "kube.targets"
+	MethodFSList        = "fs.list"
 
 	// MethodSubscribe makes the daemon push EventStatus notifications, each
 	// carrying a full Status, now and whenever anything changes; and, if
@@ -40,7 +41,7 @@ const (
 // method or field that clients rely on is added or changed, so a client can
 // tell it's talking to an older daemon left running across an upgrade.
 // Daemons from before it existed report 0.
-const ProtocolVersion = 6
+const ProtocolVersion = 7
 
 // Application error codes (outside the range reserved by JSON-RPC).
 const (
@@ -445,4 +446,16 @@ type KubePort struct {
 type RecentForward struct {
 	Spec  string `json:"spec"`
 	Label string `json:"label,omitempty"`
+}
+
+// FSListParams asks for the directories in Path on Host (relative paths
+// and ~ are from the host's home), for picking one to mount.
+type FSListParams struct {
+	Host string `json:"host"`
+	Path string `json:"path"`
+}
+
+type FSListResult struct {
+	Path string   `json:"path"` // absolute
+	Dirs []string `json:"dirs"` // names, sorted, hidden ones included
 }

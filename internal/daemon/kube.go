@@ -23,10 +23,10 @@ const kubeTimeout = 60 * time.Second
 
 var tmpConns atomic.Uint64
 
-// kubeMaster returns a connection to run kubectl on a host: its live one,
+// hostMaster returns a connection to run commands (kubectl, ls) on a host: its live one,
 // a local one for the local host, or else a temporary connection that
 // release closes.
-func (d *Daemon) kubeMaster(ctx context.Context, name string) (m *openssh.Master, host config.Host, release func(), err error) {
+func (d *Daemon) hostMaster(ctx context.Context, name string) (m *openssh.Master, host config.Host, release func(), err error) {
 	d.mu.Lock()
 	host, ok := d.host(name)
 	h := d.sessions[name]
@@ -56,7 +56,7 @@ func (d *Daemon) handleKubeList(ctx context.Context, params json.RawMessage) (an
 	}
 	ctx, cancel := context.WithTimeout(ctx, kubeTimeout)
 	defer cancel()
-	m, host, release, err := d.kubeMaster(ctx, p.Host)
+	m, host, release, err := d.hostMaster(ctx, p.Host)
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +92,7 @@ func (d *Daemon) handleKubeGC(ctx context.Context, params json.RawMessage) (any,
 	}
 	ctx, cancel := context.WithTimeout(ctx, kubeTimeout)
 	defer cancel()
-	m, host, release, err := d.kubeMaster(ctx, p.Host)
+	m, host, release, err := d.hostMaster(ctx, p.Host)
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +186,7 @@ func (d *Daemon) handleKubeTargets(ctx context.Context, params json.RawMessage) 
 	}
 	ctx, cancel := context.WithTimeout(ctx, kubeTimeout)
 	defer cancel()
-	m, host, release, err := d.kubeMaster(ctx, p.Host)
+	m, host, release, err := d.hostMaster(ctx, p.Host)
 	if err != nil {
 		return nil, err
 	}

@@ -46,6 +46,7 @@ const (
 	modeAdd  // the Add menu
 	modeForm // a form from the Add menu
 	modeKube // picking a Kubernetes service or pod to forward
+	modeUSB  // picking a USB device to share
 )
 
 type rowKind int
@@ -95,6 +96,7 @@ type Model struct {
 	add  addMenu
 	form form
 	kube kubePicker
+	usb  usbPicker
 
 	flash    string
 	flashErr bool
@@ -192,6 +194,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.gotPVCs(msg), nil
 	case kubeTargetsMsg:
 		return m.gotKube(msg), nil
+	case dirListMsg:
+		return m.gotDirs(msg), nil
 	case statusMsg:
 		m.setStatus(api.Status(msg))
 		return m, waitEvent(m.client)
@@ -295,7 +299,11 @@ func (m Model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case modeAdd:
 		return m.addKey(msg)
 	case modeForm:
-		return m.formKey(msg)
+		next, cmd := m.formKey(msg)
+		nm := next.(Model)
+		return nm, tea.Batch(cmd, nm.syncBrowser())
+	case modeUSB:
+		return m.usbKey(msg)
 	case modeKube:
 		return m.kubeKey(msg)
 	case modeInput:
@@ -766,6 +774,8 @@ func (m Model) render() string {
 		body = m.addView()
 	case modeForm:
 		body = m.form.view()
+	case modeUSB:
+		body = m.usbView()
 	case modeKube:
 		body = m.kubeView(bodyHeight)
 	case modeInput:
@@ -808,7 +818,12 @@ func (m Model) footer() string {
 	case modeAdd:
 		return "↑↓ move · enter or the letter to pick · esc back"
 	case modeForm:
+		if m.form.fields[m.form.focus].browse != nil {
+			return "type a path · ↑↓ pick a directory · → open it · ← up · tab next field · enter next, then add · esc back"
+		}
 		return "tab/↓ next field · ↑ back · ←/→ choose · enter next, then add · esc back"
+	case modeUSB:
+		return "↑↓ move · enter share · esc back"
 	case modeKube:
 		return "enter forward · type to filter · ↑↓ move · tab context · ctrl+r refresh · esc back"
 	}

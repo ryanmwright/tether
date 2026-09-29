@@ -920,7 +920,7 @@ enter disconnect · a add… · c connect to… · d doctor · ? help · q quit
 | `u` | Bring the selection up now; on a failed host, retry without waiting |
 | `x` | Take the selection down; on an ad-hoc host that's already down, forget it |
 | `c` | Connect to a host that isn't in the config: `NAME [SSH-DEST]` |
-| `a`, `+` | Add to the selected host: every kind of forward and proxy, Kubernetes services and claims, mounts, USB, gpg. Each entry explains itself and opens a short form that previews the result. "Type a forward spec…" (`x` in the menu) takes any spec or shorthand |
+| `a`, `+` | Add to the selected host: every kind of forward and proxy, Kubernetes services and claims, mounts, USB, gpg. Each entry explains itself and opens a short form that previews the result. "Type a forward spec…" (`x` in the menu) takes any spec or shorthand. In the mount forms, path fields browse as you type, here or on the host: the directories matching what's typed are listed below, `↑`/`↓` pick one, `→` opens it, `←` goes up (typing a path works as before). "Share a USB device" lists every device here |
 | `y` | Copy the selected forward's local address |
 | `o` | Open the selected forward in the browser |
 | `m` | Add an ad-hoc mount on the selected host: `SRC DST`, one side `remote:PATH`; or `pvc:[CONTEXT/]NS/CLAIM [DST]` |
@@ -974,8 +974,8 @@ summary heads the menu.
   answers, with "Copy address", "Open in browser" and "Remove" (for ad-hoc
   ones). **Recent ▸** adds again, with a click, forwards and claims you added
   lately.
-- **Mounting from the menu**: "Add ▸ Mount a directory from HOST here…" asks for the
-  remote directory and a local mount point (default `~/mnt/<name>`, created
+- **Mounting from the menu**: "Add ▸ Mount a directory from HOST here…" lets
+  you browse HOST's directories (or type a path), then asks for a local mount point (default `~/mnt/<name>`, created
   if missing). "Mount local directory on HOST…" opens a folder picker, then
   asks where to mount it on the remote (default `~/<name>`). Like
   `tether mount add`, this connects the host if needed.

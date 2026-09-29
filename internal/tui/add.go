@@ -110,7 +110,7 @@ func (m Model) addView() []string {
 // openForm shows f, focused on its first field.
 func (m *Model) openForm(f form) tea.Cmd {
 	m.mode, m.form = modeForm, f
-	return m.form.setFocus(0)
+	return tea.Batch(m.form.setFocus(0), m.syncBrowser())
 }
 
 func (m Model) formKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -301,33 +301,36 @@ func openMountForm(there bool) func(m *Model, host string) tea.Cmd {
 		if there {
 			cwd, _ := os.Getwd()
 			f = form{title: "MOUNT A LOCAL DIRECTORY ON " + host, fields: []formField{
-				textField("Local directory", "", cwd, "must exist; "+host+" sees only this"),
-				textField("Mount on "+host+" at", "~/<its name>", "", "relative to "+host+"'s home unless absolute"),
+				pathField("Local directory", "", cwd+"/", "must exist; "+host+" sees only this", false, ""),
+				pathField("Mount on "+host+" at", "~/<its name>", "", "relative to "+host+"'s home unless absolute", true, host),
 			}}
 			f.build = func(v formValues) (formResult, error) {
 				local := v.get(0, "")
 				if local == "" {
 					return formResult{}, errors.New("enter the local directory")
 				}
-				local = absLocal(local, home)
-				remote := v.get(1, "~/"+filepath.Base(local))
+				local = strings.TrimSuffix(absLocal(local, home), "/")
+				remote := strings.TrimSuffix(v.get(1, "~/"+filepath.Base(local)), "/")
 				return mountResult(host, api.MountParams{Host: host, Direction: string(mount.LocalToRemote), Local: local, Remote: remote})
 			}
 		} else {
 			f = form{title: "MOUNT A DIRECTORY FROM " + host + " HERE", fields: []formField{
-				textField("Directory on "+host, "", "~/", "relative to "+host+"'s home unless absolute"),
-				textField("Mount here at", "~/mnt/<its name>", "", "created if missing"),
+				pathField("Directory on "+host, "", "~/", "relative to "+host+"'s home unless absolute", true, host),
+				pathField("Mount here at", "~/mnt/<its name>", "", "created if missing", false, ""),
 			}}
 			f.build = func(v formValues) (formResult, error) {
 				remote := v.get(0, "")
 				if remote == "" {
 					return formResult{}, errors.New("enter the directory on " + host)
 				}
+				if remote != "/" && remote != "~/" {
+					remote = strings.TrimSuffix(remote, "/")
+				}
 				base := path.Base(strings.TrimRight(remote, "/"))
 				if base == "~" || base == "." || base == "/" {
 					base = host
 				}
-				local := absLocal(v.get(1, "~/mnt/"+base), home)
+				local := strings.TrimSuffix(absLocal(v.get(1, "~/mnt/"+base), home), "/")
 				return mountResult(host, api.MountParams{Host: host, Direction: string(mount.RemoteToLocal), Local: local, Remote: remote})
 			}
 		}
@@ -368,17 +371,15 @@ func mountResult(host string, p api.MountParams) (formResult, error) {
 	}, nil
 }
 
-// openUSBForm picks a device plugged in here to share with host.
+// usbPicker lists the USB devices plugged in here, to share one with host.
+type usbPicker struct {
+	host   string
+	cursor int
+}
+
+// openUSBForm shows every USB device here, to share one with host.
 func openUSBForm(m *Model, host string) tea.Cmd {
-	var devs []api.USBDevice
-	var names []string
-	for _, d := range m.status.USB {
-		if d.Host == "" {
-			devs = append(devs, d)
-			names = append(names, d.Title()+" at "+d.BusID)
-		}
-	}
-	if len(devs) == 0 {
+	if len(m.status.USB) == 0 {
 		m.mode = modeNormal
 		m.flash, m.flashErr = "no USB devices here to share", true
 		if m.status.USBUnavailable != "" {
@@ -386,17 +387,58 @@ func openUSBForm(m *Model, host string) tea.Cmd {
 		}
 		return nil
 	}
-	f := form{title: "SHARE A USB DEVICE WITH " + host, fields: []formField{choiceField("Device", "←/→ to pick; enter to share", names...)}}
-	f.build = func(v formValues) (formResult, error) {
-		d := devs[slices.Index(names, v[0])]
-		return formResult{
-			preview: d.Title() + " → " + host + " (gone from this machine while shared)",
-			done:    "sharing " + d.Title() + " with " + host,
-			method:  api.MethodUSBAttach,
-			params:  api.USBParams{Host: host, Device: d.BusID},
-		}, nil
+	m.mode, m.usb = modeUSB, usbPicker{host: host}
+	// Start on the first device that's free.
+	if i := slices.IndexFunc(m.status.USB, func(d api.USBDevice) bool { return d.Host == "" }); i >= 0 {
+		m.usb.cursor = i
 	}
-	return m.openForm(f)
+	return nil
+}
+
+func (m Model) usbKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	devs := m.status.USB
+	switch msg.String() {
+	case "esc", "q":
+		m.mode = modeAdd
+	case "up", "k":
+		m.usb.cursor = max(m.usb.cursor-1, 0)
+	case "down", "j":
+		m.usb.cursor = min(m.usb.cursor+1, max(len(devs)-1, 0))
+	case "enter", "space":
+		if m.usb.cursor >= len(devs) {
+			return m, nil
+		}
+		d := devs[m.usb.cursor]
+		if d.Host != "" {
+			m.flash, m.flashErr = fmt.Sprintf("%s is already shared with %s", d.Title(), d.Host), true
+			return m, nil
+		}
+		m.mode = modeNormal
+		return m, m.share(d, m.usb.host)
+	}
+	return m, nil
+}
+
+func (m Model) usbView() []string {
+	lines := []string{styleSection.Render("SHARE A USB DEVICE WITH " + m.usb.host), ""}
+	if m.status.USBUnavailable != "" {
+		lines = append(lines, styleWarn.Render("  ⚠ "+m.status.USBUnavailable), "")
+	}
+	for i, d := range m.status.USB {
+		text := fmt.Sprintf("%-8s %-10s %s", d.BusID, d.ID, d.Name)
+		if d.Host != "" {
+			text += "  (shared with " + d.Host + ")"
+		}
+		switch {
+		case i == m.usb.cursor:
+			lines = append(lines, "▸ "+styleSelected.Render(text))
+		case d.Host != "":
+			lines = append(lines, "  "+styleFaint.Render(text))
+		default:
+			lines = append(lines, "  "+text)
+		}
+	}
+	return append(lines, "", styleFaint.Render("  While shared, a device is gone from this machine; it comes back when you stop sharing it."))
 }
 
 // kubePicker lists the services and pods kubectl on a host can forward to.

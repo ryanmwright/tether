@@ -174,6 +174,7 @@ func Run(ctx context.Context, opts Options) error {
 	srv.Handle(api.MethodKubeList, d.handleKubeList)
 	srv.Handle(api.MethodKubeGC, d.handleKubeGC)
 	srv.Handle(api.MethodKubeTargets, d.handleKubeTargets)
+	srv.Handle(api.MethodFSList, d.handleFSList)
 	srv.Handle(api.MethodLogs, func(_ context.Context, params json.RawMessage) (any, error) {
 		p, err := decode[api.LogsParams](orEmpty(params))
 		if err != nil {
