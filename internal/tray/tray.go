@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -254,22 +256,33 @@ func (t *tray) run(a *Action) {
 		poke(t.startDaemon)
 		return
 	case localOpenTUI:
-		t.report("open the terminal UI", t.openTUI())
+		var args []string
+		if a.Arg != "" {
+			args = []string{a.Arg, a.Host}
+		}
+		t.report("open the terminal UI", t.openTUI(args...))
+		return
+	case localAdd:
+		t.report("add to "+a.Host, t.addPrompt(a.Host, a.Arg))
+		return
+	case localCopy:
+		t.report("copy "+a.Arg, copyText(a.Arg))
+		return
+	case localOpenURL:
+		t.report("open "+a.Arg, spawn("xdg-open", a.Arg))
 		return
 	case localConnectPrompt:
 		t.report("connect", t.connectPrompt())
-		return
-	case localPickPVC:
-		t.report("open the claim picker", t.openTUI("--pvc", a.Host))
-		return
-	case localMountHere, localMountThere:
-		t.report("mount on "+a.Host, t.mountPrompt(a.Host, a.Local == localMountThere))
 		return
 	}
 	t.report(a.Done, t.call(a.Method, a.Params))
 }
 
 func (t *tray) call(method string, params any) error {
+	return t.callResult(method, params, nil)
+}
+
+func (t *tray) callResult(method string, params, result any) error {
 	t.mu.Lock()
 	c := t.client
 	t.mu.Unlock()
@@ -278,7 +291,188 @@ func (t *tray) call(method string, params any) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
 	defer cancel()
-	return c.Call(ctx, method, params, nil)
+	return c.Call(ctx, method, params, result)
+}
+
+// addPrompt asks, with the desktop's dialogs, for what's needed to add kind
+// to host, and adds it. Without a dialog tool it opens the terminal UI at
+// the same place.
+func (t *tray) addPrompt(host, kind string) error {
+	if dialogTool() == "" {
+		switch kind {
+		case addPVC:
+			return t.openTUI("--pvc", host)
+		case addKube:
+			return t.openTUI("--k8s", host)
+		}
+		return t.openTUI("--add", host)
+	}
+	add := func(spec string) error {
+		return t.call(api.MethodForwardAdd, api.ForwardParams{Host: host, Spec: spec})
+	}
+	ask := inputDialog
+	switch kind {
+	case addLocal:
+		rp, ok := ask("Port on "+host+" to reach from here:", "")
+		if !ok {
+			return nil
+		}
+		lp, ok := ask("Local port (connect to localhost:PORT here):", rp)
+		if !ok {
+			return nil
+		}
+		return add("L:" + lp + ":localhost:" + rp)
+	case addRemote:
+		lp, ok := ask("Port here for "+host+" to reach:", "")
+		if !ok {
+			return nil
+		}
+		rp, ok := ask("Port on "+host+" (programs there connect to localhost:PORT):", lp)
+		if !ok {
+			return nil
+		}
+		return add("R:" + rp + ":localhost:" + lp)
+	case addToHost:
+		target, ok := ask("Machine and port, as "+host+" sees them (e.g. db.internal:5432):", "")
+		if !ok {
+			return nil
+		}
+		_, tp, _ := cutLast(target, ":")
+		lp, ok := ask("Local port (connect to localhost:PORT here):", tp)
+		if !ok {
+			return nil
+		}
+		return add(lp + ":" + target)
+	case addFromLAN:
+		target, ok := ask("Machine and port on your network (e.g. nas.lan:9000):", "")
+		if !ok {
+			return nil
+		}
+		_, tp, _ := cutLast(target, ":")
+		rp, ok := ask("Port on "+host+" (programs there connect to localhost:PORT):", tp)
+		if !ok {
+			return nil
+		}
+		return add("R:" + rp + ":" + target)
+	case addSOCKS, addHTTP:
+		letter, def, what := "D", "1080", "SOCKS"
+		if kind == addHTTP {
+			letter, def, what = "H", "8080", "HTTP"
+		}
+		lp, ok := ask(what+" proxy on local port (0: any free one):", def)
+		if !ok {
+			return nil
+		}
+		return add(letter + ":" + lp)
+	case addReverseSOCKS:
+		rp, ok := ask("SOCKS proxy on "+host+", port (programs there use localhost:PORT):", "1080")
+		if !ok {
+			return nil
+		}
+		return add("R:" + rp)
+	case addSpec:
+		spec, ok := ask("Forward to add to "+host+" (e.g. 5432, db.internal:5432, R:3000:localhost:3000, socks, rsocks, http, K:8080:ns/svc/name:80; name it with LABEL=):", "")
+		if !ok {
+			return nil
+		}
+		return add(spec)
+	case addMountHere, addMountThere:
+		return t.mountPrompt(host, kind == addMountThere)
+	case addKube:
+		return t.kubeForwardPrompt(host)
+	case addPVC:
+		return t.pvcPrompt(host)
+	}
+	return fmt.Errorf("unknown kind %q", kind)
+}
+
+// kubeForwardPrompt picks a service or pod kubectl on host can reach, and a
+// port, and forwards it here.
+func (t *tray) kubeForwardPrompt(host string) error {
+	var res api.KubeTargetsResult
+	if err := t.callResult(api.MethodKubeTargets, api.KubeTargetsParams{Host: host}, &res); err != nil {
+		return err
+	}
+	if len(res.Targets) == 0 {
+		return fmt.Errorf("no services or pods in context %s", res.Context)
+	}
+	var names []string
+	for _, tg := range res.Targets {
+		var ports []string
+		for _, p := range tg.Ports {
+			ports = append(ports, strconv.Itoa(p.Port))
+		}
+		names = append(names, tg.Ref()+"   "+strings.Join(ports, ","))
+	}
+	i, ok := listDialog("Forward from Kubernetes (context "+res.Context+", via "+host+"):", names)
+	if !ok {
+		return nil
+	}
+	tg := res.Targets[i]
+	port := ""
+	switch len(tg.Ports) {
+	case 0:
+		if port, ok = inputDialog("Port of "+tg.Kind+"/"+tg.Name+" to forward:", ""); !ok {
+			return nil
+		}
+	case 1:
+		port = strconv.Itoa(tg.Ports[0].Port)
+	default:
+		var ports []string
+		for _, p := range tg.Ports {
+			ports = append(ports, strings.TrimSpace(fmt.Sprintf("%d %s", p.Port, p.Name)))
+		}
+		j, ok := listDialog("Which port of "+tg.Kind+"/"+tg.Name+"?", ports)
+		if !ok {
+			return nil
+		}
+		port = strconv.Itoa(tg.Ports[j].Port)
+	}
+	lp, ok := inputDialog("Local port (connect to localhost:PORT here):", port)
+	if !ok {
+		return nil
+	}
+	spec := fmt.Sprintf("%s=K:%s:%s/%s:%s", tg.Name, lp, res.Context, tg.Ref(), port)
+	return t.call(api.MethodForwardAdd, api.ForwardParams{Host: host, Spec: spec})
+}
+
+// pvcPrompt picks a claim kubectl on host can see, and a mount point, and
+// mounts it here.
+func (t *tray) pvcPrompt(host string) error {
+	var res api.KubeListResult
+	if err := t.callResult(api.MethodKubeList, api.KubeListParams{Host: host}, &res); err != nil {
+		return err
+	}
+	var pvcs []api.PVC
+	var names []string
+	for _, p := range res.PVCs {
+		if p.Mountable {
+			pvcs = append(pvcs, p)
+			names = append(names, strings.TrimSpace(fmt.Sprintf("%s   %s %s   %s", p.Ref(), p.Phase, p.Size(), p.Note)))
+		}
+	}
+	if len(pvcs) == 0 {
+		return fmt.Errorf("no claims that can be mounted in context %s", res.Context)
+	}
+	i, ok := listDialog("Mount a Kubernetes claim (context "+res.Context+", via "+host+"):", names)
+	if !ok {
+		return nil
+	}
+	p := pvcs[i]
+	def := path.Join(res.MountRoot, strings.ReplaceAll(res.Context, "/", "_"), p.Namespace, p.Name)
+	local, ok := inputDialog("Mount "+p.Ref()+" here at:", def)
+	if !ok {
+		return nil
+	}
+	return t.call(api.MethodMountAdd, api.MountParams{Host: host, Direction: "pvc-to-local", Local: local,
+		Kube: &api.KubeMount{Context: res.Context, Namespace: p.Namespace, PVC: p.Name}})
+}
+
+func cutLast(s, sep string) (before, after string, found bool) {
+	if i := strings.LastIndex(s, sep); i >= 0 {
+		return s[:i], s[i+len(sep):], true
+	}
+	return s, "", false
 }
 
 // report tells the user about a failed action; successes show in the menu.
@@ -381,6 +575,49 @@ func inputDialog(text, initial string) (answer string, ok bool) {
 		return "", false
 	}
 	return runDialog(argv)
+}
+
+// listDialog picks one of items, returning its index.
+func listDialog(text string, items []string) (int, bool) {
+	var argv []string
+	switch dialogTool() {
+	case "kdialog":
+		argv = []string{"kdialog", "--title", "tether", "--menu", text}
+		for i, it := range items {
+			argv = append(argv, strconv.Itoa(i), it)
+		}
+	case "zenity":
+		argv = []string{"zenity", "--list", "--title=tether", "--text=" + text, "--hide-header",
+			"--column=i", "--column=item", "--hide-column=1", "--print-column=1", "--height=480", "--width=640"}
+		for i, it := range items {
+			argv = append(argv, strconv.Itoa(i), it)
+		}
+	default:
+		return 0, false
+	}
+	answer, ok := runDialog(argv)
+	if !ok {
+		return 0, false
+	}
+	i, err := strconv.Atoi(answer)
+	if err != nil || i < 0 || i >= len(items) {
+		return 0, false
+	}
+	return i, true
+}
+
+// copyText puts s on the clipboard with whichever of wl-copy, xclip and
+// xsel is installed.
+func copyText(s string) error {
+	for _, argv := range [][]string{{"wl-copy"}, {"xclip", "-selection", "clipboard"}, {"xsel", "--clipboard", "--input"}} {
+		if !lookPath(argv[0]) {
+			continue
+		}
+		cmd := exec.Command(argv[0], argv[1:]...)
+		cmd.Stdin = strings.NewReader(s)
+		return cmd.Run()
+	}
+	return errors.New("no clipboard tool found; install wl-clipboard (Wayland) or xclip (X11)")
 }
 
 // directoryDialog picks an existing directory, starting in start.

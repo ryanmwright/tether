@@ -32,6 +32,7 @@ tokens, `known_hosts`) works as it already does.
   - [Nix on another distro, without home-manager](#nix-on-another-distro-without-home-manager)
   - [Without Nix](#without-nix)
 - [Configuration file](#configuration-file)
+- [Forwarding and proxies](#forwarding-and-proxies)
 - [gpg-agent forwarding](#gpg-agent-forwarding)
 - [Directory mounts](#directory-mounts)
 - [USB devices](#usb-devices)
@@ -338,6 +339,7 @@ options = ["reconnect"]
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `reconnect_backoff` | string | `"1s..60s"` | Reconnect delay range `"min..max"`, or a single duration for a fixed delay. Go duration syntax (`500ms`, `10s`, `2m`). |
+| `check_targets` | bool | `true` | Check every 30 seconds that forwards' targets answer. See [target checks](#forwarding-and-proxies). |
 | `local_host` | bool | `true` | Offer the built-in host `local` (Kubernetes volume mounts with `kubectl` on this machine) when `kubectl` is installed. |
 
 **`[hosts.<name>]`**: a machine you connect to. Names may contain letters,
@@ -359,7 +361,7 @@ devices on one host. Several profiles on the same host share one SSH connection.
 | `autoconnect` | bool | `false` | Bring this profile up when the daemon starts. |
 | `gpg` | bool | `false` | Forward your gpg-agent, so gpg on the host signs and decrypts with your local keys. See [gpg-agent forwarding](#gpg-agent-forwarding). |
 | `gpg_ssh` | bool | `false` | Also forward gpg-agent's SSH socket, so ssh on the host can use your SSH keys. |
-| `forwards` | list of strings | `[]` | Port forwards; see below. |
+| `forwards` | list of strings | `[]` | Forwards and proxies: specs, shorthands or names, each optionally `LABEL=` first. See below and [Forwarding and proxies](#forwarding-and-proxies). |
 | `mounts` | list of tables | `[]` | Directory mounts; see below. |
 | `usb` | list of strings | `[]` | USB devices to share: bus IDs (`"1-2"`) or `vendor:product` (`"1050:0407"`). See [USB devices](#usb-devices). |
 
@@ -370,6 +372,12 @@ devices on one host. Several profiles on the same host share one SSH connection.
 | `L:[bind:]port:host:hostport` | Local forward: a local port reaches `host:hostport` from the remote side. `host` can be any machine the remote can reach, which is how you use a host as a bastion. |
 | `R:[bind:]port:host:hostport` | Remote forward: a port on the remote reaches `host:hostport` from your side. |
 | `D:[bind:]port` | Dynamic (SOCKS) proxy on a local port. |
+| `R:[bind:]port` | Reverse SOCKS proxy on the remote, connecting out from here. |
+| `H:[bind:]port` | HTTP (and SOCKS) proxy on a local port, connecting out from the remote. |
+| `K:[bind:]port:[context/]ns/kind/name:port` | A Kubernetes service or pod, via `kubectl port-forward` on the remote. |
+
+Shorthands (`5432`, `8080:3000`, `db.internal:5432`), the names `socks`,
+`rsocks` and `http`, and a `LABEL=` prefix work too; port 0 picks a free port.
 
 **`[[profiles.<name>.mounts]]`**:
 
@@ -408,6 +416,82 @@ Remotes need only `sshd`. gpg forwarding needs a little remote setup (below),
 local-to-remote mounts need `sshfs` and FUSE there, and USB sharing needs
 `usbip` with root access. Run
 `tether doctor HOST` to check a host.
+
+## Forwarding and proxies
+
+Every forward runs over the host's one SSH connection. The easiest way to add
+one is the **Add** menu: `a` on a host in the terminal UI, or "Add ▸" in its
+tray submenu. Each entry explains itself and shows what it will do before you
+confirm. From the command line, `tether fwd add HOST SPEC` takes a spec, a
+shorthand or a name; `tether fwd explain SPEC` says what one does without
+adding it.
+
+**What can I forward?** (HOST is the host you're connected to)
+
+| You want | Spec | Shorthand / name | Add menu |
+|---|---|---|---|
+| A port on HOST, here | `L:5432:localhost:5432` | `5432`, `8080:5432` (different local port) | Forward a local port to a port on HOST |
+| A machine on HOST's network, here (HOST as a jump box) | `L:5432:db.internal:5432` | `db.internal:5432` | … to a machine on HOST's network |
+| A port here, on HOST | `R:3000:localhost:3000` | | Forward a port on HOST to a port here |
+| A machine on your network, on HOST | `R:9000:nas.lan:9000` | | … to a machine on my network |
+| Browse as if you were on HOST (SOCKS5 proxy here) | `D:1080` | `socks` | SOCKS proxy here |
+| Give HOST your network or internet (SOCKS5 proxy on HOST) | `R:1080` | `rsocks` | SOCKS proxy on HOST |
+| An HTTP proxy here, for tools that only take `HTTP_PROXY` | `H:8080` | `http` | HTTP proxy here |
+| A Kubernetes service or pod, via kubectl on HOST | `K:8080:web/svc/frontend:80` | `tether kube fwd` | Kubernetes service or pod… |
+| A Unix socket, either way | `L:2375:/var/run/docker.sock` | | Type a forward spec… |
+| Your gpg-agent on HOST | | `gpg-agent`, `gpg-ssh` | Forward gpg-agent |
+
+- **Listening address:** put a bind address first to listen on more than
+  localhost: `L:0.0.0.0:8080:web.internal:80`, `D:*:1080`. For `R`, the
+  remote's sshd must allow it (`GatewayPorts`).
+- **Port 0** picks a free port: `L:0:db.internal:5432` here (kept across
+  reconnects while it's free), `R:0:localhost:3000` on the remote. `tether fwd
+  ls` and the TUI show the port picked.
+- **Labels** name a forward: `postgres=db.internal:5432`. The name is shown
+  first everywhere, and works in profiles too:
+  `forwards = ["postgres=db.internal:5432", "socks"]`.
+- **Where to connect:** `tether fwd ls` lists every forward with the address
+  to connect to and what it does. In the TUI, `y` copies a forward's address
+  and `o` opens it in the browser; in the tray, a forward's submenu has
+  "Copy address" and "Open in browser".
+
+**Reverse SOCKS** (`R:1080`, `rsocks`) is a SOCKS5 proxy *on the remote* that
+connects out from *this* machine: point a program on the remote at
+`localhost:1080` (`curl --socks5-hostname localhost:1080 …`,
+`ALL_PROXY=socks5h://localhost:1080`) to reach your network or the internet
+from a machine that can't. It needs OpenSSH 7.6 or later here.
+
+**The HTTP proxy** (`H:8080`, `http`) runs inside tether and connects out
+through the host, like `D`. It handles `CONNECT` (HTTPS) and plain `http://`
+requests, and also speaks SOCKS5 on the same port, so one address works for
+`HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`.
+
+**Kubernetes services and pods** (`K:`, `tether kube fwd`) run
+`kubectl port-forward` on the host and bring its port here, like claims do
+(see [Kubernetes volumes](#kubernetes-volumes)); on the `local` host kubectl
+listens here directly. KIND is `svc`, `pod`, `deploy` or `sts`. kubectl stops
+when its pod is replaced (a rollout, a restart); tether starts it again at
+once, on the same local port. Without a context, kubectl's current one is
+used, and remembered.
+
+```console
+$ tether kube targets jump -n web
+NAMESPACE  KIND  NAME      PORTS               OWNER
+web        svc   frontend  80 (http), 443      -
+web        pod   frontend-7d9c-x2x9f  8080     ReplicaSet/frontend-7d9c
+$ tether kube fwd jump web/svc/frontend:80 8080
+frontend (K:8080:prod/web/svc/frontend:80): up
+  localhost:8080 here → svc/frontend port 80 (namespace web, context prod), via kubectl on jump
+```
+
+**Target checks.** Every 30 seconds tether checks that each forward's target
+answers, and shows "target unreachable" (with why) in `status`, `fwd ls`, the
+TUI and the tray when it doesn't. That's a warning, not an error: the
+forward itself is fine. Forwards listening here are checked through the
+forward (ssh or kubectl closes the connection at once when the target
+refuses), `R` forwards by connecting to their target here. A target that
+silently drops packets looks reachable. Targets that log every connection
+may not like this; turn the checks off with `[defaults] check_targets = false`.
 
 ## gpg-agent forwarding
 
@@ -592,8 +676,8 @@ $ tether kube umount jump db/data-pg-0
 
 In the terminal UI, press `K` on a host for a picker: type to filter, `tab` to
 switch contexts, `enter` to mount. In the tray, each host has
-"Mount a Kubernetes claim…" (opens that picker) and "Recent claims" (one
-click to mount one again).
+"Add ▸ Mount a Kubernetes claim (PVC)…" (pick from a list, then a mount point)
+and "Recent ▸" (one click to mount one again).
 
 **How it works.** tether starts a small helper pod in the claim's namespace
 that mounts the claim at `/data`, then runs `sshfs` here piped to
@@ -826,7 +910,7 @@ lab: Permission denied (publickey) (retry in 8s)
 LOG
 14:01:53 INFO connected host=devbox
 14:01:55 WARN connect failed host=lab err="Permission denied (publickey)"
-enter toggle · a add forward · g gpg · d doctor · r reload · l log · ? help · q quit
+enter disconnect · a add… · c connect to… · d doctor · ? help · q quit
 ```
 
 | Key | Action |
@@ -836,7 +920,9 @@ enter toggle · a add forward · g gpg · d doctor · r reload · l log · ? hel
 | `u` | Bring the selection up now; on a failed host, retry without waiting |
 | `x` | Take the selection down; on an ad-hoc host that's already down, forget it |
 | `c` | Connect to a host that isn't in the config: `NAME [SSH-DEST]` |
-| `a` | Add an ad-hoc forward to the selected host (any spec, or `gpg-agent`/`gpg-ssh`) |
+| `a`, `+` | Add to the selected host: every kind of forward and proxy, Kubernetes services and claims, mounts, USB, gpg. Each entry explains itself and opens a short form that previews the result. "Type a forward spec…" (`x` in the menu) takes any spec or shorthand |
+| `y` | Copy the selected forward's local address |
+| `o` | Open the selected forward in the browser |
 | `m` | Add an ad-hoc mount on the selected host: `SRC DST`, one side `remote:PATH`; or `pvc:[CONTEXT/]NS/CLAIM [DST]` |
 | `K`, `p` | Pick a Kubernetes claim to mount, with `kubectl` on the selected host. Type to filter, `tab` for the next context, `ctrl+o` read-only, `enter` to mount (asks where, suggesting the default) |
 | `g` | Toggle ad-hoc gpg-agent forwarding to the selected host |
@@ -874,14 +960,21 @@ summary heads the menu.
 
 - **Left-click** opens the terminal UI.
 - **The menu** has a submenu per host (connect or disconnect, its forwards,
-  mounts and USB devices with their state, retry, toggle gpg-agent forwarding, mount a
-  directory in either direction, unmount ad-hoc mounts, and forget for
-  ad-hoc hosts), your profiles as checkboxes, "Connect to host…" (asks for
-  `NAME [SSH-DEST]`), a "USB devices" section, and reload. Each host also
-  has "Mount a Kubernetes claim…", which opens the terminal UI's claim
-  picker, and "Recent claims" to mount one again with a click. Prompts use `kdialog` or `zenity`; without
-  either, the terminal UI opens instead.
-- **Mounting from the menu**: "Mount remote directory here…" asks for the
+  mounts and USB devices with their state, retry, toggle gpg-agent forwarding,
+  unmount ad-hoc mounts, and forget for ad-hoc hosts), your profiles as
+  checkboxes, "Connect to host…" (asks for `NAME [SSH-DEST]`), a "USB
+  devices" section, and reload.
+- **Add ▸** in each host's submenu offers everything the terminal UI's Add
+  menu does: each kind of forward and proxy (a prompt or two, with sensible
+  defaults), Kubernetes services and pods and claims (picked from a list),
+  mounts either way, and USB devices plugged in here, one click each.
+  "More in the terminal UI…" opens the TUI's Add menu. Prompts use `kdialog`
+  or `zenity`; without either, the terminal UI opens at the same place.
+- **Each forward** has a submenu saying what it does and whether its target
+  answers, with "Copy address", "Open in browser" and "Remove" (for ad-hoc
+  ones). **Recent ▸** adds again, with a click, forwards and claims you added
+  lately.
+- **Mounting from the menu**: "Add ▸ Mount a directory from HOST here…" asks for the
   remote directory and a local mount point (default `~/mnt/<name>`, created
   if missing). "Mount local directory on HOST…" opens a folder picker, then
   asks where to mount it on the remote (default `~/<name>`). Like
@@ -932,8 +1025,11 @@ tether up NAME...                 connect hosts / activate profiles, wait for th
 tether down NAME...               deactivate profiles / disconnect hosts
 tether host add NAME [SSH-DEST]   connect to a host that isn't in the config (ad hoc)
 tether host rm NAME...            disconnect ad-hoc hosts and forget them
-tether fwd add HOST SPEC...       add ad-hoc forwards (connects the host if needed)
+tether fwd add HOST [LABEL=]SPEC...  add ad-hoc forwards (connects the host if needed);
+                                  SPEC: a spec, 5432, db.internal:5432, socks, rsocks, http
 tether fwd rm HOST SPEC...        remove ad-hoc forwards
+tether fwd ls [HOST]              forwards, where to connect, what they do
+tether fwd explain SPEC...        say what a spec does, without adding it
 tether gpg on HOST [--ssh]        forward gpg-agent (and its SSH socket) ad hoc
 tether gpg off HOST [--ssh]       stop it
 tether doctor HOST [--json]       check local, connection and remote setup
@@ -950,7 +1046,12 @@ tether kube mount HOST [CTX/]NS/CLAIM [DST]   mount a claim here
   --ro, --sub-path DIR, -o OPTION
 tether kube umount HOST [CTX/]NS/CLAIM [DST]  unmount it, delete its helper pod
 tether kube gc HOST [--context]   delete helper pods left behind
-tether tui --pvc HOST             open the TUI in the claim picker
+tether kube targets HOST          services and pods kubectl on HOST can forward to
+tether kube fwd HOST [CTX/]NS/KIND/NAME[:PORT] [LOCAL-PORT]   forward one here
+  --label NAME, --bind ADDR
+tether tui --add HOST             open the TUI in HOST's Add menu
+tether tui --pvc HOST             ... in the claim picker
+tether tui --k8s HOST             ... in the Kubernetes service/pod picker
 tether usb list                   USB devices here, and where they're shared
 tether usb attach HOST DEVICE     share a device (bus ID or vendor:product)
 tether usb detach HOST DEVICE     stop sharing it
@@ -1030,7 +1131,7 @@ well for status bars and scripts.
 | Config file | `$XDG_CONFIG_HOME/tether/config.toml` (`~/.config/...`) | `--config` or `TETHER_CONFIG` |
 | Socket | `$XDG_RUNTIME_DIR/tether/tether.sock` | `--socket` or `TETHER_SOCKET` |
 | SSH control sockets | `$XDG_RUNTIME_DIR/tether/ctl/<host>` | — |
-| Recent claims | `$XDG_STATE_HOME/tether/recent.json` (`~/.local/state/...`) | — |
+| Recent forwards and claims | `$XDG_STATE_HOME/tether/recent.json` (`~/.local/state/...`) | — |
 | Log (on-demand daemon) | next to the socket, `daemon.log` | — |
 | Log (systemd) | the journal: `journalctl --user -u tether` | — |
 

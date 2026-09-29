@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -111,16 +112,39 @@ func (d *Daemon) handleKubeGC(ctx context.Context, params json.RawMessage) (any,
 	return api.KubeGCResult{Deleted: n}, nil
 }
 
-// maxRecent is how many claims are remembered per host.
+// maxRecent is how many claims and forwards are remembered per host.
 const maxRecent = 5
+
+// recentItems are claims mounted and forwards added lately, per host,
+// newest first.
+type recentItems struct {
+	PVCs     map[string][]api.RecentPVC     `json:"pvcs"`
+	Forwards map[string][]api.RecentForward `json:"forwards"`
+}
 
 // rememberPVC records a claim just mounted from host. Callers hold d.mu.
 func (d *Daemon) rememberPVC(host string, r api.RecentPVC) {
-	list := slices.DeleteFunc(slices.Clone(d.recent[host]), func(o api.RecentPVC) bool {
+	d.recent.PVCs[host] = remember(d.recent.PVCs[host], r, func(o api.RecentPVC) bool {
 		return o.Context == r.Context && o.Namespace == r.Namespace && o.PVC == r.PVC
 	})
-	list = append([]api.RecentPVC{r}, list...)
-	d.recent[host] = list[:min(len(list), maxRecent)]
+	d.saveRecent()
+}
+
+// rememberForward records a forward just added to host. Callers hold d.mu.
+func (d *Daemon) rememberForward(host string, r api.RecentForward) {
+	d.recent.Forwards[host] = remember(d.recent.Forwards[host], r, func(o api.RecentForward) bool { return o.Spec == r.Spec })
+	d.saveRecent()
+}
+
+// remember puts r first in list, dropping entries that are the same, and
+// keeps at most maxRecent.
+func remember[T any](list []T, r T, same func(T) bool) []T {
+	list = slices.DeleteFunc(slices.Clone(list), same)
+	list = append([]T{r}, list...)
+	return list[:min(len(list), maxRecent)]
+}
+
+func (d *Daemon) saveRecent() {
 	if d.opts.RecentFile == "" {
 		return
 	}
@@ -130,18 +154,55 @@ func (d *Daemon) rememberPVC(host string, r api.RecentPVC) {
 		err = os.WriteFile(d.opts.RecentFile, b, 0o600)
 	}
 	if err != nil {
-		d.log.Warn("couldn't save recent claims", "err", err)
+		d.log.Warn("couldn't save recent items", "err", err)
 	}
 }
 
-// loadRecent reads the recent claims kept by rememberPVC.
-func loadRecent(path string) map[string][]api.RecentPVC {
-	recent := map[string][]api.RecentPVC{}
+// loadRecent reads what saveRecent wrote. Files from before forwards were
+// remembered hold only claims, as a map of host to claims.
+func loadRecent(path string) recentItems {
+	r := recentItems{PVCs: map[string][]api.RecentPVC{}, Forwards: map[string][]api.RecentForward{}}
 	if path == "" {
-		return recent
+		return r
 	}
-	if b, err := os.ReadFile(path); err == nil {
-		json.Unmarshal(b, &recent)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return r
 	}
-	return recent
+	if json.Unmarshal(b, &r) != nil || r.PVCs == nil {
+		r.PVCs = map[string][]api.RecentPVC{}
+		json.Unmarshal(b, &r.PVCs)
+	}
+	if r.Forwards == nil {
+		r.Forwards = map[string][]api.RecentForward{}
+	}
+	return r
+}
+
+func (d *Daemon) handleKubeTargets(ctx context.Context, params json.RawMessage) (any, error) {
+	p, err := decode[api.KubeTargetsParams](params)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, kubeTimeout)
+	defer cancel()
+	m, host, release, err := d.kubeMaster(ctx, p.Host)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	opts := host.Kube.Options()
+	contexts, current, err := kube.Contexts(ctx, m, opts)
+	if err != nil {
+		return nil, err
+	}
+	kctx := cmp.Or(p.Context, current)
+	if kctx == "" {
+		return nil, fmt.Errorf("kubectl on %s has no current context; pick one of: %s", p.Host, strings.Join(contexts, ", "))
+	}
+	targets, err := kube.Targets(ctx, m, opts, kctx, p.Namespace)
+	if err != nil {
+		return nil, err
+	}
+	return api.KubeTargetsResult{Host: p.Host, Context: kctx, Current: current, Contexts: contexts, Targets: targets}, nil
 }

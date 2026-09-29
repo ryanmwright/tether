@@ -154,9 +154,14 @@ func (s Source) Validate() error {
 // if set, with args.
 func kubectl(opts Options, kctx string, args ...string) string {
 	opts = opts.WithDefaults()
+	// The environment goes through env(1), not a VAR=value prefix, so the
+	// command can be exec'd.
 	var cmd []string
+	if len(opts.Env) > 0 {
+		cmd = append(cmd, "env")
+	}
 	for _, k := range slices.Sorted(maps.Keys(opts.Env)) {
-		cmd = append(cmd, k+"="+Quote(opts.Env[k]))
+		cmd = append(cmd, Quote(k+"="+opts.Env[k]))
 	}
 	cmd = append(cmd, shellPath(opts.Kubectl))
 	if opts.Kubeconfig != "" {

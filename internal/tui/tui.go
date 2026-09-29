@@ -5,7 +5,9 @@ package tui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -40,7 +42,10 @@ const (
 	modeInput       // typing a forward spec
 	modeDoctor
 	modeHelp
-	modePVC // picking a claim to mount
+	modePVC  // picking a claim to mount
+	modeAdd  // the Add menu
+	modeForm // a form from the Add menu
+	modeKube // picking a Kubernetes service or pod to forward
 )
 
 type rowKind int
@@ -86,7 +91,10 @@ type Model struct {
 	doctorErr     error
 	doctorRunning bool
 
-	pvc pvcPicker
+	pvc  pvcPicker
+	add  addMenu
+	form form
+	kube kubePicker
 
 	flash    string
 	flashErr bool
@@ -138,8 +146,11 @@ type (
 
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{waitEvent(m.client), tick()}
-	if m.mode == modePVC {
+	switch m.mode {
+	case modePVC:
 		cmds = append(cmds, m.listPVCs())
+	case modeKube:
+		cmds = append(cmds, m.listKube())
 	}
 	return tea.Batch(cmds...)
 }
@@ -179,6 +190,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case pvcListMsg:
 		return m.gotPVCs(msg), nil
+	case kubeTargetsMsg:
+		return m.gotKube(msg), nil
 	case statusMsg:
 		m.setStatus(api.Status(msg))
 		return m, waitEvent(m.client)
@@ -217,6 +230,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.pvc.filter, cmd = m.pvc.filter.Update(msg)
 		return m, cmd
+	case modeKube:
+		var cmd tea.Cmd
+		m.kube.filter, cmd = m.kube.filter.Update(msg)
+		return m, cmd
+	case modeForm:
+		if fl := &m.form.fields[m.form.focus]; fl.choices == nil {
+			var cmd tea.Cmd
+			fl.input, cmd = fl.input.Update(msg)
+			return m, cmd
+		}
 	}
 	return m, nil
 }
@@ -269,6 +292,12 @@ func (m Model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case modePVC:
 		return m.pvcKey(msg)
+	case modeAdd:
+		return m.addKey(msg)
+	case modeForm:
+		return m.formKey(msg)
+	case modeKube:
+		return m.kubeKey(msg)
 	case modeInput:
 		switch k {
 		case "esc":
@@ -338,14 +367,26 @@ func (m Model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if ok {
 			return m.remove(sel)
 		}
-	case "a", "m":
+	case "a", "+":
 		if hostOK {
-			kind := inputForward
-			if k == "m" {
-				kind = inputMount
-			}
-			cmd := m.prompt(kind, sel.host)
+			m.openAdd(sel.host)
+		}
+	case "m":
+		if hostOK {
+			cmd := m.prompt(inputMount, sel.host)
 			return m, cmd
+		}
+	case "y":
+		if ok && sel.kind == rowForward {
+			if a := m.forwardStatus(sel.host, sel.name).Address; a != "" {
+				m.flash = "copied " + a
+				return m, tea.SetClipboard(a)
+			}
+			m.flash, m.flashErr = "this forward has no address here to copy", true
+		}
+	case "o":
+		if ok && sel.kind == rowForward {
+			return m, m.openBrowser(m.forwardStatus(sel.host, sel.name))
 		}
 	case "c":
 		cmd := m.prompt(inputConnect, "")
@@ -721,6 +762,12 @@ func (m Model) render() string {
 		body = helpLines
 	case modePVC:
 		body = m.pvcView(bodyHeight)
+	case modeAdd:
+		body = m.addView()
+	case modeForm:
+		body = m.form.view()
+	case modeKube:
+		body = m.kubeView(bodyHeight)
 	case modeInput:
 		if m.inputKind == inputPVCPath {
 			body = m.pvcView(bodyHeight)
@@ -758,8 +805,18 @@ func (m Model) footer() string {
 		return "any key to go back"
 	case modePVC:
 		return "enter mount · type to filter · ↑↓ move · tab context · ctrl+o read-only · ctrl+r refresh · esc back"
+	case modeAdd:
+		return "↑↓ move · enter or the letter to pick · esc back"
+	case modeForm:
+		return "tab/↓ next field · ↑ back · ←/→ choose · enter next, then add · esc back"
+	case modeKube:
+		return "enter forward · type to filter · ↑↓ move · tab context · ctrl+r refresh · esc back"
 	}
-	return m.enterHint() + " · c connect to… · a forward · m mount · K claims · g gpg · d doctor · ? help · q quit"
+	hint := m.enterHint() + " · a add… · c connect to… · d doctor · ? help · q quit"
+	if r, ok := m.selected(); ok && r.kind == rowForward {
+		hint = m.enterHint() + " · y copy address · o open in browser · a add… · ? help · q quit"
+	}
+	return hint
 }
 
 // enterHint says what enter does on the selected row.
@@ -812,8 +869,11 @@ func (m Model) rowLines(height int) []string {
 	nameW := 0
 	for _, r := range m.rows {
 		w := len(r.name)
-		if r.kind == rowHost {
+		switch r.kind {
+		case rowHost:
 			w = len(r.host)
+		case rowForward:
+			w = len(forwardName(m.forwardStatus(r.host, r.name)))
 		}
 		nameW = max(nameW, w+2)
 	}
@@ -875,7 +935,7 @@ func (m Model) rowLine(r row, selected bool, nameW int) string {
 		extra = hostProblem(h)
 	case rowForward:
 		f := m.forwardStatus(r.host, r.name)
-		state, name, info = f.State, "  "+f.Spec, source(f.Profiles, f.AdHoc)
+		state, name, info = f.State, "  "+forwardName(f), source(f.Profiles, f.AdHoc)
 		extra = forwardDetail(f)
 	case rowMount:
 		mt := m.mountStatus(r.host, r.name)
@@ -938,10 +998,43 @@ func source(profiles []string, adhoc bool) string {
 	return strings.Join(sources, ",")
 }
 
+// forwardName is how a forward is shown: its label with its spec, or the
+// spec.
+func forwardName(f api.ForwardStatus) string {
+	if f.Label != "" {
+		return f.Label + " " + f.Spec
+	}
+	return f.Spec
+}
+
+// openBrowser opens a forward listening here in the desktop's browser.
+func (m Model) openBrowser(f api.ForwardStatus) tea.Cmd {
+	addr := f.Address
+	if addr == "" || strings.HasPrefix(addr, "/") {
+		return func() tea.Msg {
+			return actionMsg{text: "open " + f.Spec, err: errors.New("it doesn't listen on a TCP port here")}
+		}
+	}
+	url := "http://" + addr
+	if strings.HasSuffix(addr, ":443") || strings.HasSuffix(addr, ":8443") {
+		url = "https://" + addr
+	}
+	return func() tea.Msg {
+		cmd := exec.Command("xdg-open", url)
+		if err := cmd.Start(); err != nil {
+			return actionMsg{text: "open " + url, err: err}
+		}
+		go cmd.Wait()
+		return actionMsg{text: "opened " + url}
+	}
+}
+
 func forwardDetail(f api.ForwardStatus) string {
 	switch {
 	case f.Error != "":
 		return f.Error
+	case f.Target == "unreachable":
+		return "⚠ target unreachable"
 	case f.AllocatedPort != 0:
 		return fmt.Sprintf("remote port %d", f.AllocatedPort)
 	case f.Resolved != "":
@@ -966,8 +1059,14 @@ func (m Model) detail() string {
 		if f.Error != "" {
 			return styleErr.Render(f.Spec + ": " + f.Error)
 		}
+		if f.TargetError != "" {
+			return styleWarn.Render("target unreachable: " + f.TargetError)
+		}
 		if f.Resolved != "" {
 			return styleFaint.Render(f.Spec + " → " + f.Resolved)
+		}
+		if f.Description != "" {
+			return styleFaint.Render(f.Description)
 		}
 	case rowMount:
 		mt := m.mountStatus(r.host, r.name)
@@ -1051,11 +1150,25 @@ var helpLines = []string{
 	"  u            bring up the selection now (also retries a failed connection)",
 	"  x            take down the selection; on an ad-hoc host that's down, forget it",
 	"  c            connect to a host that isn't in the config (NAME [SSH-DEST])",
-	"  a            add an ad-hoc forward to the selected host",
+	"  a / +        add to the selected host: forwards, proxies, Kubernetes, mounts,",
+	"               USB, gpg — each explained, with a form that shows what it will do",
+	"  y            copy the selected forward's local address",
+	"  o            open the selected forward in the browser",
 	"  m            add an ad-hoc mount on the selected host (SRC DST, one side remote:PATH;",
 	"               or pvc:[CONTEXT/]NS/CLAIM [DST] for a Kubernetes claim)",
 	"  K / p        pick a Kubernetes claim to mount, with kubectl on the selected host",
 	"               (\"local\": kubectl on this machine)",
+	"",
+	styleSection.Render("WHAT CAN I FORWARD? (a, or type a spec with a → x)"),
+	"  5432                   localhost:5432 here → port 5432 on the host",
+	"  db.internal:5432       localhost:5432 here → db.internal:5432, a machine the host reaches",
+	"  R:3000:localhost:3000  port 3000 on the host → port 3000 here",
+	"  R:9000:nas.lan:9000    port 9000 on the host → nas.lan:9000 on your network",
+	"  socks / D:1080         SOCKS proxy here, connecting out from the host",
+	"  rsocks / R:1080        SOCKS proxy on the host, connecting out from here",
+	"  http / H:8080          HTTP (and SOCKS) proxy here, connecting out from the host",
+	"  K:8080:ns/svc/web:80   a Kubernetes service or pod, via kubectl on the host",
+	"  label=SPEC             give it a name, e.g. postgres=db.internal:5432",
 	"  g            toggle ad-hoc gpg-agent forwarding to the selected host",
 	"  d            run doctor on the selected host",
 	"  r            reload the config file",

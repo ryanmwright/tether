@@ -73,7 +73,7 @@ type Daemon struct {
 	autoSeen   map[string]bool                   // "host/x", "profile/x" -> autoconnect as last applied
 	sessions   map[string]*sessionHandle
 	usb        *localUSB
-	recent     map[string][]api.RecentPVC // host -> claims mounted lately, newest first
+	recent     recentItems // claims and forwards added lately
 
 	gen    atomic.Uint64 // see api.Status.Generation
 	logs   *logRing
@@ -173,6 +173,7 @@ func Run(ctx context.Context, opts Options) error {
 	srv.Handle(api.MethodUSBDetach, d.handleUSBDetach)
 	srv.Handle(api.MethodKubeList, d.handleKubeList)
 	srv.Handle(api.MethodKubeGC, d.handleKubeGC)
+	srv.Handle(api.MethodKubeTargets, d.handleKubeTargets)
 	srv.Handle(api.MethodLogs, func(_ context.Context, params json.RawMessage) (any, error) {
 		p, err := decode[api.LogsParams](orEmpty(params))
 		if err != nil {
@@ -354,7 +355,8 @@ func (d *Daemon) startSession(name string) {
 func (d *Daemon) recompute() {
 	for name, h := range d.sessions {
 		host, _ := d.host(name)
-		w := want{backoff: d.cfg.Defaults.ReconnectBackoff, forwards: map[string]wantForward{}, mounts: map[string]wantMount{}, usb: map[string]wantUSB{}}
+		w := want{backoff: d.cfg.Defaults.ReconnectBackoff, checkTargets: d.cfg.Defaults.CheckTargets,
+			forwards: map[string]wantForward{}, mounts: map[string]wantMount{}, usb: map[string]wantUSB{}}
 		wanted := d.upHosts[name]
 		for _, pname := range slices.Sorted(maps.Keys(d.active)) {
 			p := d.cfg.Profiles[pname]
@@ -362,7 +364,7 @@ func (d *Daemon) recompute() {
 				continue
 			}
 			wanted = true
-			for key, wf := range profileForwards(p) {
+			for key, wf := range profileForwards(p, host) {
 				wf.profiles = append(w.forwards[key].profiles, pname)
 				wf.adhoc = w.forwards[key].adhoc
 				w.forwards[key] = wf
@@ -409,27 +411,36 @@ const (
 	gpgSSHForward   = "gpg-ssh"
 )
 
-// parseForward parses a forward spec or a named forward, returning its key
-// (the canonical spec, or the name).
-func parseForward(s string) (string, wantForward, error) {
-	switch s {
-	case gpgAgentForward:
-		return s, wantForward{gpgKind: gpg.KindAgent}, nil
-	case gpgSSHForward:
-		return s, wantForward{gpgKind: gpg.KindSSH}, nil
-	}
-	spec, err := forward.Parse(s)
+// parseForward parses a forward as typed (a spec, shorthand or name, maybe
+// "label=" first) for a forward on host, returning its key (the canonical
+// spec, or the gpg name).
+func parseForward(s string, host config.Host) (string, wantForward, error) {
+	label, rest, err := forward.SplitLabel(s)
 	if err != nil {
 		return "", wantForward{}, err
 	}
-	return spec.String(), wantForward{spec: spec}, nil
+	switch rest {
+	case gpgAgentForward:
+		return rest, wantForward{gpgKind: gpg.KindAgent, label: label}, nil
+	case gpgSSHForward:
+		return rest, wantForward{gpgKind: gpg.KindSSH, label: label}, nil
+	}
+	spec, err := forward.Parse(forward.Expand(rest))
+	if err != nil {
+		return "", wantForward{}, err
+	}
+	wf := wantForward{spec: spec, label: label}
+	if spec.Kind == forward.Kube {
+		wf.kube = host.Kube.Options()
+	}
+	return spec.String(), wf, nil
 }
 
-// profileForwards is every forward a profile asks for, by key.
-func profileForwards(p config.Profile) map[string]wantForward {
+// profileForwards is every forward a profile on host asks for, by key.
+func profileForwards(p config.Profile, host config.Host) map[string]wantForward {
 	fwds := map[string]wantForward{}
 	for _, f := range p.Forwards {
-		key, wf, _ := parseForward(f) // validated with the config
+		key, wf, _ := parseForward(f, host) // validated with the config
 		fwds[key] = wf
 	}
 	if p.GPG {
@@ -553,27 +564,72 @@ func (d *Daemon) handleDown(_ context.Context, params json.RawMessage) (any, err
 	return t, nil
 }
 
-func (d *Daemon) forwardParams(params json.RawMessage) (p api.ForwardParams, key string, wf wantForward, err error) {
-	if p, err = decode[api.ForwardParams](params); err != nil {
-		return
+// forwardParams checks forward params and parses the forward. Callers hold
+// d.mu.
+func (d *Daemon) forwardParams(p api.ForwardParams) (key string, wf wantForward, err error) {
+	h, ok := d.host(p.Host)
+	if !ok {
+		return "", wf, rpc.Errorf(api.CodeNotFound, "no host named %q", p.Host)
 	}
-	if h, ok := d.host(p.Host); !ok {
-		err = rpc.Errorf(api.CodeNotFound, "no host named %q", p.Host)
-		return
-	} else if h.Local {
-		err = rpc.Errorf(rpc.CodeInvalidParams, "%s is this machine; it has no forwards", p.Host)
-		return
+	if key, wf, err = parseForward(p.Spec, h); err != nil {
+		return "", wf, rpc.Errorf(rpc.CodeInvalidParams, "%v", err)
 	}
-	if key, wf, err = parseForward(p.Spec); err != nil {
-		err = rpc.Errorf(rpc.CodeInvalidParams, "%v", err)
+	if h.Local && wf.spec.Kind != forward.Kube {
+		return "", wf, rpc.Errorf(rpc.CodeInvalidParams, "%s is this machine: it only has Kubernetes forwards (K:…)", p.Host)
 	}
-	return
+	return key, wf, nil
 }
 
-func (d *Daemon) handleForwardAdd(_ context.Context, params json.RawMessage) (any, error) {
+// resolveForwardContext fills in kubectl's current context on the host for
+// a Kubernetes forward that doesn't name one, as resolveContext does for
+// claims.
+func (d *Daemon) resolveForwardContext(ctx context.Context, p *api.ForwardParams) {
+	label, rest, err := forward.SplitLabel(p.Spec)
+	if err != nil {
+		return
+	}
+	spec, err := forward.Parse(forward.Expand(rest))
+	if err != nil || spec.Kind != forward.Kube || spec.KubeRef().Context != "" {
+		return
+	}
+	d.mu.Lock()
+	host, ok := d.host(p.Host)
+	h := d.sessions[p.Host]
+	d.mu.Unlock()
+	if !ok || h == nil {
+		return
+	}
+	m := h.s.liveMaster()
+	if m == nil && host.Local {
+		m = openssh.StartLocal(d.log)
+	}
+	if m == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, controlTimeout)
+	defer cancel()
+	c, err := kube.CurrentContext(ctx, m, host.Kube.Options())
+	if err != nil {
+		return
+	}
+	ref := spec.KubeRef()
+	ref.Context = c
+	spec.Target.Host = ref.String()
+	p.Spec = spec.String()
+	if label != "" {
+		p.Spec = label + "=" + p.Spec
+	}
+}
+
+func (d *Daemon) handleForwardAdd(ctx context.Context, params json.RawMessage) (any, error) {
+	p, err := decode[api.ForwardParams](params)
+	if err != nil {
+		return nil, err
+	}
+	d.resolveForwardContext(ctx, &p)
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	p, key, wf, err := d.forwardParams(params)
+	key, wf, err := d.forwardParams(p)
 	if err != nil {
 		return nil, err
 	}
@@ -581,6 +637,9 @@ func (d *Daemon) handleForwardAdd(_ context.Context, params json.RawMessage) (an
 		d.adhoc[p.Host] = map[string]wantForward{}
 	}
 	d.adhoc[p.Host][key] = wf
+	if wf.gpgKind == "" {
+		d.rememberForward(p.Host, api.RecentForward{Spec: key, Label: wf.label})
+	}
 	d.recompute()
 	d.sessions[p.Host].s.retryNow()
 	d.log.Info("ad-hoc forward added", "host", p.Host, "forward", key)
@@ -588,11 +647,33 @@ func (d *Daemon) handleForwardAdd(_ context.Context, params json.RawMessage) (an
 }
 
 func (d *Daemon) handleForwardRemove(_ context.Context, params json.RawMessage) (any, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	p, key, _, err := d.forwardParams(params)
+	p, err := decode[api.ForwardParams](params)
 	if err != nil {
 		return nil, err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	key, _, err := d.forwardParams(p)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := d.adhoc[p.Host][key]; !ok {
+		// A Kubernetes forward named without its context: match the one
+		// added (with the context resolved then), if only one does.
+		if spec, err := forward.Parse(key); err == nil && spec.Kind == forward.Kube && spec.KubeRef().Context == "" {
+			var found []string
+			for k := range d.adhoc[p.Host] {
+				if o, err := forward.Parse(k); err == nil && o.Kind == forward.Kube && o.Listen == spec.Listen && o.Target.Port == spec.Target.Port {
+					r, want := o.KubeRef(), spec.KubeRef()
+					if r.Namespace == want.Namespace && r.Object() == want.Object() {
+						found = append(found, k)
+					}
+				}
+			}
+			if len(found) == 1 {
+				key = found[0]
+			}
+		}
 	}
 	if _, ok := d.adhoc[p.Host][key]; !ok {
 		return nil, rpc.Errorf(api.CodeNotFound,
@@ -960,7 +1041,8 @@ func (d *Daemon) status() api.Status {
 		h, _ := d.host(name)
 		hs := d.sessions[name].s.status(h)
 		_, hs.AdHoc = d.adhocHosts[name]
-		hs.RecentPVCs = d.recent[name]
+		hs.RecentPVCs = d.recent.PVCs[name]
+		hs.RecentForwards = d.recent.Forwards[name]
 		hosts[name] = hs
 		st.Hosts = append(st.Hosts, hs)
 	}
@@ -992,7 +1074,7 @@ func profileState(active bool, p config.Profile, host config.Host, hs api.HostSt
 		byspec[f.Spec] = f
 	}
 	state := api.StateUp
-	for _, key := range slices.Sorted(maps.Keys(profileForwards(p))) {
+	for _, key := range slices.Sorted(maps.Keys(profileForwards(p, host))) {
 		fs := byspec[key]
 		switch fs.State {
 		case api.StateError:

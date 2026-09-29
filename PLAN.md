@@ -158,6 +158,7 @@ Libraries: `cobra` (CLI), `bubbletea`/`lipgloss`/`bubbles` (TUI), `BurntSushi/to
 5. ✅ **Tray:** KDE StatusNotifierItem client (`tether tray`, via `fyne.io/systray`), desktop notifications, home-manager `programs.tether.tray`.
 6. ✅ **USB/IP:** privileged helper, `tether usb`, profile `usb = [...]`, TUI and tray sections, doctor checks, NixOS modules.
 7. ✅ **Kubernetes volumes:** `tether kube`, `pvc:` mounts, the built-in `local` host, TUI claim picker, tray picker + recent claims, doctor checks, flake `sftp-image`.
+8. ✅ **Forwarding round 2:** reverse SOCKS (`R:port`), HTTP proxy (`H:`, in-daemon, also SOCKS5, over a hidden `D` forward), Kubernetes forwards (`K:`, supervised `kubectl port-forward` + L forward), shorthands/names/labels, port 0 for local listeners, `forward.Describe`, target checks, `fwd ls`/`fwd explain`, `kube targets`/`kube fwd`, TUI Add menu with forms and a service/pod picker, tray Add submenu with dialogs, per-forward copy/open/remove, recent forwards.
 
 ## Testing
 - Unit tests: spec parsing, config validation, reconciler (with a fake SSH layer behind an interface).

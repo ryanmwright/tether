@@ -104,10 +104,10 @@ func TestBuild(t *testing.T) {
 	if it := find(items, "host:dev:mount:remote:~/src -> /home/me/src"); it == nil || !strings.Contains(it.Title, "sshfs not found") || len(it.Children) != 0 {
 		t.Errorf("mount row = %+v", it)
 	}
-	if it := find(items, "host:lab:mount-here"); it == nil || *it.Action != (Action{Local: localMountHere, Host: "lab"}) {
+	if it := find(items, "host:lab:add:mount-here"); it == nil || *it.Action != (Action{Local: localAdd, Host: "lab", Arg: addMountHere}) {
 		t.Errorf("lab mount here = %+v", it)
 	}
-	if it := find(items, "host:lab:mount-there"); it == nil || *it.Action != (Action{Local: localMountThere, Host: "lab"}) {
+	if it := find(items, "host:lab:add:mount-there"); it == nil || *it.Action != (Action{Local: localAdd, Host: "lab", Arg: addMountThere}) {
 		t.Errorf("lab mount there = %+v", it)
 	}
 
@@ -399,7 +399,7 @@ func TestPVCMenu(t *testing.T) {
 	}}
 	items := Build(st)
 
-	if it := find(items, "host:jump:pvc"); it == nil || *it.Action != (Action{Local: localPickPVC, Host: "jump"}) {
+	if it := find(items, "host:jump:add:pvc"); it == nil || *it.Action != (Action{Local: localAdd, Host: "jump", Arg: addPVC}) {
 		t.Errorf("pick claim = %+v", it)
 	}
 	unmount := api.MountParams{Host: "jump", Direction: "pvc-to-local", Local: "/mnt/pg", Kube: &api.KubeMount{Context: "prod", Namespace: "db", PVC: "data"}}
@@ -413,12 +413,13 @@ func TestPVCMenu(t *testing.T) {
 	it := recent.Children[0]
 	want := api.MountParams{Host: "jump", Direction: "pvc-to-local", Local: "/mnt/up", Options: []string{"ro"},
 		Kube: &api.KubeMount{Context: "prod", Namespace: "web", PVC: "uploads", ReadOnly: true}}
-	if it.Title != "prod/web/uploads → /mnt/up (read-only)" || it.Action.Method != api.MethodMountAdd || !reflect.DeepEqual(it.Action.Params, want) {
+	if it.Title != "Mount prod/web/uploads → /mnt/up (read-only)" || it.Action.Method != api.MethodMountAdd || !reflect.DeepEqual(it.Action.Params, want) {
 		t.Errorf("recent claim = %+v %+v", it, it.Action)
 	}
 
 	// The local host only has claims.
-	if find(items, "host:local:pvc") == nil || find(items, "host:local:gpg") != nil || find(items, "host:local:mount-here") != nil {
+	if find(items, "host:local:add:pvc") == nil || find(items, "host:local:add:k8s") == nil || find(items, "host:local:gpg") != nil ||
+		find(items, "host:local:add:mount-here") != nil || find(items, "host:local:add:socks") != nil {
 		t.Errorf("local host menu = %+v", find(items, "host:local"))
 	}
 	if find(items, "host:local:recent") != nil {
@@ -434,5 +435,78 @@ func TestSummaryIgnoresIdleLocalHost(t *testing.T) {
 	st.Hosts[1].State = api.StateUp
 	if look, text := Summary(st); look != LookUp || text != "2 hosts: 2 up" {
 		t.Errorf("summary with local in use = %s %q", look, text)
+	}
+}
+
+func TestAddAndForwardMenus(t *testing.T) {
+	st := api.Status{
+		Hosts: []api.HostStatus{{Name: "dev", State: api.StateUp,
+			Forwards: []api.ForwardStatus{
+				{Spec: "L:5432:db:5432", Label: "pg", AdHoc: true, State: api.StateUp, Address: "localhost:5432",
+					Description: "localhost:5432 here → db:5432, reached from dev", Target: "unreachable", TargetError: "nothing is answering at db:5432"},
+				{Spec: "D:1080", Profiles: []string{"work"}, State: api.StateUp, Address: "localhost:1080"},
+				{Spec: "R:8080:localhost:3000", AdHoc: true, State: api.StateUp},
+			},
+			RecentForwards: []api.RecentForward{{Spec: "L:5432:db:5432", Label: "pg"}, {Spec: "H:8080", Label: "web"}},
+		}},
+		USB: []api.USBDevice{{BusID: "1-2", ID: "1050:0407", Name: "YubiKey"}, {BusID: "1-3", ID: "aaaa:bbbb", Host: "dev"}},
+	}
+	items := Build(st)
+
+	// Every kind of thing to add, named for the host.
+	add := find(items, "host:dev:add")
+	if add == nil {
+		t.Fatal("no Add submenu")
+	}
+	for id, title := range map[string]string{
+		"host:dev:add:local":  "Forward a local port to a port on dev…",
+		"host:dev:add:rsocks": "SOCKS proxy on dev, connecting out from here…",
+		"host:dev:add:k8s":    "Kubernetes service or pod…",
+		"host:dev:add:tui":    "More in the terminal UI…",
+	} {
+		if it := find(items, id); it == nil || it.Title != title {
+			t.Errorf("%s = %+v", id, it)
+		}
+	}
+	if it := find(items, "host:dev:add:socks"); *it.Action != (Action{Local: localAdd, Host: "dev", Arg: addSOCKS}) {
+		t.Errorf("socks action = %+v", it.Action)
+	}
+	// USB devices not shared elsewhere, one click each.
+	share := find(items, "host:dev:add:usb")
+	if share == nil || len(share.Children) != 1 || share.Children[0].Action.Params != (api.USBParams{Host: "dev", Device: "1-2"}) {
+		t.Errorf("share USB = %+v", share)
+	}
+
+	// A forward says what it does, and can be copied, opened and removed.
+	pg := find(items, "host:dev:fwd:L:5432:db:5432")
+	if pg == nil || !strings.Contains(pg.Title, "pg (L:5432:db:5432)") || !strings.Contains(pg.Title, "target unreachable") {
+		t.Fatalf("forward = %+v", pg)
+	}
+	for id, want := range map[string]string{
+		":what":   "localhost:5432 here → db:5432, reached from dev",
+		":target": "⚠ nothing is answering at db:5432",
+		":copy":   "Copy address (localhost:5432)",
+		":open":   "Open in browser",
+		":rm":     "Remove",
+	} {
+		if it := find(items, pg.ID+id); it == nil || it.Title != want {
+			t.Errorf("%s = %+v", id, it)
+		}
+	}
+	if it := find(items, pg.ID+":copy"); *it.Action != (Action{Local: localCopy, Arg: "localhost:5432"}) {
+		t.Errorf("copy action = %+v", it.Action)
+	}
+	// Profile forwards can't be removed on their own; SOCKS isn't a web page.
+	if find(items, "host:dev:fwd:D:1080:rm") != nil || find(items, "host:dev:fwd:D:1080:open") != nil {
+		t.Error("profile SOCKS forward has remove or open")
+	}
+
+	// Recent forwards not there now, one click to add again.
+	recent := find(items, "host:dev:recent")
+	if recent == nil || len(recent.Children) != 1 {
+		t.Fatalf("recent = %+v", recent)
+	}
+	if it := recent.Children[0]; it.Title != "Forward web (H:8080)" || it.Action.Params != (api.ForwardParams{Host: "dev", Spec: "web=H:8080"}) {
+		t.Errorf("recent forward = %+v %+v", it, it.Action)
 	}
 }

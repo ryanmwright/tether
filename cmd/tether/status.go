@@ -114,14 +114,23 @@ func printStatus(out io.Writer, st *api.Status) {
 			for _, f := range h.Forwards {
 				detail := f.Error
 				switch {
-				case f.AllocatedPort != 0:
-					detail = fmt.Sprintf("remote port %d", f.AllocatedPort)
+				case detail != "":
+				case f.TargetError != "":
+					detail = "target unreachable: " + f.TargetError
 				case f.Resolved != "":
 					if spec, err := forward.Parse(f.Resolved); err == nil {
 						detail = "remote " + spec.Listen.String()
 					}
+				case f.Address != "":
+					detail = "at " + f.Address
+				case f.AllocatedPort != 0:
+					detail = fmt.Sprintf("remote port %d", f.AllocatedPort)
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", f.Spec, h.Name, forwardSource(f), f.State, detail)
+				name := f.Spec
+				if f.Label != "" {
+					name = f.Label + " " + f.Spec
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", name, h.Name, forwardSource(f), f.State, detail)
 			}
 		}
 	}

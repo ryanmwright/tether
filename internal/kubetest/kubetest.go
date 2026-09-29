@@ -42,7 +42,12 @@ func Install(t *testing.T) *Fake {
 	for _, d := range []string{bin, filepath.Join(dir, "pods"), filepath.Join(dir, "pvcs")} {
 		os.MkdirAll(d, 0o755)
 	}
-	script := strings.NewReplacer("@STATE@", dir, "@SFTP@", sftp, "@CTX@", Context, "@NODE@", Node).Replace(fakeKubectl)
+	helper, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.MkdirAll(filepath.Join(dir, "targets"), 0o755)
+	script := strings.NewReplacer("@STATE@", dir, "@SFTP@", sftp, "@CTX@", Context, "@NODE@", Node, "@HELPER@", helper).Replace(fakeKubectl)
 	if err := os.WriteFile(filepath.Join(bin, "kubectl"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -58,6 +63,24 @@ func (f *Fake) AddPVC(t *testing.T, ns, name string) string {
 		t.Fatal(err)
 	}
 	return d
+}
+
+// AddTarget makes a service or pod (kind "svc" or "pod") that
+// `kubectl port-forward` reaches at addr ("host:port"), whatever port is
+// asked for.
+func (f *Fake) AddTarget(t *testing.T, ns, kind, name, addr string) {
+	t.Helper()
+	if err := os.WriteFile(f.targetFile(ns, kind, name), []byte(addr), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// RemoveTarget makes it go away: port-forwards to it exit, as kubectl's do
+// when their pod is deleted.
+func (f *Fake) RemoveTarget(ns, kind, name string) { os.Remove(f.targetFile(ns, kind, name)) }
+
+func (f *Fake) targetFile(ns, kind, name string) string {
+	return filepath.Join(f.Dir, "targets", ns+"_"+kind+"_"+name)
 }
 
 // Pods lists the helper pods that exist.
@@ -101,11 +124,13 @@ if [ -n "$ctx" ] && [ "$ctx" != @CTX@ ]; then
 fi
 # the namespace, and the positional args after the subcommand
 ns=default
+addr=127.0.0.1
 cmd=$1; shift
 rest=
 while [ $# -gt 0 ]; do
 	case $1 in
 	-n) ns=$2; shift 2 ;;
+	--address) addr=$2; shift 2 ;;
 	-c|-o|-l|-f|--field-selector) shift 2 ;;
 	--) shift; break ;;
 	-*) shift ;;
@@ -170,6 +195,9 @@ exec)
 		exit 0
 	fi
 	exec @SFTP@ -d "$state/pvcs/$(cat "$pod.claim")" ;;
+port-forward)
+	# $1 is kind/name, $2 the ports; the helper (this test binary) serves it.
+	TETHER_KUBETEST_PORT_FORWARD=1 exec @HELPER@ "$addr" "$state/targets/${ns}_$(echo "$1" | tr / _)" "$2" ;;
 delete)
 	if [ "$1" = pods ] || [ "$1" = pod ] && [ -z "$2" ]; then exit 0; fi
 	rm -f "$state/pods/$2" "$state/pods/$2.claim"

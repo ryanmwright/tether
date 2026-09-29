@@ -9,7 +9,7 @@ import (
 )
 
 func newTUICmd(g *globalFlags) *cobra.Command {
-	var pvcHost string
+	var pvcHost, addHost, k8sHost string
 	cmd := &cobra.Command{
 		Use:   "tui",
 		Short: "Open the interactive terminal UI",
@@ -32,13 +32,20 @@ func newTUICmd(g *globalFlags) *cobra.Command {
 				return err
 			}
 			m := tui.New(c, logs)
-			if pvcHost != "" {
+			switch {
+			case pvcHost != "":
 				m = m.WithPVCPicker(pvcHost)
+			case k8sHost != "":
+				m = m.WithKubeForward(k8sHost)
+			case addHost != "":
+				m = m.WithAdd(addHost)
 			}
 			_, err = tea.NewProgram(m, tea.WithContext(ctx)).Run()
 			return err
 		},
 	}
 	cmd.Flags().StringVar(&pvcHost, "pvc", "", "open the Kubernetes claim picker for this host")
+	cmd.Flags().StringVar(&k8sHost, "k8s", "", "open the Kubernetes service/pod forward picker for this host")
+	cmd.Flags().StringVar(&addHost, "add", "", "open the Add menu (forwards, proxies, mounts…) for this host")
 	return cmd
 }

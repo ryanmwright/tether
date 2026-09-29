@@ -38,6 +38,15 @@ func (f *fakeClient) Call(_ context.Context, method string, params, result any) 
 			{Section: "remote", Name: "public keys", Status: api.CheckWarn, Detail: "1 of 1 missing", Fix: "gpg --export X | ssh dev gpg --import"},
 		}}
 	}
+	if method == api.MethodKubeTargets && f.err == nil {
+		*result.(*api.KubeTargetsResult) = api.KubeTargetsResult{
+			Host: "dev", Context: "prod", Current: "prod", Contexts: []string{"prod"},
+			Targets: []api.KubeTarget{
+				{Namespace: "web", Kind: "svc", Name: "frontend", Ports: []api.KubePort{{Name: "http", Port: 80}, {Name: "https", Port: 443}}},
+				{Namespace: "db", Kind: "pod", Name: "pg-0", Ports: []api.KubePort{{Port: 5432}}, Owner: "StatefulSet/pg"},
+			},
+		}
+	}
 	if method == api.MethodKubeList && f.err == nil {
 		kctx := params.(api.KubeListParams).Context
 		if kctx == "" {
@@ -136,6 +145,12 @@ func keyMsg(key string) tea.KeyPressMsg {
 		return tea.KeyPressMsg{Code: tea.KeyTab}
 	case "ctrl+o":
 		return tea.KeyPressMsg{Code: 'o', Mod: tea.ModCtrl}
+	case "right":
+		return tea.KeyPressMsg{Code: tea.KeyRight}
+	case "up":
+		return tea.KeyPressMsg{Code: tea.KeyUp}
+	case "backspace":
+		return tea.KeyPressMsg{Code: tea.KeyBackspace}
 	}
 	r := []rune(key)[0]
 	return tea.KeyPressMsg{Code: r, Text: key}
@@ -251,7 +266,7 @@ func TestActionError(t *testing.T) {
 
 func TestAddForward(t *testing.T) {
 	m, fc := newModel(t)
-	m = press(t, moveTo(t, m, "D:1080"), "a")
+	m = press(t, press(t, moveTo(t, m, "D:1080"), "a"), "x") // Add menu → type a spec
 	if m.mode != modeInput || m.inputHost != "dev" {
 		t.Fatalf("mode %v host %q", m.mode, m.inputHost)
 	}
@@ -275,7 +290,7 @@ func TestAddForward(t *testing.T) {
 	}
 
 	// esc cancels without a call.
-	m = press(t, press(t, m, "a"), "esc")
+	m = press(t, press(t, press(t, m, "a"), "x"), "esc")
 	if m.mode != modeNormal || len(fc.calls) != 1 {
 		t.Errorf("esc: mode %v calls %d", m.mode, len(fc.calls))
 	}
@@ -572,5 +587,134 @@ func TestPVCMountRow(t *testing.T) {
 		Kube: &api.KubeMount{Context: "prod", Namespace: "db", PVC: "data"}}}
 	if got := fc.last(); !reflect.DeepEqual(got, want) {
 		t.Errorf("got %+v\nwant %+v", got, want)
+	}
+}
+
+func typeText(t *testing.T, m Model, s string) Model {
+	t.Helper()
+	for _, r := range s {
+		m = press(t, m, string(r))
+	}
+	return m
+}
+
+func TestAddMenu(t *testing.T) {
+	m, fc := newModel(t)
+	m = press(t, moveTo(t, m, "dev"), "a")
+	s := screen(m)
+	for _, want := range []string{"ADD TO dev", "Forward a local port to a port on dev", "SOCKS proxy on dev, connecting out from here", "Kubernetes service or pod", "Share a USB device"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("menu missing %q:\n%s", want, s)
+		}
+	}
+
+	// A local port to a machine on dev's network, with a label.
+	m = press(t, m, "n")
+	if m.mode != modeForm || !strings.Contains(screen(m), "enter the machine's name") {
+		t.Fatalf("form: mode %v\n%s", m.mode, screen(m))
+	}
+	m = typeText(t, m, "db.internal")
+	m = press(t, m, "enter")
+	m = typeText(t, m, "5432")
+	if s := screen(m); !strings.Contains(s, "→ L:5432:db.internal:5432 — localhost:5432 here → db.internal:5432, reached from dev") {
+		t.Errorf("preview missing:\n%s", s)
+	}
+	m = press(t, m, "enter") // on to the local port
+	m = press(t, m, "enter") // the same; on to "listen on"
+	m = press(t, m, "right") // all interfaces
+	m = press(t, m, "enter")
+	m = typeText(t, m, "pg")
+	m = press(t, m, "enter")
+	want := call{api.MethodForwardAdd, api.ForwardParams{Host: "dev", Spec: "pg=L:*:5432:db.internal:5432"}}
+	if got := fc.last(); got != want {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+	if m.mode != modeNormal {
+		t.Errorf("mode after adding = %v", m.mode)
+	}
+
+	// A reverse SOCKS proxy: the port is suggested.
+	m = press(t, press(t, moveTo(t, m, "dev"), "a"), "v")
+	for range 2 { // port (1080 suggested), label
+		m = press(t, m, "enter")
+	}
+	if got := fc.last(); got != (call{api.MethodForwardAdd, api.ForwardParams{Host: "dev", Spec: "R:1080"}}) {
+		t.Errorf("reverse SOCKS: %+v", got)
+	}
+
+	// esc in a form goes back to the menu; esc there closes it.
+	m = press(t, press(t, moveTo(t, m, "dev"), "a"), "l")
+	m = press(t, m, "esc")
+	if m.mode != modeAdd {
+		t.Errorf("esc in a form: mode %v", m.mode)
+	}
+	if m = press(t, m, "esc"); m.mode != modeNormal {
+		t.Errorf("esc in the menu: mode %v", m.mode)
+	}
+}
+
+func TestAddMenuLocalHost(t *testing.T) {
+	m, _ := newModel(t)
+	st := sampleStatus
+	st.Hosts = append([]api.HostStatus{{Name: "local", Local: true, State: api.StateDown}}, st.Hosts...)
+	m = update(t, m, statusMsg(st))
+	m = press(t, moveTo(t, m, "local"), "a")
+	s := screen(m)
+	if strings.Contains(s, "SOCKS") || !strings.Contains(s, "Kubernetes service or pod") || !strings.Contains(s, "Kubernetes claim") {
+		t.Errorf("local host menu:\n%s", s)
+	}
+}
+
+func TestKubeForwardPicker(t *testing.T) {
+	m, fc := newModel(t)
+	m = press(t, press(t, moveTo(t, m, "dev"), "a"), "k")
+	if got := fc.last(); got.method != api.MethodKubeTargets {
+		t.Fatalf("last call = %+v", got)
+	}
+	s := screen(m)
+	for _, want := range []string{"FORWARD FROM KUBERNETES via dev · context prod", "web/svc/frontend", "80,443", "db/pod/pg-0", "StatefulSet/pg"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("picker missing %q:\n%s", want, s)
+		}
+	}
+	m = typeText(t, m, "front")
+	m = press(t, m, "enter")
+	if m.mode != modeForm {
+		t.Fatalf("mode %v", m.mode)
+	}
+	m = press(t, m, "right") // port 443
+	if s := screen(m); !strings.Contains(s, "K:443:prod/web/svc/frontend:443") {
+		t.Errorf("preview:\n%s", s)
+	}
+	m = press(t, m, "enter")
+	m = typeText(t, m, "8443")
+	for range 3 {
+		m = press(t, m, "enter")
+	}
+	want := call{api.MethodForwardAdd, api.ForwardParams{Host: "dev", Spec: "frontend=K:8443:prod/web/svc/frontend:443"}}
+	if got := fc.last(); got != want {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
+func TestForwardRowActions(t *testing.T) {
+	m, _ := newModel(t)
+	st := sampleStatus
+	dev := st.Hosts[0]
+	dev.Forwards = append([]api.ForwardStatus{{Spec: "L:5432:db:5432", Label: "pg", AdHoc: true, State: api.StateUp,
+		Address: "localhost:5432", Description: "localhost:5432 here → db:5432, reached from dev",
+		Target: "unreachable", TargetError: "connections are closed at once: nothing is answering at db:5432"}}, dev.Forwards...)
+	st.Hosts = append([]api.HostStatus{dev}, st.Hosts[1:]...)
+	m = update(t, m, statusMsg(st))
+	m = moveTo(t, m, "L:5432:db:5432")
+	s := screen(m)
+	for _, want := range []string{"pg L:5432:db:5432", "⚠ target unreachable", "target unreachable: connections are closed at once", "y copy address"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("screen missing %q:\n%s", want, s)
+		}
+	}
+	next, cmd := m.Update(keyMsg("y"))
+	if m = next.(Model); cmd == nil || m.flash != "copied localhost:5432" {
+		t.Errorf("copy: flash %q", m.flash)
 	}
 }

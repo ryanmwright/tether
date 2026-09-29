@@ -33,6 +33,9 @@ type Defaults struct {
 	// LocalHost offers the built-in "local" host (PVC mounts with kubectl on
 	// this machine) when kubectl is installed. On by default.
 	LocalHost bool `toml:"local_host"`
+	// CheckTargets checks that forwards' targets answer, every 30 seconds.
+	// On by default; off for targets that log every connection.
+	CheckTargets bool `toml:"check_targets"`
 }
 
 type Host struct {
@@ -183,7 +186,7 @@ func (b Backoff) MarshalText() ([]byte, error) {
 
 func Default() *Config {
 	return &Config{
-		Defaults: Defaults{ReconnectBackoff: Backoff{Min: time.Second, Max: time.Minute}, LocalHost: true},
+		Defaults: Defaults{ReconnectBackoff: Backoff{Min: time.Second, Max: time.Minute}, LocalHost: true, CheckTargets: true},
 		Hosts:    map[string]Host{},
 		Profiles: map[string]Profile{},
 	}
@@ -297,12 +300,16 @@ func (c *Config) Validate() error {
 		} else if !known {
 			errs = append(errs, fmt.Errorf("profiles.%s.host: unknown host %q", name, p.Host))
 		}
-		if host.Local && (p.GPG || p.GPGSSH || len(p.Forwards) > 0 || len(p.USB) > 0) {
-			errs = append(errs, fmt.Errorf("profiles.%s: host %q is local, so it can only have PVC mounts", name, p.Host))
+		if host.Local && (p.GPG || p.GPGSSH || len(p.USB) > 0) {
+			errs = append(errs, fmt.Errorf("profiles.%s: host %q is local, so it can only have PVC mounts and Kubernetes forwards", name, p.Host))
 		}
 		for i, f := range p.Forwards {
-			if _, err := forward.Parse(f); err != nil {
+			_, spec, err := forward.ParseInput(f)
+			switch {
+			case err != nil:
 				errs = append(errs, fmt.Errorf("profiles.%s.forwards[%d]: %w", name, i, err))
+			case host.Local && spec.Kind != forward.Kube:
+				errs = append(errs, fmt.Errorf("profiles.%s.forwards[%d]: host %q is local, so it can only have Kubernetes forwards (K:…)", name, i, p.Host))
 			}
 		}
 		for i, m := range p.Mounts {

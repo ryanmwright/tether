@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -153,5 +154,47 @@ func appendFile(t *testing.T, path, s string) {
 	defer f.Close()
 	if _, err := f.WriteString(s); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestReverseSOCKS checks that ssh's reverse dynamic forward (-R with no
+// target) works through the control socket: a SOCKS proxy on the remote
+// that connects out from here.
+func TestReverseSOCKS(t *testing.T) {
+	srv := sshtest.Start(t)
+	m := startMaster(t, srv)
+	echo := sshtest.EchoServer(t)
+	spec := mustParse(t, "R:127.0.0.1:0")
+	port, err := m.Forward(context.Background(), spec)
+	if err != nil || port == 0 {
+		t.Fatalf("reverse SOCKS forward: port %d, %v", port, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := forward.DialSOCKS(ctx, fmt.Sprintf("127.0.0.1:%d", port), fmt.Sprintf("127.0.0.1:%d", echo))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	fmt.Fprint(c, "through the reverse proxy\n")
+	buf := make([]byte, 64)
+	n, _ := c.Read(buf)
+	if got := strings.TrimSpace(string(buf[:n])); got != "through the reverse proxy" {
+		t.Errorf("echo = %q", got)
+	}
+	// Cancelling takes the spec as added (port 0), not the port the server
+	// picked, unlike an R:0 forward to a target.
+	allocated := spec
+	allocated.Listen.Port = port
+	if err := m.Cancel(context.Background(), allocated); err == nil {
+		t.Log("cancelling by the allocated port works too")
+	}
+	if err := m.Cancel(context.Background(), spec); err != nil {
+		t.Errorf("cancel: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if c, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port)); err == nil {
+		c.Close()
+		t.Error("still listening after cancel")
 	}
 }

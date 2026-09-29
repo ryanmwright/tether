@@ -18,6 +18,7 @@ import (
 	"github.com/ryanmwright/tether/internal/config"
 	"github.com/ryanmwright/tether/internal/forward"
 	"github.com/ryanmwright/tether/internal/gpg"
+	"github.com/ryanmwright/tether/internal/kube"
 	"github.com/ryanmwright/tether/internal/mount"
 	"github.com/ryanmwright/tether/internal/openssh"
 )
@@ -36,14 +37,18 @@ type want struct {
 	mounts   map[string]wantMount
 	usb      map[string]wantUSB
 	backoff  config.Backoff
+	// checkTargets checks that forwards' targets answer.
+	checkTargets bool
 }
 
 type wantForward struct {
-	spec forward.Spec
+	spec  forward.Spec
+	label string // a name given to it, e.g. "postgres"
 	// gpgKind marks a gpg-agent forward (gpg.KindAgent or gpg.KindSSH). Its
 	// spec depends on socket paths on both ends, so it is resolved each time
 	// the forward is added.
 	gpgKind  string
+	kube     kube.Options // for a Kubernetes forward: how to run kubectl
 	profiles []string
 	adhoc    bool
 }
@@ -53,6 +58,12 @@ type forwardState struct {
 	err      string
 	port     int
 	resolved string // the spec a gpg forward resolved to
+	// actual is the forward with the ports chosen for it, once up.
+	actual forward.Spec
+	// lastPort is the local port picked for a forward on port 0, kept
+	// across reconnects so it stays the same while it's free.
+	lastPort          int
+	target, targetErr string // the last target check
 }
 
 // session keeps one host's connection and forwards matching its want. All
@@ -70,6 +81,8 @@ type session struct {
 	kick      chan struct{} // retry a failed connection now
 	netChange chan struct{}
 	mountDied chan struct{} // a running mount went away
+	fwdDied   chan struct{} // a forward's process (kubectl port-forward) exited
+	checkNow  chan struct{} // check forward targets now
 
 	mu             sync.Mutex
 	want           want
@@ -79,7 +92,8 @@ type session struct {
 	forwards       map[string]*forwardState
 	mounts         map[string]*mountState
 	usbStates      map[string]*usbState
-	master         *openssh.Master // the live connection, if any
+	checks         map[string]forward.Spec // forwards whose targets to check, as applied
+	master         *openssh.Master         // the live connection, if any
 	cancelConnect  context.CancelFunc
 	connectingDest string
 }
@@ -96,6 +110,8 @@ func newSession(name, ctlPath string, ssh openssh.Options, usb usbBackend, log *
 		kick:      make(chan struct{}, 1),
 		netChange: make(chan struct{}, 1),
 		mountDied: make(chan struct{}, 1),
+		fwdDied:   make(chan struct{}, 1),
+		checkNow:  make(chan struct{}, 1),
 		state:     api.StateDown,
 		forwards:  map[string]*forwardState{},
 		mounts:    map[string]*mountState{},
@@ -183,8 +199,9 @@ func (s *session) setState(state api.State, err string, retryAt time.Time) {
 	s.state, s.err, s.retryAt = state, err, retryAt
 	if state != api.StateUp {
 		for _, f := range s.forwards {
-			*f = forwardState{state: api.StatePending}
+			*f = forwardState{state: api.StatePending, lastPort: f.lastPort}
 		}
+		s.checks = nil
 		for _, ms := range s.mounts {
 			*ms = mountState{state: api.StatePending}
 		}
@@ -202,15 +219,19 @@ func (s *session) setState(state api.State, err string, retryAt time.Time) {
 }
 
 // setForward records the outcome of adding a forward and returns its
-// previous error message.
-func (s *session) setForward(key string, err error, port int, resolved string) (prevErr string) {
+// previous error message. af is the forward as applied, when it worked.
+func (s *session) setForward(key string, af *appliedForward, err error, port int, resolved string) (prevErr string) {
 	s.mu.Lock()
 	if f := s.forwards[key]; f != nil {
 		prevErr = f.err
+		last := f.lastPort
 		if err != nil {
-			*f = forwardState{state: api.StateError, err: err.Error()}
+			*f = forwardState{state: api.StateError, err: err.Error(), lastPort: last}
 		} else {
-			*f = forwardState{state: api.StateUp, port: port, resolved: resolved}
+			*f = forwardState{state: api.StateUp, port: port, resolved: resolved, actual: af.actual, lastPort: last}
+			if af.actual.AutoPort() || s.want.forwards[key].spec.AutoPort() {
+				f.lastPort = af.actual.Listen.Port
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -235,14 +256,16 @@ func (s *session) run(ctx context.Context) {
 	var (
 		m        *openssh.Master
 		dest     string
-		applied  = map[string]forward.Spec{}
+		applied  = map[string]*appliedForward{}
 		running  = map[string]*mount.Running{}
 		usbRT    = newUSBRuntime()
 		delay    time.Duration
 		retry    *time.Timer // pending reconnect; nil when not waiting
 		fwdRetry *time.Timer
 	)
+	go s.checkLoop(ctx)
 	defer func() {
+		s.stopForwards(applied)
 		if m != nil {
 			s.stopUSB(m, usbRT)
 			s.stopMounts(running)
@@ -254,10 +277,10 @@ func (s *session) run(ctx context.Context) {
 		if m != nil {
 			s.stopUSB(m, usbRT) // detach and unmount cleanly while still connected
 			s.stopMounts(running)
+			s.stopForwards(applied)
 			s.setMaster(nil)
 			m.Stop()
 			m = nil
-			clear(applied)
 		}
 	}
 	scheduleRetry := func(w want, reason string) {
@@ -323,14 +346,21 @@ func (s *session) run(ctx context.Context) {
 			if s.reapMounts(running) && fwdRetry == nil {
 				fwdRetry = time.NewTimer(forwardRetryInterval)
 			}
+		case <-s.fwdDied:
+			if retryIn, failed := s.reapForwards(ctx, m, applied); failed {
+				// A forward whose kubectl ran a while (its pod was replaced)
+				// comes back at once; one that keeps failing waits.
+				stopTimer(fwdRetry)
+				fwdRetry = time.NewTimer(retryIn)
+			}
 		case <-doneC(m):
 			err := m.Err()
 			s.log.Warn("connection lost", "err", err)
 			s.stopMounts(running) // they die with the connection; clean up after them
 			s.stopUSB(nil, usbRT)
+			s.stopForwards(applied)
 			s.setMaster(nil)
 			m = nil
-			clear(applied)
 			scheduleRetry(w, fmt.Sprintf("connection lost: %v", err))
 		case <-s.netChange:
 			if retry != nil {
@@ -368,61 +398,6 @@ func (s *session) connect(ctx context.Context, dest string) (*openssh.Master, er
 		return nil, err
 	}
 	return openssh.Start(ctx, s.ssh, dest, s.ctlPath, s.log)
-}
-
-// syncForwards cancels forwards no longer wanted and adds missing ones. It
-// reports whether any failed, so the caller can schedule a retry.
-func (s *session) syncForwards(ctx context.Context, m *openssh.Master, w want, applied map[string]forward.Spec) (failed bool) {
-	for _, key := range slices.Sorted(maps.Keys(applied)) {
-		if _, ok := w.forwards[key]; ok {
-			continue
-		}
-		cctx, cancel := context.WithTimeout(ctx, controlTimeout)
-		err := m.Cancel(cctx, applied[key])
-		cancel()
-		if err != nil {
-			s.log.Warn("cancel forward failed", "forward", key, "err", err)
-		} else {
-			s.log.Info("forward removed", "forward", key)
-		}
-		delete(applied, key)
-	}
-	for _, key := range slices.Sorted(maps.Keys(w.forwards)) {
-		if _, ok := applied[key]; ok {
-			continue
-		}
-		spec, port, err := s.addWanted(ctx, m, w.forwards[key])
-		resolved := ""
-		if w.forwards[key].gpgKind != "" {
-			resolved = spec.String()
-		}
-		if prev := s.setForward(key, err, port, resolved); err != nil {
-			// Failing forwards are retried often; log each distinct failure once.
-			if prev != err.Error() {
-				s.log.Warn("forward failed", "forward", key, "err", err)
-			}
-			failed = true
-			continue
-		}
-		s.log.Info("forward added", "forward", key)
-		applied[key] = spec
-	}
-	return failed
-}
-
-// addWanted resolves wf if it's a gpg forward, then adds it.
-func (s *session) addWanted(ctx context.Context, m *openssh.Master, wf wantForward) (forward.Spec, int, error) {
-	ctx, cancel := context.WithTimeout(ctx, controlTimeout)
-	defer cancel()
-	spec := wf.spec
-	if wf.gpgKind != "" {
-		var err error
-		if spec, err = resolveGPG(ctx, m, wf.gpgKind); err != nil {
-			return spec, 0, err
-		}
-	}
-	port, err := addForward(ctx, m, spec)
-	return spec, port, err
 }
 
 // resolveGPG builds the remote forward for a gpg socket kind: from the
@@ -550,15 +525,27 @@ func (s *session) status(host config.Host) api.HostStatus {
 	for _, key := range slices.Sorted(maps.Keys(s.forwards)) {
 		f := s.forwards[key]
 		wf := s.want.forwards[key]
-		hs.Forwards = append(hs.Forwards, api.ForwardStatus{
+		fs := api.ForwardStatus{
 			Spec:          key,
+			Label:         wf.label,
 			Profiles:      wf.profiles,
 			AdHoc:         wf.adhoc,
 			State:         f.state,
 			Error:         f.err,
 			AllocatedPort: f.port,
 			Resolved:      f.resolved,
-		})
+			Target:        f.target,
+			TargetError:   f.targetErr,
+		}
+		if wf.gpgKind == "" {
+			spec := wf.spec
+			if f.state == api.StateUp {
+				spec = f.actual
+			}
+			fs.Description = forward.Describe(spec, s.name)
+			fs.Address = connectAddress(spec)
+		}
+		hs.Forwards = append(hs.Forwards, fs)
 	}
 	hs.Mounts = s.mountStatuses()
 	hs.USB = s.usbStatuses()

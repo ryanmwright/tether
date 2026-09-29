@@ -1,14 +1,17 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ryanmwright/tether/internal/api"
+	"github.com/ryanmwright/tether/internal/forward"
 )
 
 func newFwdCmd(g *globalFlags) *cobra.Command {
@@ -17,15 +20,25 @@ func newFwdCmd(g *globalFlags) *cobra.Command {
 		Short: "Add or remove ad-hoc forwards",
 		Long: "Add or remove ad-hoc forwards. They last until removed, the host is\n" +
 			"taken down, or the daemon exits; put permanent ones in a profile.\n\n" +
-			"Specs use ssh's -L/-R/-D syntax with a kind prefix:\n" +
-			"  L:[bind:]port:host:hostport   local port -> host:hostport from the remote\n" +
-			"  R:[bind:]port:host:hostport   remote port -> host:hostport from here\n" +
-			"  D:[bind:]port                 SOCKS proxy on a local port\n" +
-			"Either side may be a Unix socket path instead, e.g. L:2375:/var/run/docker.sock.\n\n" +
-			"The names gpg-agent and gpg-ssh forward your gpg-agent and its SSH socket\n" +
-			"(see `tether gpg`).",
+			"What you can forward (HOST is the host you're connected to):\n" +
+			"  5432                          localhost:5432 here -> port 5432 on HOST\n" +
+			"  8080:3000                     localhost:8080 here -> port 3000 on HOST\n" +
+			"  db.internal:5432              localhost:5432 here -> db.internal:5432, a machine HOST reaches\n" +
+			"  L:[bind:]port:host:hostport   the same, in full; port 0 picks a free one\n" +
+			"  R:[bind:]port:host:hostport   port on HOST -> host:hostport reached from here\n" +
+			"                                (localhost: this machine; any other name: a machine on your network)\n" +
+			"  socks, D:[bind:]port          SOCKS proxy here, connecting out from HOST\n" +
+			"  rsocks, R:[bind:]port         SOCKS proxy on HOST, connecting out from here\n" +
+			"  http, H:[bind:]port           HTTP (and SOCKS) proxy here, connecting out from HOST\n" +
+			"  K:[bind:]port:[CONTEXT/]NS/KIND/NAME:PORT\n" +
+			"                                a Kubernetes svc, pod, deploy or sts, via kubectl on HOST\n" +
+			"                                (see `tether kube fwd`)\n" +
+			"  gpg-agent, gpg-ssh            your gpg-agent and its SSH socket (see `tether gpg`)\n" +
+			"Either side of L and R may be a Unix socket path, e.g. L:2375:/var/run/docker.sock.\n" +
+			"Name a forward with LABEL=, e.g. postgres=db.internal:5432.\n\n" +
+			"`tether fwd explain SPEC` says what a spec does without adding it.",
 	}
-	cmd.AddCommand(newFwdAddCmd(g), newFwdRmCmd(g))
+	cmd.AddCommand(newFwdAddCmd(g), newFwdRmCmd(g), newFwdLsCmd(g), newFwdExplainCmd())
 	return cmd
 }
 
@@ -33,8 +46,8 @@ func newFwdAddCmd(g *globalFlags) *cobra.Command {
 	var noWait bool
 	var timeout time.Duration
 	cmd := &cobra.Command{
-		Use:   "add HOST SPEC...",
-		Short: "Add forwards to a host, connecting it if needed",
+		Use:   "add HOST [LABEL=]SPEC...",
+		Short: "Add forwards to a host, connecting it if needed (see `tether fwd --help` for what SPEC can be)",
 		Args:  cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return addForwards(cmd, g, args[0], args[1:], noWait, timeout)
@@ -52,6 +65,71 @@ func newFwdRmCmd(g *globalFlags) *cobra.Command {
 		Args:  cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return removeForwards(cmd, g, args[0], args[1:])
+		},
+	}
+}
+
+func newFwdLsCmd(g *globalFlags) *cobra.Command {
+	return &cobra.Command{
+		Use:   "ls [HOST]",
+		Short: "List forwards, what they do, and where to connect",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			g.noAutostart = true
+			c, err := g.connect(cmd.Context())
+			if err != nil {
+				return err
+			}
+			defer c.Close()
+			var st api.Status
+			if err := c.Call(cmd.Context(), api.MethodStatus, nil, &st); err != nil {
+				return err
+			}
+			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
+			fmt.Fprintln(tw, "HOST\tNAME\tSTATE\tCONNECT TO\tWHAT")
+			n := 0
+			for _, h := range st.Hosts {
+				if len(args) == 1 && h.Name != args[0] {
+					continue
+				}
+				for _, f := range h.Forwards {
+					n++
+					name := cmp.Or(f.Label, f.Spec)
+					state := string(f.State)
+					if f.Target == "unreachable" {
+						state += " (target unreachable)"
+					}
+					what := cmp.Or(f.Error, f.TargetError, f.Description, f.Resolved)
+					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", h.Name, name, state, dash(f.Address), what)
+				}
+			}
+			if n == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "no forwards; add one with `tether fwd add HOST SPEC` (see `tether fwd --help`)")
+				return nil
+			}
+			return tw.Flush()
+		},
+	}
+}
+
+func newFwdExplainCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "explain SPEC...",
+		Short: "Say what a forward spec, shorthand or name does, without adding it",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			for _, a := range args {
+				label, spec, err := forward.ParseInput(a)
+				if err != nil {
+					return err
+				}
+				name := spec.String()
+				if label != "" {
+					name = label + " = " + name
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "%s\n  %s\n", name, forward.Describe(spec, "HOST"))
+			}
+			return nil
 		},
 	}
 }
@@ -129,14 +207,19 @@ func addForwards(cmd *cobra.Command, g *globalFlags, host string, specs []string
 	healthy := true
 	for _, r := range results {
 		f := findForward(st, host, r.Spec)
+		name := f.Spec
+		if f.Label != "" {
+			name = f.Label + " (" + f.Spec + ")"
+		}
 		switch {
 		case f.State == api.StateError:
 			healthy = false
-			fmt.Fprintf(cmd.OutOrStdout(), "%s: error: %s\n", f.Spec, f.Error)
-		case f.AllocatedPort != 0:
-			fmt.Fprintf(cmd.OutOrStdout(), "%s: up (remote port %d)\n", f.Spec, f.AllocatedPort)
+			fmt.Fprintf(cmd.OutOrStdout(), "%s: error: %s\n", name, f.Error)
 		default:
-			fmt.Fprintf(cmd.OutOrStdout(), "%s: %s\n", f.Spec, f.State)
+			fmt.Fprintf(cmd.OutOrStdout(), "%s: %s\n", name, f.State)
+			if f.Description != "" {
+				fmt.Fprintf(cmd.OutOrStdout(), "  %s\n", f.Description)
+			}
 		}
 	}
 	if !healthy {

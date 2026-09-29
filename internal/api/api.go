@@ -26,6 +26,7 @@ const (
 	MethodLogs          = "daemon.logs"
 	MethodKubeList      = "kube.list"
 	MethodKubeGC        = "kube.gc"
+	MethodKubeTargets   = "kube.targets"
 
 	// MethodSubscribe makes the daemon push EventStatus notifications, each
 	// carrying a full Status, now and whenever anything changes; and, if
@@ -39,7 +40,7 @@ const (
 // method or field that clients rely on is added or changed, so a client can
 // tell it's talking to an older daemon left running across an upgrade.
 // Daemons from before it existed report 0.
-const ProtocolVersion = 5
+const ProtocolVersion = 6
 
 // Application error codes (outside the range reserved by JSON-RPC).
 const (
@@ -102,13 +103,15 @@ type HostStatus struct {
 	Local       bool   `json:"local,omitempty"` // this machine, no SSH: only PVC mounts
 	// RecentPVCs are claims mounted from this host lately, newest first, to
 	// mount again quickly.
-	RecentPVCs []RecentPVC     `json:"recent_pvcs,omitempty"`
-	State      State           `json:"state"`
-	Error      string          `json:"error,omitempty"`
-	RetryAt    *time.Time      `json:"retry_at,omitempty"` // next reconnect attempt
-	Forwards   []ForwardStatus `json:"forwards"`
-	Mounts     []MountStatus   `json:"mounts"`
-	USB        []USBStatus     `json:"usb"`
+	RecentPVCs []RecentPVC `json:"recent_pvcs,omitempty"`
+	// RecentForwards are ad-hoc forwards added lately, newest first.
+	RecentForwards []RecentForward `json:"recent_forwards,omitempty"`
+	State          State           `json:"state"`
+	Error          string          `json:"error,omitempty"`
+	RetryAt        *time.Time      `json:"retry_at,omitempty"` // next reconnect attempt
+	Forwards       []ForwardStatus `json:"forwards"`
+	Mounts         []MountStatus   `json:"mounts"`
+	USB            []USBStatus     `json:"usb"`
 }
 
 // USBStatus is a USB device shared with a host.
@@ -157,12 +160,23 @@ type KubeMountStatus struct {
 }
 
 type ForwardStatus struct {
-	Spec     string   `json:"spec"`               // canonical form
-	Profiles []string `json:"profiles,omitempty"` // active profiles that include it
-	AdHoc    bool     `json:"adhoc,omitempty"`    // added with forward.add
-	State    State    `json:"state"`
-	Error    string   `json:"error,omitempty"`
-	// AllocatedPort is the server-chosen port for a remote forward on port 0.
+	Spec  string `json:"spec"`            // canonical form
+	Label string `json:"label,omitempty"` // a name given to it, e.g. "postgres"
+	// Description says what it does in plain words.
+	Description string `json:"description,omitempty"`
+	// Address is where to connect to it here, e.g. "localhost:5432" or a
+	// socket path; empty if it listens on the remote.
+	Address string `json:"address,omitempty"`
+	// Target is the result of checking what it forwards to: "ok",
+	// "unreachable", or empty if not checked (proxies, or checks are off).
+	Target      string   `json:"target,omitempty"`
+	TargetError string   `json:"target_error,omitempty"`
+	Profiles    []string `json:"profiles,omitempty"` // active profiles that include it
+	AdHoc       bool     `json:"adhoc,omitempty"`    // added with forward.add
+	State       State    `json:"state"`
+	Error       string   `json:"error,omitempty"`
+	// AllocatedPort is the port chosen for a forward on port 0: by the
+	// server for a remote one, by tether for a local one.
 	AllocatedPort int `json:"allocated_port,omitempty"`
 	// Resolved is the concrete forward behind a named one (gpg-agent,
 	// gpg-ssh), known once it is up.
@@ -199,6 +213,9 @@ type TargetResult struct {
 	Generation uint64     `json:"generation"`
 }
 
+// ForwardParams names a forward for forward.add and forward.remove. Spec
+// may be a spec, a shorthand (5432, db:5432), a name (socks, rsocks, http,
+// gpg-agent, gpg-ssh), and for forward.add may start with "label=".
 type ForwardParams struct {
 	Host string `json:"host"`
 	Spec string `json:"spec"`
@@ -389,4 +406,43 @@ type KubeGCParams struct {
 
 type KubeGCResult struct {
 	Deleted int `json:"deleted"`
+}
+
+// KubeTargetsParams asks for the services and pods kubectl on Host can
+// forward to. Empty Context: kubectl's current one; empty Namespace: all.
+type KubeTargetsParams struct {
+	Host      string `json:"host"`
+	Context   string `json:"context,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+}
+
+type KubeTargetsResult struct {
+	Host     string       `json:"host"`
+	Context  string       `json:"context"`
+	Current  string       `json:"current"`
+	Contexts []string     `json:"contexts"`
+	Targets  []KubeTarget `json:"targets"`
+}
+
+// KubeTarget is a service or pod to forward to.
+type KubeTarget struct {
+	Namespace string     `json:"namespace"`
+	Kind      string     `json:"kind"` // svc or pod
+	Name      string     `json:"name"`
+	Ports     []KubePort `json:"ports,omitempty"`
+	Owner     string     `json:"owner,omitempty"` // for pods: e.g. ReplicaSet/web-5d9f
+}
+
+// Ref is "namespace/kind/name".
+func (t KubeTarget) Ref() string { return t.Namespace + "/" + t.Kind + "/" + t.Name }
+
+type KubePort struct {
+	Name string `json:"name,omitempty"`
+	Port int    `json:"port"`
+}
+
+// RecentForward is a forward added lately.
+type RecentForward struct {
+	Spec  string `json:"spec"`
+	Label string `json:"label,omitempty"`
 }
