@@ -477,18 +477,3 @@ func DisconnectedMenu() []Item {
 		action("quit", "Quit tray", &Action{Local: localQuit}),
 	}
 }
-
-// Shape is a menu's structure: IDs, nesting and item kinds. Menus with the
-// same shape can be updated in place; others must be rebuilt.
-func Shape(items []Item) string {
-	var b strings.Builder
-	var walk func([]Item, int)
-	walk = func(items []Item, depth int) {
-		for _, it := range items {
-			fmt.Fprintf(&b, "%d|%s|%t|%t\n", depth, it.ID, it.Separator, it.Checkable)
-			walk(it.Children, depth+1)
-		}
-	}
-	walk(items, 0)
-	return b.String()
-}

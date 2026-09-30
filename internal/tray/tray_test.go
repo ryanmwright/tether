@@ -194,25 +194,57 @@ func TestBuildUSB(t *testing.T) {
 	}
 }
 
-func TestShape(t *testing.T) {
-	base := Shape(Build(sample))
-
-	// State changes keep the shape (the menu is updated in place)...
-	changed := sample
-	changed.Profiles = []api.ProfileStatus{
-		{Name: "work", Host: "dev", Active: false, State: api.StateDown},
-		{Name: "old", Host: "lab", Active: true, State: api.StatePending},
+func TestFit(t *testing.T) {
+	plain, sep := Item{ID: "p"}, Item{ID: "s", Separator: true}
+	for _, c := range []struct {
+		slots, items []Item
+		want         []int // nil: doesn't fit
+	}{
+		{[]Item{plain, sep, plain}, []Item{plain, sep, plain}, []int{0, 1, 2}},
+		{[]Item{plain, sep, plain}, []Item{plain}, []int{0}},   // the separator trails
+		{[]Item{plain, sep, plain}, []Item{plain, plain}, nil}, // it would show between
+		{[]Item{plain, sep, plain, sep, plain}, []Item{plain, sep, plain}, []int{0, 1, 2}},
+		{[]Item{plain, sep, plain, sep, plain}, []Item{plain, sep, plain, plain}, nil},
+		{[]Item{sep, plain, sep, sep, plain}, []Item{plain, sep, plain}, []int{1, 2, 4}},
+		{[]Item{{Checkable: true}}, []Item{plain}, nil},
+		{[]Item{{Children: []Item{plain}}}, []Item{{Children: []Item{plain, plain}}}, nil},
+		{[]Item{{Children: []Item{plain, plain}}}, []Item{{Children: []Item{plain}}}, []int{0}},
+	} {
+		got, ok := fit(slotsFor(c.slots), c.items)
+		if ok != (c.want != nil) || ok && !reflect.DeepEqual(got, c.want) {
+			t.Errorf("fit(%v, %v) = %v, %t; want %v", c.slots, c.items, got, ok, c.want)
+		}
 	}
-	if Shape(Build(changed)) != base {
-		t.Error("profile state change altered the shape")
-	}
+}
 
-	// ...new rows don't.
+// TestSlotsStable checks that once the tray has shown two menus, switching
+// between them again fits the slots it has, so it doesn't rebuild.
+func TestSlotsStable(t *testing.T) {
+	down := sample
+	down.Hosts = append([]api.HostStatus{}, sample.Hosts...)
+	down.Hosts[0] = api.HostStatus{Name: "dev", SSH: "devbox", State: api.StateDown}
 	more := sample
 	more.Hosts = append([]api.HostStatus{}, sample.Hosts...)
-	more.Hosts[0].Forwards = append(more.Hosts[0].Forwards, api.ForwardStatus{Spec: "D:1080", State: api.StateUp})
-	if Shape(Build(more)) == base {
-		t.Error("new forward didn't change the shape")
+	more.Hosts[0].Forwards = append(more.Hosts[0].Forwards, api.ForwardStatus{Spec: "D:1080", AdHoc: true, State: api.StateUp, Address: "127.0.0.1:1080"})
+	fewer := sample
+	fewer.Hosts = sample.Hosts[:1]
+	fewer.Profiles = nil
+	menus := map[string][]Item{
+		"sample": Build(sample), "down": Build(down), "more": Build(more), "fewer": Build(fewer),
+		"daemon gone": DisconnectedMenu(),
+	}
+	for from, a := range menus {
+		for to, b := range menus {
+			slots := slotsFor(a)
+			if _, ok := fit(slots, b); !ok {
+				slots = merge(slots, b)
+			}
+			for name, items := range map[string][]Item{from: a, to: b} {
+				if _, ok := fit(slots, items); !ok {
+					t.Errorf("%s → %s: %s doesn't fit the merged slots", from, to, name)
+				}
+			}
+		}
 	}
 }
 

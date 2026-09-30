@@ -49,9 +49,8 @@ type tray struct {
 	actions map[string]*Action
 
 	// Only touched by the goroutine running loop.
-	shape     string
-	items     map[string]*systray.MenuItem
-	buildDone chan struct{}
+	slots []*slot
+	built chan struct{} // closed when the slots are replaced
 
 	startDaemon chan struct{}
 }
@@ -142,8 +141,9 @@ func (t *tray) setClient(c *rpc.Client) {
 	t.mu.Unlock()
 }
 
-// render shows items, updating the existing menu in place when its shape is
-// unchanged (so an open menu doesn't jump) and rebuilding it otherwise.
+// render shows items, in the slots already made if they fit (so an open
+// menu doesn't jump and KDE's copy of each submenu stays good), making new
+// ones otherwise.
 func (t *tray) render(items []Item, look Look, tooltip string) {
 	systray.SetIcon(Icon(look))
 	systray.SetTooltip(tooltip)
@@ -153,16 +153,21 @@ func (t *tray) render(items []Item, look Look, tooltip string) {
 	collectActions(items, t.actions)
 	t.mu.Unlock()
 
-	if shape := Shape(items); shape != t.shape {
-		if t.buildDone != nil {
-			close(t.buildDone)
+	assign, ok := fit(t.slots, items)
+	if !ok {
+		slots := merge(t.slots, items)
+		if assign, ok = fit(slots, items); !ok {
+			slots = slotsFor(items)
+			assign, _ = fit(slots, items)
+		}
+		if t.built != nil {
+			close(t.built)
 		}
 		systray.ResetMenu()
-		t.shape, t.items, t.buildDone = shape, map[string]*systray.MenuItem{}, make(chan struct{})
-		t.build(nil, items)
-		return
+		t.slots, t.built = slots, make(chan struct{})
+		t.make(nil, slots)
 	}
-	t.update(items)
+	t.show(t.slots, items, assign)
 }
 
 func collectActions(items []Item, into map[string]*Action) {
@@ -174,69 +179,94 @@ func collectActions(items []Item, into map[string]*Action) {
 	}
 }
 
-func (t *tray) build(parent *systray.MenuItem, items []Item) {
-	for _, it := range items {
-		if it.Separator {
-			if parent == nil {
-				systray.AddSeparator()
-			} else {
-				parent.AddSeparator()
+// make adds slots to the menu, or to parent's submenu.
+func (t *tray) make(parent *systray.MenuItem, slots []*slot) {
+	for _, s := range slots {
+		check := s.kind == kindCheck || s.kind == kindCheckMenu
+		switch {
+		case s.kind == kindSeparator && parent == nil:
+			systray.AddSeparator()
+			continue
+		case s.kind == kindSeparator:
+			parent.AddSeparator()
+			continue
+		case parent == nil && check:
+			s.mi = systray.AddMenuItemCheckbox("", "", false)
+		case parent == nil:
+			s.mi = systray.AddMenuItem("", "")
+		case check:
+			s.mi = parent.AddSubMenuItemCheckbox("", "", false)
+		default:
+			s.mi = parent.AddSubMenuItem("", "")
+		}
+		s.enabled, s.visible = true, true
+		go t.watch(s, t.built)
+		t.make(s.mi, s.children)
+	}
+}
+
+// show puts items in the slots assign gives them and hides the other slots,
+// changing only what differs: each change makes KDE fetch the menu again.
+func (t *tray) show(slots []*slot, items []Item, assign []int) {
+	next := 0
+	for j, s := range slots {
+		if next < len(items) && assign[next] == j {
+			it := items[next]
+			next++
+			if s.mi == nil {
+				continue // a separator
+			}
+			t.mu.Lock()
+			s.id = it.ID
+			t.mu.Unlock()
+			if s.title != it.Title {
+				s.mi.SetTitle(it.Title)
+				s.title = it.Title
+			}
+			if s.enabled != it.Enabled {
+				if it.Enabled {
+					s.mi.Enable()
+				} else {
+					s.mi.Disable()
+				}
+				s.enabled = it.Enabled
+			}
+			if (s.kind == kindCheck || s.kind == kindCheckMenu) && s.checked != it.Checked {
+				if it.Checked {
+					s.mi.Check()
+				} else {
+					s.mi.Uncheck()
+				}
+				s.checked = it.Checked
+			}
+			if !s.visible {
+				s.mi.Show()
+				s.visible = true
+			}
+			if len(s.children) > 0 {
+				sub, _ := fit(s.children, it.Children)
+				t.show(s.children, it.Children, sub)
 			}
 			continue
 		}
-		var mi *systray.MenuItem
-		switch {
-		case parent == nil && it.Checkable:
-			mi = systray.AddMenuItemCheckbox(it.Title, "", it.Checked)
-		case parent == nil:
-			mi = systray.AddMenuItem(it.Title, "")
-		case it.Checkable:
-			mi = parent.AddSubMenuItemCheckbox(it.Title, "", it.Checked)
-		default:
-			mi = parent.AddSubMenuItem(it.Title, "")
+		if s.mi != nil && s.visible {
+			t.mu.Lock()
+			s.id = ""
+			t.mu.Unlock()
+			s.mi.Hide()
+			s.visible = false
 		}
-		if !it.Enabled {
-			mi.Disable()
-		}
-		t.items[it.ID] = mi
-		// Watch every item: one without an action now may get one in an
-		// in-place update.
-		go t.watch(it.ID, mi, t.buildDone)
-		t.build(mi, it.Children)
 	}
 }
 
-func (t *tray) update(items []Item) {
-	for _, it := range items {
-		mi := t.items[it.ID]
-		if mi == nil {
-			continue // separators
-		}
-		mi.SetTitle(it.Title)
-		if it.Enabled {
-			mi.Enable()
-		} else {
-			mi.Disable()
-		}
-		if it.Checkable {
-			if it.Checked {
-				mi.Check()
-			} else {
-				mi.Uncheck()
-			}
-		}
-		t.update(it.Children)
-	}
-}
-
-// watch runs an item's current action on each click, until the menu is
-// rebuilt.
-func (t *tray) watch(id string, mi *systray.MenuItem, done chan struct{}) {
+// watch runs the action of the item a slot shows on each click, until the
+// menu is rebuilt.
+func (t *tray) watch(s *slot, done chan struct{}) {
 	for {
 		select {
-		case <-mi.ClickedCh:
+		case <-s.mi.ClickedCh:
 			t.mu.Lock()
-			a := t.actions[id]
+			a := t.actions[s.id]
 			t.mu.Unlock()
 			if a != nil {
 				go t.run(a)
