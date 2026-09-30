@@ -34,7 +34,8 @@ type appliedForward struct {
 	actual forward.Spec
 	// runner is what runs besides ssh: the HTTP proxy, or kubectl.
 	runner  forwardRunner
-	noCheck bool // not worth checking (gpg-agent's sockets)
+	noCheck bool   // not worth checking (gpg-agent's sockets)
+	gpgKind string // for a gpg forward, its socket kind
 }
 
 type forwardRunner interface {
@@ -91,6 +92,9 @@ func (s *session) removeForward(ctx context.Context, m *openssh.Master, key stri
 	}
 	cctx, cancel := context.WithTimeout(ctx, controlTimeout)
 	defer cancel()
+	if af.gpgKind != "" {
+		s.releaseGPG(cctx, m, map[string]*appliedForward{key: af})
+	}
 	if err := m.Cancel(cctx, af.ssh); err != nil {
 		s.log.Warn("cancel forward failed", "forward", key, "err", err)
 	}
@@ -148,13 +152,13 @@ func (s *session) addWanted(ctx context.Context, m *openssh.Master, key string, 
 	spec := wf.spec
 	switch {
 	case wf.gpgKind != "":
-		if spec, err = resolveGPG(ctx, m, wf.gpgKind); err != nil {
+		if spec, err = s.resolveGPG(ctx, m, wf.gpgKind); err != nil {
 			return nil, 0, "", err
 		}
 		if _, err := addForward(ctx, m, spec); err != nil {
 			return nil, 0, "", err
 		}
-		return &appliedForward{ssh: spec, actual: spec, noCheck: true}, 0, spec.String(), nil
+		return &appliedForward{ssh: spec, actual: spec, noCheck: true, gpgKind: wf.gpgKind}, 0, spec.String(), nil
 	case spec.Kind == forward.HTTP:
 		return s.startHTTPProxy(ctx, m, key, spec)
 	case spec.Kind == forward.Kube:

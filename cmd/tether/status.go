@@ -117,6 +117,8 @@ func printStatus(out io.Writer, st *api.Status) {
 				case detail != "":
 				case f.TargetError != "":
 					detail = "target unreachable: " + f.TargetError
+				case f.UsedBy != "" && f.State == api.StateUp:
+					detail = fmt.Sprintf("standing by: in use by %s (to use yours: tether gpg use %s)", f.UsedBy, h.Name)
 				case f.Resolved != "":
 					if spec, err := forward.Parse(f.Resolved); err == nil {
 						detail = "remote " + spec.Listen.String()

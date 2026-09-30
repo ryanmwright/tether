@@ -4,7 +4,10 @@ package gpg
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -13,7 +16,7 @@ import (
 	"strings"
 )
 
-// Remote socket kinds, as understood by PrepareRemoteScript.
+// Remote socket kinds, as understood by RemoteScript.
 const (
 	KindAgent = "agent" // the remote's standard agent socket
 	KindSSH   = "ssh"   // the remote's SSH agent socket
@@ -72,20 +75,57 @@ func isSocket(path string) bool {
 	return err == nil && fi.Mode().Type() == os.ModeSocket
 }
 
-// PrepareRemoteScript runs on the remote under `sh -s -- KIND...`. For each
-// kind it prints "kind=path" for the socket to forward to, after clearing
-// the way:
+// Several machines can forward their agents to the same remote, but gpg
+// there talks to one socket. So each machine's forward gets a path of its
+// own beside the standard one (S.gpg-agent.tether.ID), and the standard path
+// is a symlink to the forward in use: the machine holding it. Switching
+// machines relinks it, and the others' forwards stay up, ready.
+
+// Script modes, as understood by RemoteScript.
+const (
+	ModeBind    = "bind"    // clear the way for this machine's forward
+	ModeStatus  = "status"  // just report
+	ModeClaim   = "claim"   // link the standard path to this machine's forward
+	ModeRelease = "release" // hand the standard path to another live forward, or remove it
+)
+
+// HolderOther is Socket.Holder for a socket that isn't a tether forward:
+// normally the remote's own gpg-agent.
+const HolderOther = "(remote)"
+
+// RemoteScript runs on the remote under the command RemoteCommand gives.
+// Whatever the mode, it then prints each kind's Socket as "KIND.FIELD=VALUE"
+// lines. In status mode it changes nothing.
 //
-//   - It stops the remote's own gpg-agent. Merely removing its socket isn't
-//     enough: the agent notices, exits, and deletes the socket path on the
-//     way out, taking the forward with it. (If the socket is instead a stale
-//     forward from an earlier connection, the kill request reaches the local
-//     agent's restricted extra socket, which refuses it.)
-//   - It removes whatever is left at the path, e.g. a stale socket.
-const PrepareRemoteScript = `
+//   - bind removes a stale socket of this machine's, so ssh can listen there.
+//   - claim first stops the remote's own gpg-agent if it has the standard
+//     path. Merely removing its socket isn't enough: the agent notices,
+//     exits, and deletes the path on the way out, taking the link with it.
+//     (If the path is instead a stale forward from an older tether, the kill
+//     request reaches that machine's restricted extra socket, which refuses
+//     it.) The link is replaced atomically, so gpg never finds no socket.
+//   - release removes this machine's socket and, if it held the standard
+//     path, passes it to another machine's live forward or removes it.
+//
+// A socket is alive if it answers within 3s: one whose machine has gone to
+// sleep still accepts a connection (sshd does) but never answers.
+const RemoteScript = `
+mode=$1 id=$2
+shift 2
 command -v gpgconf >/dev/null 2>&1 || { echo "gpgconf not found on the remote; install GnuPG there" >&2; exit 3; }
-gpgconf --create-socketdir >/dev/null 2>&1
-if command -v timeout >/dev/null 2>&1; then timeout 5 gpgconf --kill gpg-agent; else gpgconf --kill gpg-agent; fi >/dev/null 2>&1
+[ "$mode" = status ] || gpgconf --create-socketdir >/dev/null 2>&1
+t=
+command -v timeout >/dev/null 2>&1 && t="timeout 3"
+alive() {
+  [ -S "$2" ] || return 1
+  case $1 in
+    agent) $t gpg-connect-agent --no-autostart --raw-socket "$2" /bye >/dev/null 2>&1 ;;
+    ssh) command -v ssh-add >/dev/null 2>&1 || return 0
+      SSH_AUTH_SOCK=$2 $t ssh-add -l >/dev/null 2>&1; [ $? -le 1 ] ;;
+  esac
+}
+relink() { ln -sf "$2" "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"; }
+killed=
 for kind in "$@"; do
   case $kind in
     agent) p=$(gpgconf --list-dirs agent-socket) ;;
@@ -93,23 +133,140 @@ for kind in "$@"; do
     *) continue ;;
   esac
   [ -n "$p" ] || { echo "gpgconf gave no socket path for $kind" >&2; exit 3; }
-  rm -f "$p"
-  echo "$kind=$p"
+  ours=$p.tether.$id
+  case $mode in
+    bind) rm -f "$ours" ;;
+    claim)
+      if [ ! -L "$p" ] && [ -e "$p" ]; then
+        if [ -z "$killed" ]; then
+          $t gpgconf --kill gpg-agent >/dev/null 2>&1
+          killed=1
+        fi
+        rm -f "$p"
+      fi
+      relink "$p" "$ours" ;;
+    release)
+      rm -f "$ours"
+      if [ "$(readlink "$p")" = "$ours" ]; then
+        next=
+        for s in "$p".tether.*; do
+          if alive "$kind" "$s"; then next=$s; break; fi
+        done
+        if [ -n "$next" ]; then relink "$p" "$next"; else rm -f "$p"; fi
+      fi ;;
+  esac
+  holder= ok=0 mine=0
+  if [ -L "$p" ]; then
+    l=$(readlink "$p")
+    case ${l##*/} in
+      "${p##*/}".tether.*) holder=${l##*/}; holder=${holder#"${p##*/}".tether.} ;;
+      *) holder="` + HolderOther + `" ;;
+    esac
+  elif [ -e "$p" ]; then
+    holder="` + HolderOther + `"
+  fi
+  [ -n "$holder" ] && alive "$kind" "$p" && ok=1
+  [ -S "$ours" ] && mine=1
+  echo "$kind.path=$p"
+  echo "$kind.ours=$ours"
+  echo "$kind.holder=$holder"
+  echo "$kind.alive=$ok"
+  echo "$kind.bound=$mine"
 done
 `
 
-// ParsePrepareOutput maps each kind to its remote socket path.
-func ParsePrepareOutput(out string) map[string]string {
-	paths := map[string]string{}
+// RemoteCommand is the command to run RemoteScript with, on its stdin, for
+// machine id.
+func RemoteCommand(mode, id string, kinds ...string) string {
+	return "sh -s -- " + mode + " " + id + " " + strings.Join(kinds, " ")
+}
+
+// Socket is a kind's standard socket path on the remote, as RemoteScript
+// found it.
+type Socket struct {
+	Path string // what gpg uses
+	Ours string // this machine's forward, beside it
+	// Holder is the ID of the machine whose forward Path leads to,
+	// HolderOther if it's something else, or empty if there's nothing.
+	Holder string
+	Alive  bool // Path answers
+	Bound  bool // something (our forward, once added) is at Ours
+}
+
+// ParseSockets reads RemoteScript's output, by kind.
+func ParseSockets(out string) map[string]Socket {
+	socks := map[string]Socket{}
 	for line := range strings.Lines(out) {
-		if kind, path, ok := strings.Cut(strings.TrimSpace(line), "="); ok {
-			if p, err := url.PathUnescape(path); err == nil {
-				path = p
-			}
-			paths[kind] = path
+		key, value, ok := strings.Cut(strings.TrimRight(line, "\n"), "=")
+		kind, field, ok2 := strings.Cut(key, ".")
+		if !ok || !ok2 {
+			continue
+		}
+		s := socks[kind]
+		switch field {
+		case "path":
+			s.Path = value
+		case "ours":
+			s.Ours = value
+		case "holder":
+			s.Holder = value
+		case "alive":
+			s.Alive = value == "1"
+		case "bound":
+			s.Bound = value == "1"
+		default:
+			continue
+		}
+		socks[kind] = s
+	}
+	return socks
+}
+
+// MachineID names this machine in remote socket paths: its hostname, cut
+// short to keep paths under the socket path limit, and a hash of its
+// machine ID so two machines with the same hostname don't collide.
+func MachineID() string {
+	host, _ := os.Hostname()
+	unique, err := os.ReadFile("/etc/machine-id")
+	if err != nil || len(bytes.TrimSpace(unique)) == 0 {
+		unique = []byte(host)
+	}
+	return machineID(host, bytes.TrimSpace(unique))
+}
+
+func machineID(host string, unique []byte) string {
+	host, _, _ = strings.Cut(host, ".")
+	var b strings.Builder
+	for _, r := range host {
+		if b.Len() >= 16 {
+			break
+		}
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r - 'A' + 'a')
+		default:
+			b.WriteByte('-')
 		}
 	}
-	return paths
+	name := strings.Trim(b.String(), "-")
+	if name == "" {
+		name = "machine"
+	}
+	sum := sha256.Sum256(unique)
+	return name + "-" + hex.EncodeToString(sum[:3])
+}
+
+// HolderName is how to show Socket.Holder: the machine's hostname part.
+func HolderName(holder string) string {
+	if holder == HolderOther {
+		return "the remote's own gpg-agent"
+	}
+	if i := strings.LastIndexByte(holder, '-'); i > 0 {
+		return holder[:i]
+	}
+	return holder
 }
 
 // agentUnits are the systemd user units distributions ship for gpg-agent.

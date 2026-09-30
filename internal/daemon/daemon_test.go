@@ -33,10 +33,16 @@ type harness struct {
 // config file so tests never touch the user's ~/.ssh/config.
 func start(t *testing.T, configTOML string, sshOpts ...openssh.Options) *harness {
 	t.Helper()
-	ssh := openssh.Options{ConfigFile: os.DevNull}
-	if len(sshOpts) > 0 {
-		ssh = sshOpts[0]
-	}
+	return startWith(t, configTOML, func(o *Options) {
+		if len(sshOpts) > 0 {
+			o.SSH = sshOpts[0]
+		}
+	})
+}
+
+// startWith runs a daemon with options adjusted by opt.
+func startWith(t *testing.T, configTOML string, opt func(*Options)) *harness {
+	t.Helper()
 	dir := t.TempDir()
 	h := &harness{
 		socket: filepath.Join(dir, "run", "tether.sock"),
@@ -52,7 +58,10 @@ func start(t *testing.T, configTOML string, sshOpts ...openssh.Options) *harness
 		helper := cmp.Or(os.Getenv("TETHER_TEST_USBIP_HELPER"), filepath.Join(dir, "no-usbip-helper.sock"))
 		// Only the kube tests want the built-in local host.
 		noLocal := os.Getenv("TETHER_TEST_LOCAL_HOST") == ""
-		h.done <- Run(ctx, Options{SocketPath: h.socket, ConfigPath: h.config, Version: "test", Logger: testLogger(t), SSH: ssh, USBHelperSocket: helper, NoLocalHost: noLocal})
+		o := Options{SocketPath: h.socket, ConfigPath: h.config, Version: "test", Logger: testLogger(t),
+			SSH: openssh.Options{ConfigFile: os.DevNull}, USBHelperSocket: helper, NoLocalHost: noLocal}
+		opt(&o)
+		h.done <- Run(ctx, o)
 	}()
 	t.Cleanup(func() {
 		cancel()

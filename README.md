@@ -511,9 +511,36 @@ with root on the remote can use your SSH keys while it's forwarded, so only
 turn it on for machines you trust.
 
 Each time the connection comes up, tether asks both ends' `gpgconf` where
-the sockets live, stops the remote's own gpg-agent if one is running, and
-forwards your local sockets to the remote's standard paths. `tether status`
-shows each gpg forward and the remote socket it's bound to.
+the sockets live and forwards your local sockets to the remote, next to its
+standard paths (`S.gpg-agent.tether.<this machine>`). The standard paths
+become symlinks to them, after stopping the remote's own gpg-agent if one is
+running. `tether status` shows each gpg forward and the remote socket it's
+bound to.
+
+### From several machines
+
+You can forward gpg to the same host from more than one machine, say your
+laptop at home and your desktop at the office. gpg on the host uses one
+machine's agent at a time. The others stay forwarded, standing by, and
+switching is instant. Each machine's forward has its own socket; switching
+just repoints the standard path's symlink.
+
+- **Connecting to the host, activating a profile on it, or turning gpg on**
+  makes gpg there use this machine's keys. Using the host here means using
+  your keys here.
+- **Reconnecting on its own** (after sleep, a network change or a daemon
+  restart) doesn't take gpg from a machine still using it. This machine
+  stands by, and says so: the tray shows **⇄ Use this machine's gpg keys on
+  HOST** at the top of its menu and in a notification with a button, the
+  terminal UI shows a banner (press `G` on the host), and `tether status`
+  shows the forward as standing by. `tether gpg use HOST` switches too.
+- **When the machine using it disconnects** (or turns gpg off), it passes to a
+  machine standing by right away, with a notification there.
+- **When the machine using it vanishes** without disconnecting (it went to
+  sleep or lost its network), a machine standing by takes over after a
+  minute of it not answering. Brief network blips don't cause a switch.
+
+`tether doctor HOST` reports whose agent gpg on the host uses.
 
 ### Your local gpg-agent
 
@@ -570,6 +597,7 @@ connection
 remote
   ok    gpg               gpg (GnuPG) 2.4.7
   ok    agent socket      /run/user/1000/gnupg/S.gpg-agent
+  ok    gpg uses          this machine's agent
   WARN  remote gpg-agent  these units can start a gpg-agent on devbox that takes over the forwarded socket: gpg-agent.socket
                           fix: ssh devbox systemctl --user mask --now gpg-agent.socket ...
   ok    public keys       all 1 local keys are known on devbox
@@ -926,6 +954,7 @@ enter disconnect · a add… · c connect to… · d doctor · ? help · q quit
 | `m` | Add an ad-hoc mount on the selected host: `SRC DST`, one side `remote:PATH`; or `pvc:[CONTEXT/]NS/CLAIM [DST]` |
 | `K`, `p` | Pick a Kubernetes claim to mount, with `kubectl` on the selected host. Type to filter, `tab` for the next context, `ctrl+o` read-only, `enter` to mount (asks where, suggesting the default) |
 | `g` | Toggle ad-hoc gpg-agent forwarding to the selected host |
+| `G` | Make gpg on the selected host use this machine's keys, when another machine has it ([several machines](#from-several-machines)) |
 | `d` | Run `doctor` on the selected host |
 | `r` | Reload the config file |
 | `l` | Show or hide the log |
@@ -1032,6 +1061,7 @@ tether fwd ls [HOST]              forwards, where to connect, what they do
 tether fwd explain SPEC...        say what a spec does, without adding it
 tether gpg on HOST [--ssh]        forward gpg-agent (and its SSH socket) ad hoc
 tether gpg off HOST [--ssh]       stop it
+tether gpg use HOST               make gpg on HOST use this machine's keys, when another machine has it
 tether doctor HOST [--json]       check local, connection and remote setup
 tether tui                        interactive terminal UI
 tether tray [--no-notify]         system tray icon

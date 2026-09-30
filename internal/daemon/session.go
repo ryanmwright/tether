@@ -64,6 +64,9 @@ type forwardState struct {
 	// across reconnects so it stays the same while it's free.
 	lastPort          int
 	target, targetErr string // the last target check
+	// usedBy, for a gpg forward, names the machine whose agent gpg on the
+	// remote uses instead of this one's; empty while it uses this one's.
+	usedBy string
 }
 
 // session keeps one host's connection and forwards matching its want. All
@@ -83,6 +86,7 @@ type session struct {
 	mountDied chan struct{} // a running mount went away
 	fwdDied   chan struct{} // a forward's process (kubectl port-forward) exited
 	checkNow  chan struct{} // check forward targets now
+	gpgID     string        // this machine's name in remote gpg socket paths
 
 	mu             sync.Mutex
 	want           want
@@ -94,6 +98,7 @@ type session struct {
 	usbStates      map[string]*usbState
 	checks         map[string]forward.Spec // forwards whose targets to check, as applied
 	master         *openssh.Master         // the live connection, if any
+	gpgClaim       bool                    // claim the gpg sockets at the next sync: the user asked for this host
 	cancelConnect  context.CancelFunc
 	connectingDest string
 }
@@ -262,9 +267,18 @@ func (s *session) run(ctx context.Context) {
 		delay    time.Duration
 		retry    *time.Timer // pending reconnect; nil when not waiting
 		fwdRetry *time.Timer
+		gpgRT    gpgRuntime
+		gpgTick  = time.NewTicker(gpgCheckInterval)
 	)
+	defer gpgTick.Stop()
 	go s.checkLoop(ctx)
 	defer func() {
+		if m != nil {
+			// Shutting down: hand the gpg sockets on while still connected.
+			rctx, cancel := context.WithTimeout(context.Background(), controlTimeout)
+			s.releaseGPG(rctx, m, applied)
+			cancel()
+		}
 		s.stopForwards(applied)
 		if m != nil {
 			s.stopUSB(m, usbRT)
@@ -275,6 +289,7 @@ func (s *session) run(ctx context.Context) {
 	}()
 	disconnect := func() {
 		if m != nil {
+			s.releaseGPG(ctx, m, applied)
 			s.stopUSB(m, usbRT) // detach and unmount cleanly while still connected
 			s.stopMounts(running)
 			s.stopForwards(applied)
@@ -321,7 +336,9 @@ func (s *session) run(ctx context.Context) {
 			s.setState(api.StateUp, "", time.Time{})
 		}
 		if m != nil {
+			claim := s.takeGPGClaim()
 			fwdFailed := s.syncForwards(ctx, m, w, applied)
+			fwdFailed = s.syncGPG(ctx, m, w, applied, claim, &gpgRT) || fwdFailed
 			mountFailed := s.syncMounts(ctx, m, w, running)
 			usbFailed := s.syncUSB(ctx, m, w, usbRT)
 			if (fwdFailed || mountFailed || usbFailed) && fwdRetry == nil {
@@ -342,6 +359,7 @@ func (s *session) run(ctx context.Context) {
 			retry = nil
 		case <-timerC(fwdRetry):
 			fwdRetry = nil
+		case <-gpgTick.C:
 		case <-s.mountDied:
 			if s.reapMounts(running) && fwdRetry == nil {
 				fwdRetry = time.NewTimer(forwardRetryInterval)
@@ -400,9 +418,10 @@ func (s *session) connect(ctx context.Context, dest string) (*openssh.Master, er
 	return openssh.Start(ctx, s.ssh, dest, s.ctlPath, s.log)
 }
 
-// resolveGPG builds the remote forward for a gpg socket kind: from the
-// remote's standard socket (cleared first) to the matching local one.
-func resolveGPG(ctx context.Context, m *openssh.Master, kind string) (forward.Spec, error) {
+// resolveGPG builds the remote forward for a gpg socket kind: from this
+// machine's socket beside the remote's standard one (cleared first) to the
+// matching local one. syncGPG decides whether the standard one leads to it.
+func (s *session) resolveGPG(ctx context.Context, m *openssh.Master, kind string) (forward.Spec, error) {
 	extra, sshSock, err := gpg.LocalSockets(ctx, kind == gpg.KindSSH)
 	if err != nil {
 		return forward.Spec{}, err
@@ -411,17 +430,13 @@ func resolveGPG(ctx context.Context, m *openssh.Master, kind string) (forward.Sp
 	if kind == gpg.KindSSH {
 		local = sshSock
 	}
-	out, err := m.Run(ctx, gpg.PrepareRemoteScript, "sh -s -- "+kind)
+	socks, err := s.gpgScript(ctx, m, gpg.ModeBind, kind)
 	if err != nil {
 		return forward.Spec{}, fmt.Errorf("preparing remote gpg socket: %w", err)
 	}
-	remote := gpg.ParsePrepareOutput(string(out))[kind]
-	if remote == "" {
-		return forward.Spec{}, fmt.Errorf("remote gpgconf reported no %s socket", kind)
-	}
 	return forward.Spec{
 		Kind:   forward.Remote,
-		Listen: forward.Endpoint{Socket: remote},
+		Listen: forward.Endpoint{Socket: socks[kind].Ours},
 		Target: forward.Endpoint{Socket: local},
 	}, nil
 }
@@ -536,6 +551,7 @@ func (s *session) status(host config.Host) api.HostStatus {
 			Resolved:      f.resolved,
 			Target:        f.target,
 			TargetError:   f.targetErr,
+			UsedBy:        f.usedBy,
 		}
 		if wf.gpgKind == "" {
 			spec := wf.spec

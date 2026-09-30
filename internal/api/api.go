@@ -22,6 +22,7 @@ const (
 	MethodHostRemove    = "host.remove"
 	MethodUSBAttach     = "usb.attach"
 	MethodUSBDetach     = "usb.detach"
+	MethodGPGClaim      = "gpg.claim"
 	MethodDoctor        = "host.doctor"
 	MethodLogs          = "daemon.logs"
 	MethodKubeList      = "kube.list"
@@ -41,7 +42,7 @@ const (
 // method or field that clients rely on is added or changed, so a client can
 // tell it's talking to an older daemon left running across an upgrade.
 // Daemons from before it existed report 0.
-const ProtocolVersion = 7
+const ProtocolVersion = 8
 
 // Application error codes (outside the range reserved by JSON-RPC).
 const (
@@ -182,6 +183,11 @@ type ForwardStatus struct {
 	// Resolved is the concrete forward behind a named one (gpg-agent,
 	// gpg-ssh), known once it is up.
 	Resolved string `json:"resolved,omitempty"`
+	// UsedBy, for a gpg forward that's up, names what gpg on the host uses
+	// instead of this machine's agent: another machine forwarding its own
+	// (gpg.claim switches back), or the host's own gpg-agent. Empty while
+	// it uses this machine's.
+	UsedBy string `json:"used_by,omitempty"`
 }
 
 type ProfileStatus struct {
@@ -317,6 +323,12 @@ type MountResult struct {
 	Host       string `json:"host"`
 	Key        string `json:"key"`
 	Generation uint64 `json:"generation"`
+}
+
+// GPGClaimParams names the host whose gpg sockets gpg.claim takes over:
+// gpg there then uses this machine's agent. It returns a TargetResult.
+type GPGClaimParams struct {
+	Host string `json:"host"`
 }
 
 // HostParams names an ad-hoc host for host.add (which also connects it) and

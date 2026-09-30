@@ -2,6 +2,7 @@ package tray
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/godbus/dbus/v5"
 
@@ -15,12 +16,17 @@ type Notice struct {
 	Summary string
 	Body    string
 	Urgent  bool
+	// Button, when Action is set, labels a button that runs it.
+	Button string
+	Action *Action
 }
 
 // Changes lists what's worth telling the user between two snapshots: hosts
 // losing or regaining their connection, and forwards, mounts or USB
 // devices failing.
-// Things the user just asked for (connecting, going down) aren't news.
+// Things the user just asked for (connecting, going down) aren't news. So
+// is which machine's keys gpg on a host uses, with a button to use this
+// one's.
 func Changes(prev, cur api.Status) []Notice {
 	before := map[string]api.HostStatus{}
 	for _, h := range prev.Hosts {
@@ -42,6 +48,18 @@ func Changes(prev, cur api.Status) []Notice {
 			notices = append(notices, Notice{Key: key, Summary: h.Name + ": not connected", Body: msg + "\nRetrying in the background.", Urgent: true})
 		case (h.State == api.StateUp || h.State == api.StateDegraded) && old.State == api.StateError:
 			notices = append(notices, Notice{Key: key, Summary: h.Name + ": connected again"})
+		}
+
+		if by, was := gpgUsedBy(h), gpgUsedBy(old); by != was {
+			switch {
+			case by != "":
+				notices = append(notices, Notice{Key: key + ":gpg", Summary: "gpg on " + h.Name + ": in use by " + by,
+					Body:   "gpg there uses " + by + "'s keys, not this machine's. Yours stay forwarded, ready.",
+					Button: "Use this machine's keys", Action: gpgClaimAction(h.Name)})
+			case gpgOn(h):
+				notices = append(notices, Notice{Key: key + ":gpg", Summary: "gpg on " + h.Name + ": using this machine's keys",
+					Body: "It was using " + was + "'s."})
+			}
 		}
 
 		oldFwd := map[string]api.ForwardStatus{}
@@ -78,15 +96,57 @@ func Changes(prev, cur api.Status) []Notice {
 // Notifier shows notices through the freedesktop notification service.
 type Notifier struct {
 	conn *dbus.Conn
-	ids  map[string]uint32 // last notification per key, to replace it
+
+	mu      sync.Mutex
+	ids     map[string]uint32  // last notification per key, to replace it
+	actions map[uint32]*Action // what each notification's button does
 }
 
-func NewNotifier() (*Notifier, error) {
+const (
+	notifications      = "org.freedesktop.Notifications"
+	notificationsPath  = "/org/freedesktop/Notifications"
+	notificationAction = "act"
+)
+
+// NewNotifier connects to the notification service. onAction runs the
+// action of a notice whose button (or body) is clicked.
+func NewNotifier(onAction func(*Action)) (*Notifier, error) {
 	conn, err := dbus.ConnectSessionBus()
 	if err != nil {
 		return nil, err
 	}
-	return &Notifier{conn: conn, ids: map[string]uint32{}}, nil
+	n := &Notifier{conn: conn, ids: map[string]uint32{}, actions: map[uint32]*Action{}}
+	if err := conn.AddMatchSignal(dbus.WithMatchInterface(notifications), dbus.WithMatchObjectPath(notificationsPath)); err == nil {
+		signals := make(chan *dbus.Signal, 16)
+		conn.Signal(signals)
+		go func() {
+			for sig := range signals { // closed with the connection
+				n.signal(sig, onAction)
+			}
+		}()
+	}
+	return n, nil
+}
+
+func (n *Notifier) signal(sig *dbus.Signal, onAction func(*Action)) {
+	if len(sig.Body) == 0 {
+		return
+	}
+	id, _ := sig.Body[0].(uint32)
+	n.mu.Lock()
+	a := n.actions[id]
+	switch sig.Name {
+	case notifications + ".ActionInvoked":
+	case notifications + ".NotificationClosed":
+		delete(n.actions, id)
+		a = nil
+	default:
+		a = nil
+	}
+	n.mu.Unlock()
+	if a != nil && onAction != nil {
+		onAction(a)
+	}
 }
 
 func (n *Notifier) Show(notice Notice) error {
@@ -94,10 +154,18 @@ func (n *Notifier) Show(notice Notice) error {
 	if notice.Urgent {
 		urgency = 2
 	}
-	obj := n.conn.Object("org.freedesktop.Notifications", "/org/freedesktop/Notifications")
-	call := obj.Call("org.freedesktop.Notifications.Notify", 0,
-		"tether", n.ids[notice.Key], "network-server", notice.Summary, notice.Body,
-		[]string{}, map[string]dbus.Variant{"urgency": dbus.MakeVariant(urgency)}, int32(-1))
+	actions := []string{}
+	if notice.Action != nil {
+		// "default" is clicking the notification itself.
+		actions = []string{"default", notice.Button, notificationAction, notice.Button}
+	}
+	n.mu.Lock()
+	replaces := n.ids[notice.Key]
+	n.mu.Unlock()
+	obj := n.conn.Object(notifications, notificationsPath)
+	call := obj.Call(notifications+".Notify", 0,
+		"tether", replaces, "network-server", notice.Summary, notice.Body,
+		actions, map[string]dbus.Variant{"urgency": dbus.MakeVariant(urgency)}, int32(-1))
 	if call.Err != nil {
 		return call.Err
 	}
@@ -105,7 +173,14 @@ func (n *Notifier) Show(notice Notice) error {
 	if err := call.Store(&id); err != nil {
 		return err
 	}
+	n.mu.Lock()
 	n.ids[notice.Key] = id
+	if notice.Action != nil {
+		n.actions[id] = notice.Action
+	} else {
+		delete(n.actions, id)
+	}
+	n.mu.Unlock()
 	return nil
 }
 

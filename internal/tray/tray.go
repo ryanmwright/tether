@@ -47,6 +47,7 @@ type tray struct {
 	mu      sync.Mutex
 	client  *rpc.Client
 	actions map[string]*Action
+	claimed map[string]time.Time // when this tray last took each host's gpg sockets
 
 	// Only touched by the goroutine running loop.
 	slots []*slot
@@ -57,9 +58,9 @@ type tray struct {
 
 // Run shows the tray icon until ctx is cancelled or the user quits it.
 func Run(ctx context.Context, opts Options) error {
-	t := &tray{opts: opts, actions: map[string]*Action{}, startDaemon: make(chan struct{}, 1)}
+	t := &tray{opts: opts, actions: map[string]*Action{}, claimed: map[string]time.Time{}, startDaemon: make(chan struct{}, 1)}
 	if opts.Notify {
-		n, err := NewNotifier()
+		n, err := NewNotifier(func(a *Action) { go t.run(a) })
 		if err != nil {
 			opts.Log.Warn("desktop notifications unavailable", "err", err)
 		} else {
@@ -126,6 +127,9 @@ func (t *tray) follow(c *rpc.Client) {
 		t.render(Build(st), look, "tether: "+summary)
 		if prev != nil && t.notifier != nil {
 			for _, notice := range Changes(*prev, st) {
+				if t.justClaimed(notice) {
+					continue
+				}
 				if err := t.notifier.Show(notice); err != nil {
 					t.opts.Log.Warn("notification failed", "err", err)
 				}
@@ -133,6 +137,19 @@ func (t *tray) follow(c *rpc.Client) {
 		}
 		prev = &st
 	}
+}
+
+// justClaimed reports whether notice only says that gpg on a host now uses
+// this machine's keys, as the user just asked here.
+func (t *tray) justClaimed(notice Notice) bool {
+	host, ok := strings.CutPrefix(notice.Key, "host:")
+	host, ok2 := strings.CutSuffix(host, ":gpg")
+	if !ok || !ok2 || notice.Action != nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return time.Since(t.claimed[host]) < 30*time.Second
 }
 
 func (t *tray) setClient(c *rpc.Client) {
@@ -278,6 +295,11 @@ func (t *tray) watch(s *slot, done chan struct{}) {
 }
 
 func (t *tray) run(a *Action) {
+	if p, ok := a.Params.(api.GPGClaimParams); ok && a.Method == api.MethodGPGClaim {
+		t.mu.Lock()
+		t.claimed[p.Host] = time.Now()
+		t.mu.Unlock()
+	}
 	switch a.Local {
 	case localQuit:
 		systray.Quit()

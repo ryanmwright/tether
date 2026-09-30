@@ -7,6 +7,7 @@ import (
 	"image/png"
 	"os/exec"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -229,8 +230,12 @@ func TestSlotsStable(t *testing.T) {
 	fewer := sample
 	fewer.Hosts = sample.Hosts[:1]
 	fewer.Profiles = nil
+	standby := sample
+	standby.Hosts = append([]api.HostStatus{}, sample.Hosts...)
+	standby.Hosts[0].Forwards = append([]api.ForwardStatus{}, sample.Hosts[0].Forwards...)
+	standby.Hosts[0].Forwards[1].UsedBy = "office"
 	menus := map[string][]Item{
-		"sample": Build(sample), "down": Build(down), "more": Build(more), "fewer": Build(fewer),
+		"sample": Build(sample), "down": Build(down), "more": Build(more), "fewer": Build(fewer), "gpg standby": Build(standby),
 		"daemon gone": DisconnectedMenu(),
 	}
 	for from, a := range menus {
@@ -320,13 +325,14 @@ type notifyCall struct {
 	replaces      uint32
 	summary, body string
 	urgency       byte
+	actions       []string
 }
 
 func (f *fakeNotifications) Notify(app string, replaces uint32, icon, summary, body string, actions []string, hints map[string]dbus.Variant, timeout int32) (uint32, *dbus.Error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	u, _ := hints["urgency"].Value().(byte)
-	f.calls = append(f.calls, notifyCall{replaces, summary, body, u})
+	f.calls = append(f.calls, notifyCall{replaces, summary, body, u, actions})
 	if replaces != 0 {
 		return replaces, nil
 	}
@@ -366,11 +372,37 @@ func TestNotifier(t *testing.T) {
 		t.Fatalf("claiming the notification service: %v %v", reply, err)
 	}
 
-	n, err := NewNotifier()
+	clicked := make(chan *Action, 1)
+	n, err := NewNotifier(func(a *Action) { clicked <- a })
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer n.Close()
+
+	// A notice with a button runs its action when the button is clicked.
+	claim := gpgClaimAction("dev")
+	if err := n.Show(Notice{Key: "host:dev:gpg", Summary: "gpg on dev: in use by office", Button: "Use this machine's keys", Action: claim}); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	got := fake.calls[0]
+	fake.calls = nil
+	fake.mu.Unlock()
+	if !slices.Contains(got.actions, "Use this machine's keys") {
+		t.Errorf("button not offered: %+v", got)
+	}
+	if err := conn.Emit("/org/freedesktop/Notifications", "org.freedesktop.Notifications.ActionInvoked", uint32(1), notificationAction); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case a := <-clicked:
+		if a != claim {
+			t.Errorf("clicked ran %+v", a)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("clicking the button did nothing")
+	}
+
 	for _, notice := range []Notice{
 		{Key: "host:dev", Summary: "dev: not connected", Body: "Connection lost", Urgent: true},
 		{Key: "host:dev", Summary: "dev: connected again"},
@@ -387,7 +419,7 @@ func TestNotifier(t *testing.T) {
 		calls := append([]notifyCall{}, fake.calls...)
 		fake.mu.Unlock()
 		if len(calls) == 3 {
-			if calls[0].replaces != 0 || calls[0].urgency != 2 {
+			if calls[0].replaces != 0 || calls[0].urgency != 2 || len(calls[0].actions) != 0 {
 				t.Errorf("first = %+v", calls[0])
 			}
 			// The same key replaces the earlier notification instead of piling up.
@@ -540,5 +572,60 @@ func TestAddAndForwardMenus(t *testing.T) {
 	}
 	if it := recent.Children[0]; it.Title != "Forward web (H:8080)" || it.Action.Params != (api.ForwardParams{Host: "dev", Spec: "web=H:8080"}) {
 		t.Errorf("recent forward = %+v %+v", it, it.Action)
+	}
+}
+
+func TestGPGStandbyMenu(t *testing.T) {
+	gpgFwd := func(usedBy string) api.Status {
+		return api.Status{Hosts: []api.HostStatus{{Name: "dev", SSH: "devbox", State: api.StateUp, Forwards: []api.ForwardStatus{
+			{Spec: "gpg-agent", AdHoc: true, State: api.StateUp, UsedBy: usedBy},
+		}}}}
+	}
+	mine, standby := gpgFwd(""), gpgFwd("office")
+
+	items := Build(standby)
+	top := find(items, "gpg-claim:dev")
+	if top == nil || !strings.Contains(top.Title, "in use by office") || top.Action == nil || top.Action.Method != api.MethodGPGClaim {
+		t.Fatalf("top-level claim item = %+v", top)
+	}
+	if p, _ := top.Action.Params.(api.GPGClaimParams); p.Host != "dev" {
+		t.Errorf("claims %+v", top.Action.Params)
+	}
+	if it := find(items, "host:dev:gpg-claim"); it == nil || it.Action == nil {
+		t.Errorf("host submenu claim item = %+v", it)
+	}
+	if it := find(items, "host:dev:fwd:gpg-agent"); it == nil || !strings.Contains(it.Title, "standing by, in use by office") {
+		t.Errorf("forward row = %+v", it)
+	}
+	if _, text := Summary(standby); !strings.Contains(text, "gpg on dev in use by office") {
+		t.Errorf("summary = %q", text)
+	}
+	items = Build(mine)
+	if find(items, "gpg-claim:dev") != nil || find(items, "host:dev:gpg-claim") != nil {
+		t.Error("claim offered while this machine's keys are in use")
+	}
+
+	n := Changes(mine, standby)
+	if len(n) != 1 || n[0].Action == nil || n[0].Action.Method != api.MethodGPGClaim || !strings.Contains(n[0].Summary, "in use by office") {
+		t.Fatalf("taken over: %+v", n)
+	}
+	if n := Changes(standby, mine); len(n) != 1 || n[0].Action != nil || !strings.Contains(n[0].Body, "office") {
+		t.Errorf("taken back: %+v", n)
+	}
+	// Turning gpg off isn't news, whoever had it.
+	off := api.Status{Hosts: []api.HostStatus{{Name: "dev", SSH: "devbox", State: api.StateUp}}}
+	if n := Changes(standby, off); len(n) != 0 {
+		t.Errorf("gpg turned off: %+v", n)
+	}
+
+	// The tray doesn't confirm a claim the user just made from it.
+	tr := &tray{claimed: map[string]time.Time{}}
+	back := Changes(standby, mine)[0]
+	if tr.justClaimed(back) {
+		t.Error("unasked-for claim suppressed")
+	}
+	tr.claimed["dev"] = time.Now()
+	if !tr.justClaimed(back) || tr.justClaimed(n[0]) {
+		t.Error("claim from the tray not suppressed, or the takeover notice was")
 	}
 }

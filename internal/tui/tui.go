@@ -403,6 +403,10 @@ func (m Model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if hostOK {
 			return m, m.toggleGPG(sel.host)
 		}
+	case "G":
+		if hostOK {
+			return m.claimGPG(sel.host)
+		}
 	case "K", "p":
 		if hostOK {
 			m.openPVC(sel.host)
@@ -592,6 +596,44 @@ func (m Model) toggleGPG(host string) tea.Cmd {
 	return m.call("forwarding gpg-agent to "+host, api.MethodForwardAdd, api.ForwardParams{Host: host, Spec: "gpg-agent"})
 }
 
+// claimGPG makes gpg on host use this machine's keys, taking over from
+// whichever machine's it uses.
+func (m Model) claimGPG(host string) (tea.Model, tea.Cmd) {
+	h := m.hostStatus(host)
+	switch {
+	case gpgUsedBy(h) != "":
+		return m, m.call("gpg on "+host+" now uses this machine's keys", api.MethodGPGClaim, api.GPGClaimParams{Host: host})
+	case gpgOn(h):
+		m.flash = "gpg on " + host + " already uses this machine's keys"
+	default:
+		m.flash, m.flashErr = "gpg-agent isn't forwarded to "+host+" — press g to forward it", true
+	}
+	return m, nil
+}
+
+// gpgOn reports whether this machine's gpg-agent is forwarded to h.
+func gpgOn(h api.HostStatus) bool {
+	for _, f := range h.Forwards {
+		if isGPG(f) && f.State == api.StateUp {
+			return true
+		}
+	}
+	return false
+}
+
+// gpgUsedBy is what gpg on h uses instead of this machine's forwarded
+// agent, if anything.
+func gpgUsedBy(h api.HostStatus) string {
+	for _, f := range h.Forwards {
+		if isGPG(f) && f.State == api.StateUp && f.UsedBy != "" {
+			return f.UsedBy
+		}
+	}
+	return ""
+}
+
+func isGPG(f api.ForwardStatus) bool { return f.Spec == "gpg-agent" || f.Spec == "gpg-ssh" }
+
 func (m Model) call(done, method string, params any) tea.Cmd {
 	c := m.client
 	return func() tea.Msg {
@@ -723,6 +765,11 @@ func (m Model) render() string {
 	if m.status.ConfigError != "" {
 		first, _, _ := strings.Cut(m.status.ConfigError, "\n")
 		top = append(top, styleErr.Render("config error (using last good config): "+first))
+	}
+	for _, h := range m.status.Hosts {
+		if by := gpgUsedBy(h); by != "" {
+			top = append(top, styleWarn.Render("⇄ gpg on "+h.Name+" uses "+by+"'s keys — select "+h.Name+" and press G to use this machine's"))
+		}
 	}
 
 	var bottom []string
@@ -948,6 +995,9 @@ func (m Model) rowLine(r row, selected bool, nameW int) string {
 			info += " · ad-hoc"
 		}
 		extra = hostProblem(h)
+		if by := gpgUsedBy(h); extra == "" && by != "" {
+			extra = "gpg: " + by + "'s keys in use · G to use yours"
+		}
 	case rowForward:
 		f := m.forwardStatus(r.host, r.name)
 		state, name, info = f.State, "  "+forwardName(f), source(f.Profiles, f.AdHoc)
@@ -1048,6 +1098,8 @@ func forwardDetail(f api.ForwardStatus) string {
 	switch {
 	case f.Error != "":
 		return f.Error
+	case f.UsedBy != "" && f.State == api.StateUp:
+		return "standing by — in use by " + f.UsedBy + " · G to use yours"
 	case f.Target == "unreachable":
 		return "⚠ target unreachable"
 	case f.AllocatedPort != 0:
@@ -1185,6 +1237,8 @@ var helpLines = []string{
 	"  K:8080:ns/svc/web:80   a Kubernetes service or pod, via kubectl on the host",
 	"  label=SPEC             give it a name, e.g. postgres=db.internal:5432",
 	"  g            toggle ad-hoc gpg-agent forwarding to the selected host",
+	"  G            make gpg on the selected host use this machine's keys, when",
+	"               another machine forwarding its gpg-agent there has them",
 	"  d            run doctor on the selected host",
 	"  r            reload the config file",
 	"  l            show/hide the log",

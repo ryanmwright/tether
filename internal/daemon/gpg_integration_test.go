@@ -3,13 +3,16 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ryanmwright/tether/internal/api"
+	"github.com/ryanmwright/tether/internal/gpg"
 	"github.com/ryanmwright/tether/internal/openssh"
 	"github.com/ryanmwright/tether/internal/sshtest"
 )
@@ -118,6 +121,10 @@ func TestGPGForwarding(t *testing.T) {
 	st := g.waitFor(t, "profile up", func(st api.Status) bool { return profile(st, "work").State == api.StateUp })
 	if f := fwd(st, "dev", "gpg-agent"); !strings.HasPrefix(f.Resolved, "R:/") || f.Profiles[0] != "work" {
 		t.Errorf("gpg-agent forward = %+v", f)
+	}
+	g.call(t, api.MethodDoctor, api.DoctorParams{Host: "dev"}, &res)
+	if c := findCheck(res, "gpg uses"); c.Status != api.CheckOK || c.Detail != "this machine's agent" {
+		t.Errorf("gpg uses check = %+v", c)
 	}
 
 	// The remote keyring has only the public key: signing works only
@@ -242,4 +249,119 @@ func gpgconfIn(home string, args ...string) {
 	cmd := exec.Command("gpgconf", args...)
 	cmd.Env = append(os.Environ(), "GNUPGHOME="+home)
 	cmd.Run()
+}
+
+// TestGPGSwitchMachines has two machines ("home", this test's default, and
+// "office") forward their agents to one host, and checks which one gpg
+// there uses as they come, go and take over.
+func TestGPGSwitchMachines(t *testing.T) {
+	interval, grace := gpgCheckInterval, gpgGrace
+	gpgCheckInterval, gpgGrace = 200*time.Millisecond, 3*time.Second
+	t.Cleanup(func() { gpgCheckInterval, gpgGrace = interval, grace })
+
+	home := startGPG(t, "")
+	home.importPublicKey(t)
+	const officeID = "office-bbbbbb"
+	oh := startWith(t, fmt.Sprintf("[defaults]\nreconnect_backoff = \"100ms..500ms\"\n\n[hosts.dev]\nssh = %q\n", sshtest.HostAlias),
+		func(o *Options) { o.SSH, o.GPGMachine = openssh.Options{ConfigFile: home.srv.ConfigFile}, officeID })
+	office := &sshHarness{harness: oh, srv: home.srv, c: oh.client(t)}
+	homeName := gpg.HolderName(gpg.MachineID())
+
+	out, err := home.remote(t, "gpgconf --list-dirs agent-socket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket := strings.TrimSpace(out)
+	holder := func() string {
+		l, _ := os.Readlink(socket)
+		_, id, _ := strings.Cut(filepath.Base(l), ".tether.")
+		return id
+	}
+	waitHolder := func(when, want string) {
+		t.Helper()
+		for deadline := time.Now().Add(10 * time.Second); holder() != want; time.Sleep(50 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: socket leads to %q, not %q", when, holder(), want)
+			}
+		}
+	}
+	sign := func(when string) {
+		t.Helper()
+		if out, err := home.remote(t, "echo hello | gpg --batch --no-autostart --clearsign"); err != nil || !strings.Contains(out, "BEGIN PGP SIGNATURE") {
+			t.Fatalf("remote signing failed %s: %v\n%s", when, err, out)
+		}
+	}
+	usedBy := func(who string) func(api.Status) bool {
+		return func(st api.Status) bool {
+			f := fwd(st, "dev", "gpg-agent")
+			return f.State == api.StateUp && f.UsedBy == who
+		}
+	}
+
+	home.call(t, api.MethodForwardAdd, api.ForwardParams{Host: "dev", Spec: "gpg-agent"}, nil)
+	home.waitFor(t, "home holds", usedBy(""))
+	waitHolder("home turned gpg on", gpg.MachineID())
+	sign("from home")
+
+	// Turning gpg on at the office takes it over; home stands by.
+	office.call(t, api.MethodForwardAdd, api.ForwardParams{Host: "dev", Spec: "gpg-agent"}, nil)
+	office.waitFor(t, "office holds", usedBy(""))
+	home.waitFor(t, "home sees office", usedBy("office"))
+	waitHolder("office turned gpg on", officeID)
+	sign("from office")
+	var res api.DoctorResult
+	home.call(t, api.MethodDoctor, api.DoctorParams{Host: "dev"}, &res)
+	if c := findCheck(res, "gpg uses"); c.Status != api.CheckOK || !strings.HasPrefix(c.Detail, "office's agent") {
+		t.Errorf("home's doctor: gpg uses = %+v", c)
+	}
+
+	// Both reconnect on their own: neither takes over from the other, even
+	// if home comes back first and finds office's socket dead for a moment.
+	home.srv.Stop()
+	home.waitFor(t, "connection lost", func(st api.Status) bool { return host(st, "dev").State == api.StateError })
+	home.srv.Restart(t)
+	home.waitFor(t, "home back, standing by", usedBy("office"))
+	office.waitFor(t, "office back, holding", usedBy(""))
+	time.Sleep(gpgGrace + 4*gpgCheckInterval)
+	if id := holder(); id != officeID {
+		t.Fatalf("after reconnecting, socket leads to %q, not office", id)
+	}
+	sign("after reconnecting")
+
+	// Home asks for it back.
+	home.call(t, api.MethodGPGClaim, api.GPGClaimParams{Host: "dev"}, nil)
+	home.waitFor(t, "home holds again", usedBy(""))
+	waitHolder("home claimed", gpg.MachineID())
+	office.waitFor(t, "office sees home", usedBy(homeName))
+	sign("after home claims")
+
+	// Home turning gpg off hands it to office, at once.
+	home.call(t, api.MethodForwardRemove, api.ForwardParams{Host: "dev", Spec: "gpg-agent"}, nil)
+	waitHolder("home let go", officeID)
+	office.waitFor(t, "office holds after handover", usedBy(""))
+	sign("after handover")
+
+	// A machine that vanishes without letting go (asleep, off the network)
+	// is replaced once it has been silent for the grace period.
+	ghost := filepath.Join(filepath.Dir(socket), filepath.Base(socket)+".tether.ghost-cccccc")
+	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: ghost, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.SetUnlinkOnClose(false)
+	l.Close()
+	t.Cleanup(func() { os.Remove(ghost) })
+	if err := os.Symlink(ghost, socket+".tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(socket+".tmp", socket); err != nil {
+		t.Fatal(err)
+	}
+	office.waitFor(t, "office sees the ghost", usedBy("ghost"))
+	start := time.Now()
+	office.waitFor(t, "office takes over from the ghost", usedBy(""))
+	if waited := time.Since(start); waited < gpgGrace-time.Second {
+		t.Errorf("took over after %v, before the grace period", waited)
+	}
+	sign("after taking over from a vanished machine")
 }

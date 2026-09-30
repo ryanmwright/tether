@@ -27,9 +27,10 @@ const doctorTimeout = 30 * time.Second
 type doctor struct {
 	host, dest     string
 	useGPG, gpgSSH bool
-	mountHere      bool // remote directories mounted on this machine
-	mountThere     bool // local directories mounted on the remote
-	local          bool // the host is this machine
+	gpgID          string // this machine's name in remote gpg socket paths
+	mountHere      bool   // remote directories mounted on this machine
+	mountThere     bool   // local directories mounted on the remote
+	local          bool   // the host is this machine
 	kube           *kube.Options
 	kubeTargets    []kube.Source // claims mounted from the host
 	useUSB         bool          // USB devices shared with the host
@@ -52,6 +53,7 @@ func (d *Daemon) handleDoctor(ctx context.Context, params json.RawMessage) (any,
 	dr := &doctor{host: p.Host, dest: host.SSH, local: host.Local, usbHelper: d.usb.Port}
 	if ok {
 		s = d.sessions[p.Host].s
+		dr.gpgID = s.gpgID
 		// Check gpg if anything could forward it to this host.
 		for _, prof := range d.cfg.Profiles {
 			if prof.Host == p.Host {
@@ -379,6 +381,7 @@ func (dr *doctor) checkRemoteGPG(ctx context.Context, m *openssh.Master) {
 	}
 	dr.add("remote", "gpg", api.CheckOK, info.Version, "")
 	dr.add("remote", "agent socket", api.CheckOK, info.Dirs["agent-socket"], "")
+	dr.checkGPGHolder(ctx, m)
 
 	if units := info.CompetingUnits(); len(units) > 0 {
 		dr.add("remote", "remote gpg-agent", api.CheckWarn,
@@ -412,6 +415,29 @@ func (dr *doctor) checkRemoteGPG(ctx context.Context, m *openssh.Master) {
 	if dr.gpgSSH {
 		dr.add("remote", "ssh socket", api.CheckOK, info.Dirs["agent-ssh-socket"],
 			"remote shells need SSH_AUTH_SOCK set to this path: export SSH_AUTH_SOCK=\"$(gpgconf --list-dirs agent-ssh-socket)\" (the NixOS module does this)")
+	}
+}
+
+// checkGPGHolder says whose agent gpg on the host uses.
+func (dr *doctor) checkGPGHolder(ctx context.Context, m *openssh.Master) {
+	out, err := m.Run(ctx, gpg.RemoteScript, gpg.RemoteCommand(gpg.ModeStatus, dr.gpgID, gpg.KindAgent))
+	if err != nil {
+		dr.add("remote", "gpg uses", api.CheckWarn, "couldn't check: "+err.Error(), "")
+		return
+	}
+	sock := gpg.ParseSockets(string(out))[gpg.KindAgent]
+	use := "tether gpg use " + dr.host
+	switch name := gpg.HolderName(sock.Holder); {
+	case sock.Holder == "":
+		dr.add("remote", "gpg uses", api.CheckSkip, "no forwarded agent now; gpg there would start its own, without your keys", "")
+	case sock.Holder == dr.gpgID:
+		dr.add("remote", "gpg uses", api.CheckOK, "this machine's agent", "")
+	case sock.Holder == gpg.HolderOther:
+		dr.add("remote", "gpg uses", api.CheckWarn, name+", which doesn't have your keys", use)
+	case !sock.Alive:
+		dr.add("remote", "gpg uses", api.CheckWarn, name+"'s agent, which isn't answering (asleep or offline?)", use)
+	default:
+		dr.add("remote", "gpg uses", api.CheckOK, name+"'s agent, forwarded from there; "+use+" to use this machine's", "")
 	}
 }
 

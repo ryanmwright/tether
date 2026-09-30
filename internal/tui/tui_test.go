@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -841,5 +842,31 @@ func TestBrowseLocal(t *testing.T) {
 	m = press(t, m, ".")
 	if s := screen(m); !strings.Contains(s, ".git/") {
 		t.Errorf("hidden directories once . is typed:\n%s", s)
+	}
+}
+
+func TestGPGStandby(t *testing.T) {
+	m, fc := newModel(t)
+	if m = press(t, moveTo(t, m, "dev"), "G"); !strings.Contains(screen(m), "already uses this machine's keys") {
+		t.Errorf("G while holding:\n%s", screen(m))
+	}
+	if m = press(t, moveTo(t, m, "lab"), "G"); !strings.Contains(screen(m), "press g to forward it") {
+		t.Errorf("G without gpg:\n%s", screen(m))
+	}
+
+	st := sampleStatus
+	st.Hosts = slices.Clone(sampleStatus.Hosts)
+	st.Hosts[0].Forwards = slices.Clone(sampleStatus.Hosts[0].Forwards)
+	st.Hosts[0].Forwards[2].UsedBy = "office"
+	m = update(t, m, statusMsg(st))
+	s := screen(m)
+	for _, want := range []string{"gpg on dev uses office's keys", "press G", "standing by — in use by office"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("standby screen lacks %q:\n%s", want, s)
+		}
+	}
+	m = press(t, moveTo(t, m, "dev"), "G")
+	if got, want := fc.last(), (call{api.MethodGPGClaim, api.GPGClaimParams{Host: "dev"}}); !reflect.DeepEqual(got, want) {
+		t.Errorf("G on standby called %+v", got)
 	}
 }

@@ -121,7 +121,40 @@ func Summary(st api.Status) (Look, string) {
 		}
 		text += fmt.Sprintf(" · %d/%d %s active", active, len(st.Profiles), plural(len(st.Profiles), "profile", "profiles"))
 	}
+	for _, h := range st.Hosts {
+		if by := gpgUsedBy(h); by != "" {
+			text += " · gpg on " + h.Name + " in use by " + by
+		}
+	}
 	return look, text
+}
+
+// gpgOn reports whether this machine's gpg-agent is forwarded to h.
+func gpgOn(h api.HostStatus) bool {
+	for _, f := range h.Forwards {
+		if isGPG(f) && f.State == api.StateUp {
+			return true
+		}
+	}
+	return false
+}
+
+// gpgUsedBy is what gpg on h uses instead of this machine's forwarded
+// agent: another machine's, or its own; empty if it uses this one's, or
+// this one's isn't forwarded.
+func gpgUsedBy(h api.HostStatus) string {
+	for _, f := range h.Forwards {
+		if isGPG(f) && f.State == api.StateUp && f.UsedBy != "" {
+			return f.UsedBy
+		}
+	}
+	return ""
+}
+
+func isGPG(f api.ForwardStatus) bool { return f.Spec == "gpg-agent" || f.Spec == "gpg-ssh" }
+
+func gpgClaimAction(host string) *Action {
+	return &Action{Method: api.MethodGPGClaim, Params: api.GPGClaimParams{Host: host}, Done: "use this machine's gpg keys on " + host}
 }
 
 func plural(n int, one, many string) string {
@@ -138,6 +171,12 @@ func Build(st api.Status) []Item {
 	if st.ConfigError != "" {
 		first, _, _ := strings.Cut(st.ConfigError, "\n")
 		items = append(items, label("config-error", "⚠ config error: "+first))
+	}
+	// A host using another machine's keys is worth a click from the top.
+	for _, h := range st.Hosts {
+		if by := gpgUsedBy(h); by != "" {
+			items = append(items, action("gpg-claim:"+h.Name, "⇄ Use this machine's gpg keys on "+h.Name+" (in use by "+by+")", gpgClaimAction(h.Name)))
+		}
 	}
 	items = append(items, separator("sep-hosts"))
 	if len(st.Hosts) == 0 {
@@ -247,6 +286,9 @@ func hostItem(h api.HostStatus, usb []api.USBDevice) Item {
 		gpg.Action = &Action{Method: api.MethodForwardAdd, Params: api.ForwardParams{Host: h.Name, Spec: "gpg-agent"}, Done: "forward gpg-agent to " + h.Name}
 	}
 	children = append(children, gpg)
+	if by := gpgUsedBy(h); by != "" {
+		children = append(children, action(id+":gpg-claim", "Use this machine's gpg keys (in use by "+by+")", gpgClaimAction(h.Name)))
+	}
 	if h.AdHoc {
 		children = append(children, action(id+":forget", "Forget this host", &Action{Method: api.MethodHostRemove, Params: api.HostParams{Name: h.Name}, Done: "forget " + h.Name}))
 	}
@@ -263,6 +305,8 @@ func forwardItem(id, host string, f api.ForwardStatus) Item {
 	switch {
 	case f.Error != "":
 		title += " — " + f.Error
+	case f.UsedBy != "" && f.State == api.StateUp:
+		title = "◑ " + strings.TrimPrefix(title, stateMark[f.State]+" ") + " — standing by, in use by " + f.UsedBy
 	case f.Target == "unreachable":
 		title += " — ⚠ target unreachable"
 	case f.Address != "":

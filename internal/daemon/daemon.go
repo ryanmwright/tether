@@ -50,6 +50,9 @@ type Options struct {
 	// RecentFile keeps the claims mounted lately across restarts; if empty,
 	// they're only kept in memory.
 	RecentFile string
+	// GPGMachine names this machine in remote gpg socket paths (default:
+	// gpg.MachineID).
+	GPGMachine string
 }
 
 type Daemon struct {
@@ -171,6 +174,7 @@ func Run(ctx context.Context, opts Options) error {
 	srv.Handle(api.MethodMountRemove, d.handleMountRemove)
 	srv.Handle(api.MethodUSBAttach, d.handleUSBAttach)
 	srv.Handle(api.MethodUSBDetach, d.handleUSBDetach)
+	srv.Handle(api.MethodGPGClaim, d.handleGPGClaim)
 	srv.Handle(api.MethodKubeList, d.handleKubeList)
 	srv.Handle(api.MethodKubeGC, d.handleKubeGC)
 	srv.Handle(api.MethodKubeTargets, d.handleKubeTargets)
@@ -342,6 +346,10 @@ func (d *Daemon) hostNames() []string {
 func (d *Daemon) startSession(name string) {
 	ctlPath := filepath.Join(filepath.Dir(d.opts.SocketPath), "ctl", name)
 	s := newSession(name, ctlPath, d.opts.SSH, d.usb, d.log, d.notify)
+	s.gpgID = d.opts.GPGMachine
+	if s.gpgID == "" {
+		s.gpgID = gpg.MachineID()
+	}
 	ctx, cancel := context.WithCancel(d.ctx)
 	h := &sessionHandle{s: s, cancel: cancel, done: make(chan struct{})}
 	d.sessions[name] = h
@@ -528,6 +536,7 @@ func (d *Daemon) handleUp(_ context.Context, params json.RawMessage) (any, error
 		d.upHosts[t.Name] = true
 	}
 	d.recompute()
+	d.sessions[t.Host].s.claimGPG() // using the host here means using this machine's keys there
 	d.sessions[t.Host].s.retryNow()
 	d.log.Info("up", "kind", t.Kind, "name", t.Name)
 	t.Generation = d.gen.Load()
@@ -642,6 +651,9 @@ func (d *Daemon) handleForwardAdd(ctx context.Context, params json.RawMessage) (
 		d.rememberForward(p.Host, api.RecentForward{Spec: key, Label: wf.label})
 	}
 	d.recompute()
+	if wf.gpgKind != "" {
+		d.sessions[p.Host].s.claimGPG()
+	}
 	d.sessions[p.Host].s.retryNow()
 	d.log.Info("ad-hoc forward added", "host", p.Host, "forward", key)
 	return api.ForwardResult{Host: p.Host, Spec: key, Generation: d.gen.Load()}, nil
