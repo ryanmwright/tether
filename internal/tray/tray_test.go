@@ -150,11 +150,13 @@ func TestBuildUSB(t *testing.T) {
 			}},
 			{Name: "lab", State: api.StateUp, USB: []api.USBStatus{
 				{Device: "0627:0001", Profiles: []string{"work"}, State: api.StateError, Error: "no USB device 0627:0001 plugged in"},
+				{Device: "0403:6001", BusID: "1-3", Profiles: []string{"work"}, State: api.StateUp},
 			}},
 		},
 		USB: []api.USBDevice{
 			{BusID: "1-1", ID: "1050:0407", Name: "Yubico YubiKey", Host: "dev"},
 			{BusID: "1-2", ID: "046d:c52b", Name: "Logitech Receiver"},
+			{BusID: "1-3", ID: "0403:6001", Name: "FT232 Serial", Host: "lab"},
 		},
 	}
 	items := Build(st)
@@ -166,9 +168,14 @@ func TestBuildUSB(t *testing.T) {
 		it.Action.Params != (api.USBParams{Host: "dev", Device: "1-1"}) {
 		t.Errorf("unshare = %+v", it)
 	}
-	// It can't be shared with a second host while it's on dev.
-	if it := find(items, "usb:1-1:lab"); it == nil || it.Checked || it.Enabled || it.Action != nil {
-		t.Errorf("share elsewhere = %+v", it)
+	// Another host takes it from dev in one step.
+	if it := find(items, "usb:1-1:lab"); it == nil || it.Checked || !it.Enabled || it.Action.Method != api.MethodUSBAttach ||
+		it.Action.Params != (api.USBParams{Host: "lab", Device: "1-1", Move: true}) {
+		t.Errorf("move to lab = %+v", it)
+	}
+	// One a profile shares stays put.
+	if it := find(items, "usb:1-3:dev"); it == nil || it.Checked || it.Enabled || it.Action != nil {
+		t.Errorf("profile's device elsewhere = %+v", it)
 	}
 	if it := find(items, "usb:1-2"); it == nil || it.Title != "○ Logitech Receiver (046d:c52b)" {
 		t.Errorf("free device = %+v", it)

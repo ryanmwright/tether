@@ -840,7 +840,7 @@ func (d *Daemon) usbParams(params json.RawMessage) (api.USBParams, usbip.Spec, e
 	return p, spec, nil
 }
 
-func (d *Daemon) handleUSBAttach(_ context.Context, params json.RawMessage) (any, error) {
+func (d *Daemon) handleUSBAttach(ctx context.Context, params json.RawMessage) (any, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	p, spec, err := d.usbParams(params)
@@ -848,16 +848,41 @@ func (d *Daemon) handleUSBAttach(_ context.Context, params json.RawMessage) (any
 		return nil, err
 	}
 	// A device can only be in one place: refuse a second host up front
-	// rather than failing later.
-	if dev, err := spec.Find(d.usb.Devices()); err == nil {
-		for name, h := range d.sessions {
-			if name == p.Host {
+	// rather than failing later, or with Move, take it from the first.
+	title := string(spec)
+	dev, findErr := spec.Find(d.usb.Devices())
+	if findErr == nil {
+		title = dev.Title()
+	}
+	moved := false
+	for _, name := range slices.Sorted(maps.Keys(d.sessions)) {
+		if name == p.Host {
+			continue
+		}
+		for _, u := range d.sessions[name].s.status(config.Host{}).USB {
+			if u.Device != string(spec) && (findErr != nil || u.BusID != dev.BusID) {
 				continue
 			}
-			for _, u := range h.s.status(config.Host{}).USB {
-				if u.BusID == dev.BusID || spec.Matches(dev) && u.Device == string(spec) {
-					return nil, rpc.Errorf(api.CodeInvalidConfig, "%s is already shared with %s", dev.Title(), name)
-				}
+			switch {
+			case !u.AdHoc:
+				return nil, rpc.Errorf(api.CodeInvalidConfig, "%s is shared with %s by profile %s", title, name, strings.Join(u.Profiles, ", "))
+			case !p.Move:
+				return nil, rpc.Errorf(api.CodeInvalidConfig, "%s is already shared with %s", title, name)
+			}
+			delete(d.adhocUSB[name], u.Device)
+			moved = true
+			d.log.Info("ad-hoc USB device moving", "from", name, "to", p.Host, "usb", u.Device)
+		}
+	}
+	if moved {
+		d.recompute()
+		if findErr == nil {
+			// Let the other host give it back before this one asks for it.
+			d.mu.Unlock()
+			waitUSBReleased(ctx, dev.BusID)
+			d.mu.Lock()
+			if _, ok := d.sessions[p.Host]; !ok {
+				return nil, rpc.Errorf(api.CodeNotFound, "no host named %q", p.Host)
 			}
 		}
 	}
@@ -869,6 +894,23 @@ func (d *Daemon) handleUSBAttach(_ context.Context, params json.RawMessage) (any
 	d.sessions[p.Host].s.retryNow()
 	d.log.Info("ad-hoc USB device added", "host", p.Host, "usb", spec)
 	return api.USBResult{Host: p.Host, Device: string(spec), Generation: d.gen.Load()}, nil
+}
+
+// waitUSBReleased waits, up to usbReleaseWait, until the device at busid is
+// no longer attached to a remote.
+func waitUSBReleased(ctx context.Context, busid string) {
+	ctx, cancel := context.WithTimeout(ctx, usbReleaseWait)
+	defer cancel()
+	for {
+		if dev, err := usbip.Read(busid); err != nil || dev.Status != usbip.StatusUsed {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 func (d *Daemon) handleUSBDetach(_ context.Context, params json.RawMessage) (any, error) {

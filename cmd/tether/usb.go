@@ -10,6 +10,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -71,7 +72,7 @@ func newUSBListCmd(g *globalFlags) *cobra.Command {
 }
 
 func newUSBAttachCmd(g *globalFlags) *cobra.Command {
-	var noWait bool
+	var noWait, move bool
 	var timeout time.Duration
 	cmd := &cobra.Command{
 		Use:   "attach HOST DEVICE",
@@ -91,7 +92,10 @@ func newUSBAttachCmd(g *globalFlags) *cobra.Command {
 				}
 			}
 			var res api.USBResult
-			if err := c.Call(ctx, api.MethodUSBAttach, api.USBParams{Host: args[0], Device: args[1]}, &res); err != nil {
+			if err := c.Call(ctx, api.MethodUSBAttach, api.USBParams{Host: args[0], Device: args[1], Move: move}, &res); err != nil {
+				if !move && strings.Contains(err.Error(), "already shared with") {
+					return fmt.Errorf("%w (--move takes it from there)", err)
+				}
 				return err
 			}
 			if noWait {
@@ -122,6 +126,7 @@ func newUSBAttachCmd(g *globalFlags) *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&noWait, "no-wait", false, "return without waiting for the result")
+	cmd.Flags().BoolVar(&move, "move", false, "take the device from the host it's shared with, if shared ad hoc")
 	cmd.Flags().DurationVar(&timeout, "timeout", 60*time.Second, "how long to wait")
 	return cmd
 }

@@ -820,7 +820,11 @@ usb = ["1050:0407"]
 The tray's "USB devices" section and the terminal UI's USB DEVICES list do
 the same with a click or `enter`.
 
-A device can be shared with one host at a time. Sharing comes and goes with
+A device can be shared with one host at a time. To move it to another, pick
+that host in the tray (or in the host's "Share a USB device" list in the
+terminal UI), or run `tether usb attach --move HOST DEVICE`: it's detached
+from the first host and attached to the new one in one step. One a profile
+shares stays put until the profile is deactivated. Sharing comes and goes with
 the connection, like mounts: when the connection drops, the device comes
 back here, and it's attached again after reconnecting. If the remote
 detaches it, tether attaches it again within a couple of seconds; if you
@@ -1084,6 +1088,7 @@ tether tui --pvc HOST             ... in the claim picker
 tether tui --k8s HOST             ... in the Kubernetes service/pod picker
 tether usb list                   USB devices here, and where they're shared
 tether usb attach HOST DEVICE     share a device (bus ID or vendor:product)
+  --move                          ... taking it from the host it's shared with
 tether usb detach HOST DEVICE     stop sharing it
 tether usbip-helper               the privileged USB/IP helper (as root)
   --allow-user USER               who may share devices (repeatable)

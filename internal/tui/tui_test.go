@@ -767,10 +767,16 @@ func TestUSBList(t *testing.T) {
 		{BusID: "1-2", ID: "1050:0407", Name: "YubiKey"},
 		{BusID: "2-4", ID: "0403:6001", Name: "FT232 Serial"},
 	}
+	st.Hosts = slices.Clone(st.Hosts)
+	for i, h := range st.Hosts {
+		if h.Name == "lab" {
+			st.Hosts[i].USB = []api.USBStatus{{Device: "046d:0a64", BusID: "1-1", Profiles: []string{"work"}, State: api.StateUp}}
+		}
+	}
 	m = update(t, m, statusMsg(st))
 	m = press(t, press(t, moveTo(t, m, "dev"), "a"), "u")
 	s := screen(m)
-	for _, want := range []string{"SHARE A USB DEVICE WITH dev", "Headset  (shared with lab)", "1050:0407  YubiKey", "FT232 Serial"} {
+	for _, want := range []string{"SHARE A USB DEVICE WITH dev", "Headset  (shared with lab by profile work)", "1050:0407  YubiKey", "FT232 Serial"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("list missing %q:\n%s", want, s)
 		}
@@ -779,14 +785,30 @@ func TestUSBList(t *testing.T) {
 	if m.usb.cursor != 1 {
 		t.Errorf("cursor = %d", m.usb.cursor)
 	}
-	m = press(t, m, "up") // the shared one: can't share it again
+	m = press(t, m, "up") // the shared one: a profile put it there, so it stays
 	m = press(t, m, "enter")
-	if !m.flashErr || !strings.Contains(m.flash, "already shared with lab") || len(fc.calls) != 0 {
-		t.Errorf("sharing a shared device: flash %q calls %+v", m.flash, fc.calls)
+	if !m.flashErr || !strings.Contains(m.flash, "shared with lab by profile work") || len(fc.calls) != 0 {
+		t.Errorf("moving a profile's device: flash %q calls %+v", m.flash, fc.calls)
 	}
 	m = press(t, press(t, press(t, m, "down"), "down"), "enter")
 	if got := fc.last(); got != (call{api.MethodUSBAttach, api.USBParams{Host: "dev", Device: "2-4"}}) {
 		t.Errorf("got %+v", got)
+	}
+
+	// Shared with lab ad hoc, it moves here in one step.
+	for i, h := range st.Hosts {
+		if h.Name == "lab" {
+			st.Hosts[i].USB = []api.USBStatus{{Device: "1-1", BusID: "1-1", AdHoc: true, State: api.StateUp}}
+		}
+	}
+	m = update(t, m, statusMsg(st))
+	m = press(t, press(t, moveTo(t, m, "dev"), "a"), "u")
+	if s := screen(m); !strings.Contains(s, "Headset  (shared with lab; enter moves it here)") {
+		t.Errorf("movable device not offered:\n%s", s)
+	}
+	m = press(t, press(t, m, "up"), "enter")
+	if got := fc.last(); got != (call{api.MethodUSBAttach, api.USBParams{Host: "dev", Device: "1-1", Move: true}}) {
+		t.Errorf("move = %+v", got)
 	}
 }
 

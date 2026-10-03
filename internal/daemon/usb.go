@@ -21,6 +21,9 @@ import (
 const (
 	usbPollInterval = 2 * time.Second
 	usbAttachWait   = 5 * time.Second
+	// usbReleaseWait is how long moving a device waits for the host it's
+	// leaving to give it back: a remote detach, then the helper's.
+	usbReleaseWait = 15 * time.Second
 )
 
 // usbBackend is this machine's side of USB sharing: the devices plugged in,
@@ -209,7 +212,11 @@ func (s *session) attachUSB(ctx context.Context, m *openssh.Master, rt *usbRunti
 	ctx, cancel := context.WithTimeout(ctx, mountStartTimeout)
 	defer cancel()
 	if dev.Status == usbip.StatusUsed {
-		return fmt.Errorf("%s is attached elsewhere", dev.BusID)
+		// The polled list may predate its release, e.g. by a host it was
+		// just moved from.
+		if fresh, err := usbip.Read(dev.BusID); err != nil || fresh.Status == usbip.StatusUsed {
+			return fmt.Errorf("%s is attached elsewhere", dev.BusID)
+		}
 	}
 	port, err := s.usb.Port(ctx)
 	if err != nil {

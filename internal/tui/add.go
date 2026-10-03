@@ -409,9 +409,16 @@ func (m Model) usbKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		d := devs[m.usb.cursor]
-		if d.Host != "" {
+		switch u := m.sharedUSB(d); {
+		case d.Host == m.usb.host:
 			m.flash, m.flashErr = fmt.Sprintf("%s is already shared with %s", d.Title(), d.Host), true
 			return m, nil
+		case d.Host != "" && !u.AdHoc:
+			m.flash, m.flashErr = fmt.Sprintf("%s is shared with %s by profile %s; deactivate the profile to move it", d.Title(), d.Host, strings.Join(u.Profiles, ", ")), true
+			return m, nil
+		case d.Host != "":
+			m.mode = modeNormal
+			return m, m.call("moving "+d.Title()+" to "+m.usb.host, api.MethodUSBAttach, api.USBParams{Host: m.usb.host, Device: d.BusID, Move: true})
 		}
 		m.mode = modeNormal
 		return m, m.share(d, m.usb.host)
@@ -426,13 +433,20 @@ func (m Model) usbView() []string {
 	}
 	for i, d := range m.status.USB {
 		text := fmt.Sprintf("%-8s %-10s %s", d.BusID, d.ID, d.Name)
-		if d.Host != "" {
+		u := m.sharedUSB(d)
+		movable := d.Host != "" && d.Host != m.usb.host && u.AdHoc
+		switch {
+		case movable:
+			text += "  (shared with " + d.Host + "; enter moves it here)"
+		case d.Host != "" && !u.AdHoc:
+			text += "  (shared with " + d.Host + " by profile " + strings.Join(u.Profiles, ", ") + ")"
+		case d.Host != "":
 			text += "  (shared with " + d.Host + ")"
 		}
 		switch {
 		case i == m.usb.cursor:
 			lines = append(lines, "▸ "+styleSelected.Render(text))
-		case d.Host != "":
+		case d.Host != "" && !movable:
 			lines = append(lines, "  "+styleFaint.Render(text))
 		default:
 			lines = append(lines, "  "+text)

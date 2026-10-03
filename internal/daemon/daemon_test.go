@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -233,7 +235,7 @@ func TestLogs(t *testing.T) {
 }
 
 func TestUSBRequests(t *testing.T) {
-	h := start(t, "[hosts.devbox]\nssh = \"devbox.invalid\"\n[profiles.work]\nhost = \"devbox\"\nusb = [\"1050:0407\"]\n")
+	h := start(t, "[hosts.devbox]\nssh = \"devbox.invalid\"\n[hosts.lab]\nssh = \"lab.invalid\"\n[profiles.work]\nhost = \"devbox\"\nusb = [\"1050:0407\"]\n")
 	c := h.client(t)
 	ctx := context.Background()
 	code := func(err error) int {
@@ -269,14 +271,40 @@ func TestUSBRequests(t *testing.T) {
 		t.Errorf("usb_unavailable = %q", st.USBUnavailable)
 	}
 
-	if err := c.Call(ctx, api.MethodUSBDetach, api.USBParams{Host: "devbox", Device: "1050:abcd"}, nil); err != nil {
+	// A device is in one place: another host gets it only by moving it.
+	usbOn := func(host string) []string {
+		var st api.Status
+		c.Call(ctx, api.MethodStatus, nil, &st)
+		var devs []string
+		for _, hs := range st.Hosts {
+			if hs.Name == host {
+				for _, u := range hs.USB {
+					devs = append(devs, u.Device)
+				}
+			}
+		}
+		return devs
+	}
+	if err := c.Call(ctx, api.MethodUSBAttach, api.USBParams{Host: "lab", Device: "1050:abcd"}, nil); code(err) != api.CodeInvalidConfig || !strings.Contains(err.Error(), "already shared with devbox") {
+		t.Errorf("second host: %v", err)
+	}
+	if err := c.Call(ctx, api.MethodUSBAttach, api.USBParams{Host: "lab", Device: "1050:abcd", Move: true}, nil); err != nil {
+		t.Fatalf("move: %v", err)
+	}
+	if on, lab := usbOn("devbox"), usbOn("lab"); slices.Contains(on, "1050:abcd") || !slices.Equal(lab, []string{"1050:abcd"}) {
+		t.Errorf("after moving: devbox %v, lab %v", on, lab)
+	}
+	if err := c.Call(ctx, api.MethodUSBAttach, api.USBParams{Host: "lab", Device: "1050:0407", Move: true}, nil); code(err) != api.CodeInvalidConfig || !strings.Contains(err.Error(), "by profile work") {
+		t.Errorf("moving a profile's device: %v", err)
+	}
+	if err := c.Call(ctx, api.MethodUSBDetach, api.USBParams{Host: "lab", Device: "1050:abcd"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	// Taking the profile down leaves nothing.
 	c.Call(ctx, api.MethodDown, api.TargetParams{Name: "work"}, nil)
 	st = api.Status{}
 	c.Call(ctx, api.MethodStatus, nil, &st)
-	if len(st.Hosts[0].USB) != 0 {
-		t.Errorf("after down: %+v", st.Hosts[0].USB)
+	if len(usbOn("devbox")) != 0 || len(usbOn("lab")) != 0 {
+		t.Errorf("after down: %+v", st.Hosts)
 	}
 }

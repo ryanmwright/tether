@@ -343,6 +343,9 @@ type HostParams struct {
 type USBParams struct {
 	Host   string `json:"host"`
 	Device string `json:"device"`
+	// Move, for usb.attach, takes the device from the host it's shared
+	// with, if that's ad hoc, rather than refusing.
+	Move bool `json:"move,omitempty"`
 }
 
 type USBResult struct {

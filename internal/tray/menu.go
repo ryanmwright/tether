@@ -465,6 +465,14 @@ func usbItems(st api.Status) []Item {
 	for _, d := range st.USB {
 		id := "usb:" + d.BusID
 		title := "○ " + d.Title()
+		// Where it's shared now, if anywhere; it can be moved from there
+		// unless a profile put it there.
+		holder, movable := "", false
+		for _, h := range st.Hosts {
+			if u, shared := sharedWith(h, d); shared {
+				holder, movable = h.Name, u.AdHoc
+			}
+		}
 		var children []Item
 		for _, h := range st.Hosts {
 			u, shared := sharedWith(h, d)
@@ -475,8 +483,10 @@ func usbItems(st api.Status) []Item {
 				it.Enabled = false
 			case shared:
 				it.Action = &Action{Method: api.MethodUSBDetach, Params: api.USBParams{Host: h.Name, Device: u.Device}, Done: "stop sharing " + d.Title() + " with " + h.Name}
-			case d.Host != "":
-				it.Enabled = false // it's elsewhere
+			case holder != "" && movable:
+				it.Action = &Action{Method: api.MethodUSBAttach, Params: api.USBParams{Host: h.Name, Device: d.BusID, Move: true}, Done: "move " + d.Title() + " to " + h.Name}
+			case holder != "" || d.Host != "":
+				it.Enabled = false // a profile has it elsewhere
 			default:
 				it.Action = &Action{Method: api.MethodUSBAttach, Params: api.USBParams{Host: h.Name, Device: d.BusID}, Done: "share " + d.Title() + " with " + h.Name}
 			}
