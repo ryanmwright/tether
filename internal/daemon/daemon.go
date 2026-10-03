@@ -938,7 +938,7 @@ func (d *Daemon) handleHostAdd(_ context.Context, params json.RawMessage) (any, 
 	if p.SSH == "" {
 		p.SSH = p.Name
 	}
-	if err := config.ValidateHost(p.Name, config.Host{SSH: p.SSH}); err != nil {
+	if err := config.ValidateHost(p.Name, config.Host{SSH: p.SSH, DisplayName: p.DisplayName}); err != nil {
 		return nil, rpc.Errorf(rpc.CodeInvalidParams, "%v", err)
 	}
 	d.mu.Lock()
@@ -952,7 +952,7 @@ func (d *Daemon) handleHostAdd(_ context.Context, params json.RawMessage) (any, 
 	if h, ok := d.adhocHosts[p.Name]; ok && h.SSH != p.SSH {
 		return nil, rpc.Errorf(api.CodeInvalidConfig, "ad-hoc host %q already connects to %s", p.Name, h.SSH)
 	}
-	d.adhocHosts[p.Name] = config.Host{SSH: p.SSH}
+	d.adhocHosts[p.Name] = config.Host{SSH: p.SSH, DisplayName: p.DisplayName}
 	if _, ok := d.sessions[p.Name]; !ok {
 		d.startSession(p.Name)
 	}

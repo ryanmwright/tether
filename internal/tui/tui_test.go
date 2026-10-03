@@ -892,3 +892,31 @@ func TestGPGStandby(t *testing.T) {
 		t.Errorf("G on standby called %+v", got)
 	}
 }
+
+// TestDisplayName checks that a host with a display name is shown by it,
+// with its ssh destination beside it, while calls still use its name.
+func TestDisplayName(t *testing.T) {
+	m, fc := newModel(t)
+	st := sampleStatus
+	st.Hosts = slices.Clone(st.Hosts)
+	st.Hosts[2].DisplayName = "Scratch VM" // scratch, at me@10.0.0.5
+	st.Profiles = append(slices.Clone(st.Profiles), api.ProfileStatus{Name: "tmp", Host: "scratch", State: api.StateDown})
+	m = update(t, m, statusMsg(st))
+	s := screen(m)
+	for _, want := range []string{"Scratch VM", "ssh me@10.0.0.5", "on Scratch VM"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("screen missing %q:\n%s", want, s)
+		}
+	}
+	m = press(t, moveTo(t, m, "scratch"), "enter")
+	if got := fc.last(); got != (call{api.MethodUp, api.TargetParams{Name: "scratch", Kind: api.TargetHost}}) {
+		t.Errorf("connect = %+v", got)
+	}
+	if !strings.Contains(m.flash, "connecting Scratch VM") {
+		t.Errorf("flash = %q", m.flash)
+	}
+	m = press(t, press(t, moveTo(t, m, "scratch"), "a"), "l")
+	if s := screen(m); !strings.Contains(s, "FORWARD A LOCAL PORT TO A PORT ON Scratch VM") {
+		t.Errorf("form doesn't name the host:\n%s", s)
+	}
+}

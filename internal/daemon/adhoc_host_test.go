@@ -26,9 +26,9 @@ func TestAdHocHost(t *testing.T) {
 	}
 
 	var res api.TargetResult
-	sh.call(t, api.MethodHostAdd, api.HostParams{Name: "scratch", SSH: sshtest.HostAlias}, &res)
+	sh.call(t, api.MethodHostAdd, api.HostParams{Name: "scratch", SSH: sshtest.HostAlias, DisplayName: "Scratch box"}, &res)
 	st := sh.waitFor(t, "ad-hoc host up", func(st api.Status) bool { return host(st, "scratch").State == api.StateUp })
-	if hs := host(st, "scratch"); !hs.AdHoc || hs.SSH != sshtest.HostAlias {
+	if hs := host(st, "scratch"); !hs.AdHoc || hs.SSH != sshtest.HostAlias || hs.Title() != "Scratch box" {
 		t.Errorf("host = %+v", hs)
 	}
 	if host(st, "cfg").AdHoc {

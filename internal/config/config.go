@@ -43,6 +43,10 @@ type Host struct {
 	// ~/.ssh/config. Defaults to the host's name.
 	SSH         string `toml:"ssh"`
 	Autoconnect bool   `toml:"autoconnect"`
+	// DisplayName is shown for the host in the tray and terminal UI instead
+	// of its name, e.g. when the name is an IP address. Commands still take
+	// the name.
+	DisplayName string `toml:"display_name"`
 	// Local makes this host stand for this machine, with no SSH: only PVC
 	// mounts, with kubectl run here.
 	Local bool `toml:"local"`
@@ -241,6 +245,9 @@ func ValidateHost(name string, h Host) error {
 	var errs []error
 	if !namePattern.MatchString(name) {
 		errs = append(errs, fmt.Errorf("hosts.%s: name must match %s", name, namePattern))
+	}
+	if strings.ContainsFunc(h.DisplayName, unicode.IsControl) {
+		errs = append(errs, fmt.Errorf("hosts.%s.display_name: no control characters or line breaks", name))
 	}
 	if err := h.Kube.Options().Validate(); err != nil {
 		errs = append(errs, fmt.Errorf("hosts.%s.kube: %w", name, err))

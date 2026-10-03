@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"time"
 
@@ -20,6 +21,7 @@ func newHostCmd(g *globalFlags) *cobra.Command {
 
 	var noWait bool
 	var timeout time.Duration
+	var displayName string
 	add := &cobra.Command{
 		Use:   "add NAME [SSH-DEST]",
 		Short: "Add a host and connect to it",
@@ -30,7 +32,7 @@ func newHostCmd(g *globalFlags) *cobra.Command {
 			"  tether host add scratch me@10.0.0.5",
 		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			p := api.HostParams{Name: args[0]}
+			p := api.HostParams{Name: args[0], DisplayName: displayName}
 			if len(args) == 2 {
 				p.SSH = args[1]
 			}
@@ -51,13 +53,14 @@ func newHostCmd(g *globalFlags) *cobra.Command {
 				return err
 			}
 			if noWait {
-				fmt.Fprintf(cmd.OutOrStdout(), "%s: starting\n", res.Name)
+				fmt.Fprintf(cmd.OutOrStdout(), "%s: starting\n", cmp.Or(displayName, res.Name))
 				return nil
 			}
 			return waitTargets(cmd, next, []api.TargetResult{res}, timeout)
 		},
 	}
 	add.Flags().BoolVar(&noWait, "no-wait", false, "return without waiting for the result")
+	add.Flags().StringVar(&displayName, "display-name", "", "name to show for it in the tray and terminal UI")
 	add.Flags().DurationVar(&timeout, "timeout", 45*time.Second, "how long to wait")
 
 	rm := &cobra.Command{

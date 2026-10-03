@@ -578,6 +578,7 @@ func (s *session) status(host config.Host) api.HostStatus {
 	hs := api.HostStatus{
 		Name:        s.name,
 		SSH:         host.SSH,
+		DisplayName: host.DisplayName,
 		Autoconnect: host.Autoconnect,
 		Local:       host.Local,
 		State:       s.state,

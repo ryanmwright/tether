@@ -123,7 +123,7 @@ func Summary(st api.Status) (Look, string) {
 	}
 	for _, h := range st.Hosts {
 		if by := gpgUsedBy(h); by != "" {
-			text += " · gpg on " + h.Name + " in use by " + by
+			text += " · gpg on " + h.Title() + " in use by " + by
 		}
 	}
 	return look, text
@@ -153,8 +153,8 @@ func gpgUsedBy(h api.HostStatus) string {
 
 func isGPG(f api.ForwardStatus) bool { return f.Spec == "gpg-agent" || f.Spec == "gpg-ssh" }
 
-func gpgClaimAction(host string) *Action {
-	return &Action{Method: api.MethodGPGClaim, Params: api.GPGClaimParams{Host: host}, Done: "use this machine's gpg keys on " + host}
+func gpgClaimAction(h api.HostStatus) *Action {
+	return &Action{Method: api.MethodGPGClaim, Params: api.GPGClaimParams{Host: h.Name}, Done: "use this machine's gpg keys on " + h.Title()}
 }
 
 func plural(n int, one, many string) string {
@@ -175,7 +175,7 @@ func Build(st api.Status) []Item {
 	// A host using another machine's keys is worth a click from the top.
 	for _, h := range st.Hosts {
 		if by := gpgUsedBy(h); by != "" {
-			items = append(items, action("gpg-claim:"+h.Name, "⇄ Use this machine's gpg keys on "+h.Name+" (in use by "+by+")", gpgClaimAction(h.Name)))
+			items = append(items, action("gpg-claim:"+h.Name, "⇄ Use this machine's gpg keys on "+h.Title()+" (in use by "+by+")", gpgClaimAction(h)))
 		}
 	}
 	items = append(items, separator("sep-hosts"))
@@ -216,22 +216,22 @@ func Build(st api.Status) []Item {
 
 func hostItem(h api.HostStatus, usb []api.USBDevice) Item {
 	id := "host:" + h.Name
-	title := fmt.Sprintf("%s %s", stateMark[h.State], h.Name)
+	title := fmt.Sprintf("%s %s", stateMark[h.State], h.Title())
 	if h.State != api.StateDown {
 		title += " (" + string(h.State) + ")"
 	}
 	target := api.TargetParams{Name: h.Name, Kind: api.TargetHost}
 	var children []Item
 	if h.State == api.StateDown {
-		children = append(children, action(id+":up", "Connect", &Action{Method: api.MethodUp, Params: target, Done: "connect " + h.Name}))
+		children = append(children, action(id+":up", "Connect", &Action{Method: api.MethodUp, Params: target, Done: "connect " + h.Title()}))
 	} else {
-		children = append(children, action(id+":down", "Disconnect", &Action{Method: api.MethodDown, Params: target, Done: "disconnect " + h.Name}))
+		children = append(children, action(id+":down", "Disconnect", &Action{Method: api.MethodDown, Params: target, Done: "disconnect " + h.Title()}))
 	}
 	if h.State == api.StateError {
 		if h.Error != "" {
 			children = append(children, label(id+":error", "✕ "+h.Error))
 		}
-		children = append(children, action(id+":retry", "Retry now", &Action{Method: api.MethodUp, Params: target, Done: "reconnect " + h.Name}))
+		children = append(children, action(id+":retry", "Retry now", &Action{Method: api.MethodUp, Params: target, Done: "reconnect " + h.Title()}))
 	}
 
 	if len(h.Forwards) > 0 || len(h.Mounts) > 0 || len(h.USB) > 0 {
@@ -281,16 +281,16 @@ func hostItem(h api.HostStatus, usb []api.USBDevice) Item {
 	}
 	gpg := Item{ID: id + ":gpg", Title: "Forward gpg-agent", Enabled: true, Checkable: true, Checked: gpgAdHoc}
 	if gpgAdHoc {
-		gpg.Action = &Action{Method: api.MethodForwardRemove, Params: api.ForwardParams{Host: h.Name, Spec: "gpg-agent"}, Done: "stop gpg-agent forwarding to " + h.Name}
+		gpg.Action = &Action{Method: api.MethodForwardRemove, Params: api.ForwardParams{Host: h.Name, Spec: "gpg-agent"}, Done: "stop gpg-agent forwarding to " + h.Title()}
 	} else {
-		gpg.Action = &Action{Method: api.MethodForwardAdd, Params: api.ForwardParams{Host: h.Name, Spec: "gpg-agent"}, Done: "forward gpg-agent to " + h.Name}
+		gpg.Action = &Action{Method: api.MethodForwardAdd, Params: api.ForwardParams{Host: h.Name, Spec: "gpg-agent"}, Done: "forward gpg-agent to " + h.Title()}
 	}
 	children = append(children, gpg)
 	if by := gpgUsedBy(h); by != "" {
-		children = append(children, action(id+":gpg-claim", "Use this machine's gpg keys (in use by "+by+")", gpgClaimAction(h.Name)))
+		children = append(children, action(id+":gpg-claim", "Use this machine's gpg keys (in use by "+by+")", gpgClaimAction(h)))
 	}
 	if h.AdHoc {
-		children = append(children, action(id+":forget", "Forget this host", &Action{Method: api.MethodHostRemove, Params: api.HostParams{Name: h.Name}, Done: "forget " + h.Name}))
+		children = append(children, action(id+":forget", "Forget this host", &Action{Method: api.MethodHostRemove, Params: api.HostParams{Name: h.Name}, Done: "forget " + h.Title()}))
 	}
 	return Item{ID: id, Title: title, Enabled: true, Children: children}
 }
@@ -339,7 +339,7 @@ func forwardItem(id, host string, f api.ForwardStatus) Item {
 }
 
 // addKinds are the things the Add submenu offers, in the terminal UI's
-// order; HOST is replaced by the host's name. local marks those offered on
+// order; HOST is replaced by the host's title. local marks those offered on
 // the local host.
 var addKinds = []struct {
 	kind, title string
@@ -383,7 +383,7 @@ func addItem(id string, h api.HostStatus, usb []api.USBDevice) Item {
 		if h.Local && !k.local {
 			continue
 		}
-		title := strings.ReplaceAll(k.title, "HOST", h.Name)
+		title := strings.ReplaceAll(k.title, "HOST", h.Title())
 		add.Children = append(add.Children, action(add.ID+":"+k.kind, title, &Action{Local: localAdd, Host: h.Name, Arg: k.kind}))
 	}
 	if !h.Local {
@@ -397,7 +397,7 @@ func addItem(id string, h api.HostStatus, usb []api.USBDevice) Item {
 			share := Item{ID: add.ID + ":usb", Title: "Share a USB device", Enabled: true}
 			for _, d := range free {
 				share.Children = append(share.Children, action(share.ID+":"+d.BusID, d.Title()+" at "+d.BusID, &Action{
-					Method: api.MethodUSBAttach, Params: api.USBParams{Host: h.Name, Device: d.BusID}, Done: "share " + d.Title() + " with " + h.Name,
+					Method: api.MethodUSBAttach, Params: api.USBParams{Host: h.Name, Device: d.BusID}, Done: "share " + d.Title() + " with " + h.Title(),
 				}))
 			}
 			add.Children = append(add.Children, share)
@@ -476,22 +476,22 @@ func usbItems(st api.Status) []Item {
 		var children []Item
 		for _, h := range st.Hosts {
 			u, shared := sharedWith(h, d)
-			it := Item{ID: id + ":" + h.Name, Title: "Share with " + h.Name, Enabled: true, Checkable: true, Checked: shared}
+			it := Item{ID: id + ":" + h.Name, Title: "Share with " + h.Title(), Enabled: true, Checkable: true, Checked: shared}
 			switch {
 			case shared && !u.AdHoc:
 				it.Title += " (profile " + strings.Join(u.Profiles, ", ") + ")"
 				it.Enabled = false
 			case shared:
-				it.Action = &Action{Method: api.MethodUSBDetach, Params: api.USBParams{Host: h.Name, Device: u.Device}, Done: "stop sharing " + d.Title() + " with " + h.Name}
+				it.Action = &Action{Method: api.MethodUSBDetach, Params: api.USBParams{Host: h.Name, Device: u.Device}, Done: "stop sharing " + d.Title() + " with " + h.Title()}
 			case holder != "" && movable:
-				it.Action = &Action{Method: api.MethodUSBAttach, Params: api.USBParams{Host: h.Name, Device: d.BusID, Move: true}, Done: "move " + d.Title() + " to " + h.Name}
+				it.Action = &Action{Method: api.MethodUSBAttach, Params: api.USBParams{Host: h.Name, Device: d.BusID, Move: true}, Done: "move " + d.Title() + " to " + h.Title()}
 			case holder != "" || d.Host != "":
 				it.Enabled = false // a profile has it elsewhere
 			default:
-				it.Action = &Action{Method: api.MethodUSBAttach, Params: api.USBParams{Host: h.Name, Device: d.BusID}, Done: "share " + d.Title() + " with " + h.Name}
+				it.Action = &Action{Method: api.MethodUSBAttach, Params: api.USBParams{Host: h.Name, Device: d.BusID}, Done: "share " + d.Title() + " with " + h.Title()}
 			}
 			if shared {
-				title = stateMark[u.State] + " " + d.Title() + " — " + h.Name
+				title = stateMark[u.State] + " " + d.Title() + " — " + h.Title()
 				if u.State != api.StateUp {
 					title += " (" + string(u.State) + ")"
 				}

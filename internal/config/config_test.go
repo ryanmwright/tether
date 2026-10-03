@@ -17,6 +17,9 @@ reconnect_backoff = "2s..30s"
 ssh = "devbox.lan"
 autoconnect = true
 
+[hosts."192.168.122.10"]
+display_name = "Build VM"
+
 [hosts.bastion]
 
 [profiles.work]
@@ -37,6 +40,9 @@ local = "~/mnt/src"
 	}
 	if h := c.Hosts["devbox"]; h.SSH != "devbox.lan" || !h.Autoconnect {
 		t.Errorf("devbox = %+v", h)
+	}
+	if h := c.Hosts["192.168.122.10"]; h.DisplayName != "Build VM" || h.SSH != "192.168.122.10" {
+		t.Errorf("VM = %+v", h)
 	}
 	if h := c.Hosts["bastion"]; h.SSH != "bastion" {
 		t.Errorf("ssh should default to the host name, got %q", h.SSH)
@@ -67,6 +73,7 @@ func TestParseErrors(t *testing.T) {
 		{"option injection", "[hosts.a]\nssh = \"-oProxyCommand=evil\"", []string{"hosts.a.ssh: invalid destination"}},
 		{"whitespace in ssh", "[hosts.a]\nssh = \"a b\"", []string{"hosts.a.ssh: invalid destination"}},
 		{"bad name", "[hosts.\"a b\"]", []string{`hosts.a b: name must match`}},
+		{"line break in display name", "[hosts.a]\ndisplay_name = \"a\\nb\"", []string{"hosts.a.display_name: no control characters"}},
 		{
 			"collects all profile errors",
 			"[profiles.p]\nforwards = [\"\"]\n[[profiles.p.mounts]]\ndirection = \"sideways\"",

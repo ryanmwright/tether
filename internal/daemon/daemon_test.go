@@ -109,7 +109,7 @@ func (h *harness) client(t *testing.T) *rpc.Client {
 }
 
 func TestStatusAndReload(t *testing.T) {
-	h := start(t, "[hosts.devbox]\nssh = \"devbox.invalid\"\n[profiles.work]\nhost = \"devbox\"\n")
+	h := start(t, "[hosts.devbox]\nssh = \"devbox.invalid\"\ndisplay_name = \"Dev box\"\n[profiles.work]\nhost = \"devbox\"\n")
 	c := h.client(t)
 	ctx := context.Background()
 
@@ -120,7 +120,8 @@ func TestStatusAndReload(t *testing.T) {
 	if st.Version != "test" || st.PID != os.Getpid() || st.ConfigError != "" {
 		t.Errorf("status = %+v", st)
 	}
-	if len(st.Hosts) != 1 || st.Hosts[0].Name != "devbox" || st.Hosts[0].SSH != "devbox.invalid" || st.Hosts[0].State != api.StateDown {
+	if len(st.Hosts) != 1 || st.Hosts[0].Name != "devbox" || st.Hosts[0].SSH != "devbox.invalid" || st.Hosts[0].State != api.StateDown ||
+		st.Hosts[0].DisplayName != "Dev box" {
 		t.Errorf("hosts = %+v", st.Hosts)
 	}
 	if len(st.Profiles) != 1 || st.Profiles[0].Host != "devbox" {

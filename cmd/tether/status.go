@@ -90,7 +90,14 @@ func printStatus(out io.Writer, st *api.Status) {
 
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	defer tw.Flush()
-	fmt.Fprintln(tw, "\nHOST\tSSH\tAUTO\tSTATE\tDETAIL")
+	// Other tables name hosts by their display names; this one pairs them
+	// with the names commands take.
+	named := slices.ContainsFunc(st.Hosts, func(h api.HostStatus) bool { return h.DisplayName != "" })
+	if named {
+		fmt.Fprintln(tw, "\nHOST\tDISPLAY NAME\tSSH\tAUTO\tSTATE\tDETAIL")
+	} else {
+		fmt.Fprintln(tw, "\nHOST\tSSH\tAUTO\tSTATE\tDETAIL")
+	}
 	var forwards bool
 	for _, h := range st.Hosts {
 		detail := h.Error
@@ -104,7 +111,11 @@ func printStatus(out io.Writer, st *api.Status) {
 		if h.AdHoc {
 			ssh += " (ad-hoc)"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", h.Name, ssh, yesNo(h.Autoconnect), h.State, detail)
+		name := h.Name
+		if named {
+			name += "\t" + dash(h.DisplayName)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", name, ssh, yesNo(h.Autoconnect), h.State, detail)
 		forwards = forwards || len(h.Forwards) > 0
 	}
 
@@ -132,7 +143,7 @@ func printStatus(out io.Writer, st *api.Status) {
 				if f.Label != "" {
 					name = f.Label + " " + f.Spec
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", name, h.Name, forwardSource(f), f.State, detail)
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", name, h.Title(), forwardSource(f), f.State, detail)
 			}
 		}
 	}
@@ -149,7 +160,7 @@ func printStatus(out io.Writer, st *api.Status) {
 				if detail == "" && m.Kube != nil && m.Kube.Pod != "" {
 					detail = "pod " + m.Kube.Pod + " on " + m.Kube.Node
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", m.Key, h.Name, source(m.Profiles, m.AdHoc), m.State, detail)
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", m.Key, h.Title(), source(m.Profiles, m.AdHoc), m.State, detail)
 			}
 		}
 	}
@@ -166,7 +177,7 @@ func printStatus(out io.Writer, st *api.Status) {
 				if detail == "" && u.BusID != "" {
 					detail = strings.TrimSpace(u.Name + " at " + u.BusID)
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", u.Device, h.Name, source(u.Profiles, u.AdHoc), u.State, detail)
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", u.Device, h.Title(), source(u.Profiles, u.AdHoc), u.State, detail)
 			}
 		}
 	}
@@ -174,7 +185,7 @@ func printStatus(out io.Writer, st *api.Status) {
 	if len(st.Profiles) > 0 {
 		fmt.Fprintln(tw, "\nPROFILE\tHOST\tAUTO\tSTATE\tDETAIL")
 		for _, p := range st.Profiles {
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", p.Name, p.Host, yesNo(p.Autoconnect), p.State, p.Error)
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", p.Name, findHost(*st, p.Host).Title(), yesNo(p.Autoconnect), p.State, p.Error)
 		}
 	}
 }

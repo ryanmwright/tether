@@ -99,6 +99,7 @@ func (d USBDevice) Title() string {
 
 type HostStatus struct {
 	Name        string `json:"name"`
+	DisplayName string `json:"display_name,omitempty"` // shown instead of Name, if set
 	SSH         string `json:"ssh"`
 	Autoconnect bool   `json:"autoconnect"`
 	AdHoc       bool   `json:"adhoc,omitempty"` // added with host.add, not in the config
@@ -114,6 +115,14 @@ type HostStatus struct {
 	Forwards       []ForwardStatus `json:"forwards"`
 	Mounts         []MountStatus   `json:"mounts"`
 	USB            []USBStatus     `json:"usb"`
+}
+
+// Title names the host for people: its display name, or else its name.
+func (h HostStatus) Title() string {
+	if h.DisplayName != "" {
+		return h.DisplayName
+	}
+	return h.Name
 }
 
 // USBStatus is a USB device shared with a host.
@@ -334,8 +343,9 @@ type GPGClaimParams struct {
 // HostParams names an ad-hoc host for host.add (which also connects it) and
 // host.remove. SSH defaults to Name.
 type HostParams struct {
-	Name string `json:"name"`
-	SSH  string `json:"ssh,omitempty"`
+	Name        string `json:"name"`
+	SSH         string `json:"ssh,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
 }
 
 // USBParams names a device for usb.attach and usb.detach: a bus ID ("1-2.3")

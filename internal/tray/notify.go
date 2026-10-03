@@ -42,11 +42,11 @@ func Changes(prev, cur api.Status) []Notice {
 		if by, was := gpgUsedBy(h), gpgUsedBy(old); by != was {
 			switch {
 			case by != "":
-				notices = append(notices, Notice{Key: key + ":gpg", Summary: "gpg on " + h.Name + ": in use by " + by,
+				notices = append(notices, Notice{Key: key + ":gpg", Summary: "gpg on " + h.Title() + ": in use by " + by,
 					Body:   "gpg there uses " + by + "'s keys, not this machine's. Yours stay forwarded, ready.",
-					Button: "Use this machine's keys", Action: gpgClaimAction(h.Name)})
+					Button: "Use this machine's keys", Action: gpgClaimAction(h)})
 			case gpgOn(h):
-				notices = append(notices, Notice{Key: key + ":gpg", Summary: "gpg on " + h.Name + ": using this machine's keys",
+				notices = append(notices, Notice{Key: key + ":gpg", Summary: "gpg on " + h.Title() + ": using this machine's keys",
 					Body: "It was using " + was + "'s."})
 			}
 		}
@@ -57,7 +57,7 @@ func Changes(prev, cur api.Status) []Notice {
 		}
 		for _, f := range h.Forwards {
 			if f.State == api.StateError && oldFwd[f.Spec].State != api.StateError {
-				notices = append(notices, Notice{Key: key + ":fwd:" + f.Spec, Summary: fmt.Sprintf("%s: %s failed", h.Name, f.Spec), Body: f.Error})
+				notices = append(notices, Notice{Key: key + ":fwd:" + f.Spec, Summary: fmt.Sprintf("%s: %s failed", h.Title(), f.Spec), Body: f.Error})
 			}
 		}
 		oldMnt := map[string]api.MountStatus{}
@@ -66,7 +66,7 @@ func Changes(prev, cur api.Status) []Notice {
 		}
 		for _, m := range h.Mounts {
 			if m.State == api.StateError && oldMnt[m.Key].State != api.StateError {
-				notices = append(notices, Notice{Key: key + ":mount:" + m.Key, Summary: h.Name + ": mount failed", Body: m.Key + "\n" + m.Error})
+				notices = append(notices, Notice{Key: key + ":mount:" + m.Key, Summary: h.Title() + ": mount failed", Body: m.Key + "\n" + m.Error})
 			}
 		}
 		oldUSB := map[string]api.USBStatus{}
@@ -75,7 +75,7 @@ func Changes(prev, cur api.Status) []Notice {
 		}
 		for _, u := range h.USB {
 			if u.State == api.StateError && oldUSB[u.Device].State != api.StateError {
-				notices = append(notices, Notice{Key: key + ":usb:" + u.Device, Summary: h.Name + ": USB device " + u.Device + " failed", Body: u.Error})
+				notices = append(notices, Notice{Key: key + ":usb:" + u.Device, Summary: h.Title() + ": USB device " + u.Device + " failed", Body: u.Error})
 			}
 		}
 	}
@@ -104,6 +104,7 @@ type connAlerts struct {
 type connAlert struct {
 	up    bool        // connected, last it was settled
 	lost  bool        // it was connected when it started failing
+	title string      // the host's, for people
 	err   string      // the latest error
 	timer *time.Timer // running while it fails, until it's reported
 	gen   int         // which timer is current
@@ -126,11 +127,12 @@ func (c *connAlerts) update(st api.Status) {
 			a = &connAlert{}
 			c.hosts[h.Name] = a
 		}
+		a.title = h.Title()
 		switch h.State {
 		case api.StateUp, api.StateDegraded:
 			a.stop()
 			if a.told {
-				notices = append(notices, Notice{Key: "host:" + h.Name, Summary: h.Name + ": connected again"})
+				notices = append(notices, Notice{Key: "host:" + h.Name, Summary: h.Title() + ": connected again"})
 			}
 			a.up, a.told = true, false
 		case api.StateError:
@@ -172,9 +174,9 @@ func (c *connAlerts) expire(name string, gen int) {
 		return
 	}
 	a.timer, a.told = nil, true
-	n := Notice{Key: "host:" + name, Summary: name + ": not connected", Body: a.err + "\nRetrying in the background.", Urgent: true}
+	n := Notice{Key: "host:" + name, Summary: a.title + ": not connected", Body: a.err + "\nRetrying in the background.", Urgent: true}
 	if a.lost {
-		n.Summary = name + ": connection lost"
+		n.Summary = a.title + ": connection lost"
 	}
 	c.mu.Unlock()
 	c.show(n)

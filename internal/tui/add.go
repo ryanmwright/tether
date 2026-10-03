@@ -94,12 +94,13 @@ func (m Model) addKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) addView() []string {
 	a := m.add
-	lines := []string{styleSection.Render("ADD TO " + a.host), ""}
+	host := m.title(a.host)
+	lines := []string{styleSection.Render("ADD TO " + host), ""}
 	for i, e := range a.entries {
-		title := strings.ReplaceAll(e.title, "HOST", a.host)
+		title := strings.ReplaceAll(e.title, "HOST", host)
 		text := fmt.Sprintf("%s  %-60s", e.key, title)
 		if i == a.cursor {
-			lines = append(lines, "▸ "+styleSelected.Render(text)+"  "+styleFaint.Render(strings.ReplaceAll(e.help, "HOST", a.host)))
+			lines = append(lines, "▸ "+styleSelected.Render(text)+"  "+styleFaint.Render(strings.ReplaceAll(e.help, "HOST", host)))
 		} else {
 			lines = append(lines, "  "+text)
 		}
@@ -144,8 +145,9 @@ func bindPrefix(choice string) string {
 	return ""
 }
 
-// forwardResult is what submitting a forward form does.
-func forwardResult(host, label, spec string) (formResult, error) {
+// forwardResult is what submitting a forward form does: add spec to the host
+// called name, shown as host.
+func forwardResult(name, host, label, spec string) (formResult, error) {
 	s, err := forward.Parse(spec)
 	if err != nil {
 		return formResult{}, err
@@ -161,7 +163,7 @@ func forwardResult(host, label, spec string) (formResult, error) {
 		preview: s.String() + " — " + forward.Describe(s, host),
 		done:    "added " + in + " on " + host,
 		method:  api.MethodForwardAdd,
-		params:  api.ForwardParams{Host: host, Spec: in},
+		params:  api.ForwardParams{Host: name, Spec: in},
 	}, nil
 }
 
@@ -169,7 +171,8 @@ const labelHelp = "optional name, e.g. postgres"
 
 // openFwdForm opens the form for one kind of forward.
 func openFwdForm(kind string) func(m *Model, host string) tea.Cmd {
-	return func(m *Model, host string) tea.Cmd {
+	return func(m *Model, name string) tea.Cmd {
+		host := m.title(name)
 		var f form
 		switch kind {
 		case "local":
@@ -188,7 +191,7 @@ func openFwdForm(kind string) func(m *Model, host string) tea.Cmd {
 				if err != nil {
 					return formResult{}, err
 				}
-				return forwardResult(host, v.get(3, ""), "L:"+bindPrefix(v[2])+lp+":localhost:"+rp)
+				return forwardResult(name, host, v.get(3, ""), "L:"+bindPrefix(v[2])+lp+":localhost:"+rp)
 			}
 		case "remote":
 			f = form{title: "FORWARD A PORT ON " + host + " TO A PORT HERE", fields: []formField{
@@ -205,7 +208,7 @@ func openFwdForm(kind string) func(m *Model, host string) tea.Cmd {
 				if err != nil {
 					return formResult{}, err
 				}
-				return forwardResult(host, v.get(2, ""), "R:"+rp+":localhost:"+lp)
+				return forwardResult(name, host, v.get(2, ""), "R:"+rp+":localhost:"+lp)
 			}
 		case "tohost":
 			f = form{title: "FORWARD A LOCAL PORT TO A MACHINE ON " + host + "'S NETWORK", fields: []formField{
@@ -228,7 +231,7 @@ func openFwdForm(kind string) func(m *Model, host string) tea.Cmd {
 				if err != nil {
 					return formResult{}, err
 				}
-				return forwardResult(host, v.get(4, ""), "L:"+bindPrefix(v[3])+lp+":"+bracket(target)+":"+tp)
+				return forwardResult(name, host, v.get(4, ""), "L:"+bindPrefix(v[3])+lp+":"+bracket(target)+":"+tp)
 			}
 		case "fromlan":
 			f = form{title: "FORWARD A PORT ON " + host + " TO A MACHINE ON MY NETWORK", fields: []formField{
@@ -250,7 +253,7 @@ func openFwdForm(kind string) func(m *Model, host string) tea.Cmd {
 				if err != nil {
 					return formResult{}, err
 				}
-				return forwardResult(host, v.get(3, ""), "R:"+rp+":"+bracket(target)+":"+tp)
+				return forwardResult(name, host, v.get(3, ""), "R:"+rp+":"+bracket(target)+":"+tp)
 			}
 		case "socks", "http":
 			kindLetter, def, what := "D", 1080, "SOCKS PROXY"
@@ -267,7 +270,7 @@ func openFwdForm(kind string) func(m *Model, host string) tea.Cmd {
 				if err != nil {
 					return formResult{}, err
 				}
-				return forwardResult(host, v.get(2, ""), kindLetter+":"+bindPrefix(v[1])+lp)
+				return forwardResult(name, host, v.get(2, ""), kindLetter+":"+bindPrefix(v[1])+lp)
 			}
 		case "rsocks":
 			f = form{title: "SOCKS PROXY ON " + host + ", CONNECTING OUT FROM HERE", fields: []formField{
@@ -279,7 +282,7 @@ func openFwdForm(kind string) func(m *Model, host string) tea.Cmd {
 				if err != nil {
 					return formResult{}, err
 				}
-				return forwardResult(host, v.get(1, ""), "R:"+rp)
+				return forwardResult(name, host, v.get(1, ""), "R:"+rp)
 			}
 		}
 		return m.openForm(f)
@@ -295,14 +298,15 @@ func bracket(host string) string {
 
 // openMountForm opens the form for mounting a directory either way.
 func openMountForm(there bool) func(m *Model, host string) tea.Cmd {
-	return func(m *Model, host string) tea.Cmd {
+	return func(m *Model, name string) tea.Cmd {
+		host := m.title(name)
 		home, _ := os.UserHomeDir()
 		var f form
 		if there {
 			cwd, _ := os.Getwd()
 			f = form{title: "MOUNT A LOCAL DIRECTORY ON " + host, fields: []formField{
 				pathField("Local directory", "", cwd+"/", "must exist; "+host+" sees only this", false, ""),
-				pathField("Mount on "+host+" at", "~/<its name>", "", "relative to "+host+"'s home unless absolute", true, host),
+				pathField("Mount on "+host+" at", "~/<its name>", "", "relative to "+host+"'s home unless absolute", true, name),
 			}}
 			f.build = func(v formValues) (formResult, error) {
 				local := v.get(0, "")
@@ -311,11 +315,11 @@ func openMountForm(there bool) func(m *Model, host string) tea.Cmd {
 				}
 				local = strings.TrimSuffix(absLocal(local, home), "/")
 				remote := strings.TrimSuffix(v.get(1, "~/"+filepath.Base(local)), "/")
-				return mountResult(host, api.MountParams{Host: host, Direction: string(mount.LocalToRemote), Local: local, Remote: remote})
+				return mountResult(host, api.MountParams{Host: name, Direction: string(mount.LocalToRemote), Local: local, Remote: remote})
 			}
 		} else {
 			f = form{title: "MOUNT A DIRECTORY FROM " + host + " HERE", fields: []formField{
-				pathField("Directory on "+host, "", "~/", "relative to "+host+"'s home unless absolute", true, host),
+				pathField("Directory on "+host, "", "~/", "relative to "+host+"'s home unless absolute", true, name),
 				pathField("Mount here at", "~/mnt/<its name>", "", "created if missing", false, ""),
 			}}
 			f.build = func(v formValues) (formResult, error) {
@@ -328,10 +332,10 @@ func openMountForm(there bool) func(m *Model, host string) tea.Cmd {
 				}
 				base := path.Base(strings.TrimRight(remote, "/"))
 				if base == "~" || base == "." || base == "/" {
-					base = host
+					base = name
 				}
 				local := strings.TrimSuffix(absLocal(v.get(1, "~/mnt/"+base), home), "/")
-				return mountResult(host, api.MountParams{Host: host, Direction: string(mount.RemoteToLocal), Local: local, Remote: remote})
+				return mountResult(host, api.MountParams{Host: name, Direction: string(mount.RemoteToLocal), Local: local, Remote: remote})
 			}
 		}
 		return m.openForm(f)
@@ -411,14 +415,14 @@ func (m Model) usbKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		d := devs[m.usb.cursor]
 		switch u := m.sharedUSB(d); {
 		case d.Host == m.usb.host:
-			m.flash, m.flashErr = fmt.Sprintf("%s is already shared with %s", d.Title(), d.Host), true
+			m.flash, m.flashErr = fmt.Sprintf("%s is already shared with %s", d.Title(), m.title(d.Host)), true
 			return m, nil
 		case d.Host != "" && !u.AdHoc:
-			m.flash, m.flashErr = fmt.Sprintf("%s is shared with %s by profile %s; deactivate the profile to move it", d.Title(), d.Host, strings.Join(u.Profiles, ", ")), true
+			m.flash, m.flashErr = fmt.Sprintf("%s is shared with %s by profile %s; deactivate the profile to move it", d.Title(), m.title(d.Host), strings.Join(u.Profiles, ", ")), true
 			return m, nil
 		case d.Host != "":
 			m.mode = modeNormal
-			return m, m.call("moving "+d.Title()+" to "+m.usb.host, api.MethodUSBAttach, api.USBParams{Host: m.usb.host, Device: d.BusID, Move: true})
+			return m, m.call("moving "+d.Title()+" to "+m.title(m.usb.host), api.MethodUSBAttach, api.USBParams{Host: m.usb.host, Device: d.BusID, Move: true})
 		}
 		m.mode = modeNormal
 		return m, m.share(d, m.usb.host)
@@ -427,7 +431,7 @@ func (m Model) usbKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) usbView() []string {
-	lines := []string{styleSection.Render("SHARE A USB DEVICE WITH " + m.usb.host), ""}
+	lines := []string{styleSection.Render("SHARE A USB DEVICE WITH " + m.title(m.usb.host)), ""}
 	if m.status.USBUnavailable != "" {
 		lines = append(lines, styleWarn.Render("  ⚠ "+m.status.USBUnavailable), "")
 	}
@@ -437,11 +441,11 @@ func (m Model) usbView() []string {
 		movable := d.Host != "" && d.Host != m.usb.host && u.AdHoc
 		switch {
 		case movable:
-			text += "  (shared with " + d.Host + "; enter moves it here)"
+			text += "  (shared with " + m.title(d.Host) + "; enter moves it here)"
 		case d.Host != "" && !u.AdHoc:
-			text += "  (shared with " + d.Host + " by profile " + strings.Join(u.Profiles, ", ") + ")"
+			text += "  (shared with " + m.title(d.Host) + " by profile " + strings.Join(u.Profiles, ", ") + ")"
 		case d.Host != "":
-			text += "  (shared with " + d.Host + ")"
+			text += "  (shared with " + m.title(d.Host) + ")"
 		}
 		switch {
 		case i == m.usb.cursor:
@@ -580,7 +584,7 @@ func (m Model) kubeKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if m.kube.cursor >= len(visible) {
 			return m, nil
 		}
-		cmd := m.openForm(kubeForwardForm(m.kube.host, m.kube.res.Context, visible[m.kube.cursor]))
+		cmd := m.openForm(kubeForwardForm(m.kube.host, m.title(m.kube.host), m.kube.res.Context, visible[m.kube.cursor]))
 		return m, cmd
 	}
 	var cmd tea.Cmd
@@ -593,7 +597,7 @@ func (m Model) kubeKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 // kubeForwardForm asks which port of t to forward, and where.
-func kubeForwardForm(host, kctx string, t api.KubeTarget) form {
+func kubeForwardForm(host, title, kctx string, t api.KubeTarget) form {
 	var portField formField
 	if len(t.Ports) > 0 {
 		var choices []string
@@ -625,7 +629,7 @@ func kubeForwardForm(host, kctx string, t api.KubeTarget) form {
 			return formResult{}, err
 		}
 		ref := forward.KubeRef{Context: kctx, Namespace: t.Namespace, Kind: t.Kind, Name: t.Name}
-		return forwardResult(host, v.get(3, ""), "K:"+bindPrefix(v[2])+lp+":"+ref.String()+":"+tp)
+		return forwardResult(host, title, v.get(3, ""), "K:"+bindPrefix(v[2])+lp+":"+ref.String()+":"+tp)
 	}
 	return f
 }

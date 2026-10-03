@@ -315,6 +315,9 @@ autoconnect = true
 
 [hosts.prod-bastion]           # `ssh` defaults to the host's name
 
+[hosts."192.168.122.10"]
+display_name = "Build VM"      # shown instead of the IP; commands still take the IP
+
 [profiles.work]
 host = "devbox"
 autoconnect = false
@@ -349,6 +352,7 @@ digits, `.`, `_` and `-`.
 |---|---|---|---|
 | `ssh` | string | the host's name | Destination passed to `ssh`: an alias from `~/.ssh/config`, or `user@host`. Put bastions, ports, users and keys in `~/.ssh/config` (e.g. `ProxyJump`). |
 | `autoconnect` | bool | `false` | Connect when the daemon starts and after network changes. |
+| `display_name` | string | | Shown for the host in the tray, its notifications, the terminal UI and command output instead of its name, e.g. when the name is an IP address; `tether status` lists both. Commands and profiles still take the name. |
 | `local` | bool | `false` | This machine, with no SSH: only Kubernetes volume mounts, `kubectl` run here. |
 | `kube` | table | | How to run `kubectl` there and what helper pods look like. See [Kubernetes volumes](#kubernetes-volumes). |
 
@@ -1057,6 +1061,7 @@ tether up NAME...                 connect hosts / activate profiles, wait for th
   --no-wait, --timeout 45s
 tether down NAME...               deactivate profiles / disconnect hosts
 tether host add NAME [SSH-DEST]   connect to a host that isn't in the config (ad hoc)
+  --display-name NAME             ... shown for it instead of NAME
 tether host rm NAME...            disconnect ad-hoc hosts and forget them
 tether fwd add HOST [LABEL=]SPEC...  add ad-hoc forwards (connects the host if needed);
                                   SPEC: a spec, 5432, db.internal:5432, socks, rsocks, http

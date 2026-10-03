@@ -57,6 +57,7 @@ type tray struct {
 	mu      sync.Mutex
 	client  *rpc.Client
 	claimed map[string]time.Time // when this tray last took each host's gpg sockets
+	titles  map[string]string    // each host's title, by name, from the latest status
 
 	startDaemon chan struct{}
 	gpgOn       atomic.Bool   // this machine's gpg-agent is forwarded somewhere
@@ -144,6 +145,12 @@ func (t *tray) follow(c *rpc.Client) {
 		}
 		look, summary := Summary(st)
 		t.render(Build(st), look, "tether: "+summary)
+		t.mu.Lock()
+		t.titles = map[string]string{}
+		for _, h := range st.Hosts {
+			t.titles[h.Name] = h.Title()
+		}
+		t.mu.Unlock()
 		if t.alerts != nil {
 			t.alerts.update(st)
 		}
@@ -208,6 +215,16 @@ func (t *tray) justClaimed(notice Notice) bool {
 	return time.Since(t.claimed[host]) < 30*time.Second
 }
 
+// title is how to name a host to people: its display name, if it has one.
+func (t *tray) title(host string) string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if title := t.titles[host]; title != "" {
+		return title
+	}
+	return host
+}
+
 func (t *tray) setClient(c *rpc.Client) {
 	t.mu.Lock()
 	t.client = c
@@ -242,7 +259,7 @@ func (t *tray) run(a *Action) {
 		t.report("open the terminal UI", t.openTUI(args...))
 		return
 	case localAdd:
-		t.report("add to "+a.Host, t.addPrompt(a.Host, a.Arg))
+		t.report("add to "+t.title(a.Host), t.addPrompt(a.Host, a.Arg))
 		return
 	case localCopy:
 		t.report("copy "+a.Arg, copyText(a.Arg))
@@ -292,7 +309,7 @@ func (t *tray) addPrompt(host, kind string) error {
 	ask := inputDialog
 	switch kind {
 	case addLocal:
-		rp, ok := ask("Port on "+host+" to reach from here:", "")
+		rp, ok := ask("Port on "+t.title(host)+" to reach from here:", "")
 		if !ok {
 			return nil
 		}
@@ -302,17 +319,17 @@ func (t *tray) addPrompt(host, kind string) error {
 		}
 		return add("L:" + lp + ":localhost:" + rp)
 	case addRemote:
-		lp, ok := ask("Port here for "+host+" to reach:", "")
+		lp, ok := ask("Port here for "+t.title(host)+" to reach:", "")
 		if !ok {
 			return nil
 		}
-		rp, ok := ask("Port on "+host+" (programs there connect to localhost:PORT):", lp)
+		rp, ok := ask("Port on "+t.title(host)+" (programs there connect to localhost:PORT):", lp)
 		if !ok {
 			return nil
 		}
 		return add("R:" + rp + ":localhost:" + lp)
 	case addToHost:
-		target, ok := ask("Machine and port, as "+host+" sees them (e.g. db.internal:5432):", "")
+		target, ok := ask("Machine and port, as "+t.title(host)+" sees them (e.g. db.internal:5432):", "")
 		if !ok {
 			return nil
 		}
@@ -328,7 +345,7 @@ func (t *tray) addPrompt(host, kind string) error {
 			return nil
 		}
 		_, tp, _ := cutLast(target, ":")
-		rp, ok := ask("Port on "+host+" (programs there connect to localhost:PORT):", tp)
+		rp, ok := ask("Port on "+t.title(host)+" (programs there connect to localhost:PORT):", tp)
 		if !ok {
 			return nil
 		}
@@ -344,13 +361,13 @@ func (t *tray) addPrompt(host, kind string) error {
 		}
 		return add(letter + ":" + lp)
 	case addReverseSOCKS:
-		rp, ok := ask("SOCKS proxy on "+host+", port (programs there use localhost:PORT):", "1080")
+		rp, ok := ask("SOCKS proxy on "+t.title(host)+", port (programs there use localhost:PORT):", "1080")
 		if !ok {
 			return nil
 		}
 		return add("R:" + rp)
 	case addSpec:
-		spec, ok := ask("Forward to add to "+host+" (e.g. 5432, db.internal:5432, R:3000:localhost:3000, socks, rsocks, http, K:8080:ns/svc/name:80; name it with LABEL=):", "")
+		spec, ok := ask("Forward to add to "+t.title(host)+" (e.g. 5432, db.internal:5432, R:3000:localhost:3000, socks, rsocks, http, K:8080:ns/svc/name:80; name it with LABEL=):", "")
 		if !ok {
 			return nil
 		}
@@ -372,8 +389,8 @@ func (t *tray) remoteDirDialog(host string) (string, bool) {
 	for {
 		var res api.FSListResult
 		if err := t.callResult(api.MethodFSList, api.FSListParams{Host: host, Path: dir}, &res); err != nil {
-			t.report("list "+dir+" on "+host, err)
-			return inputDialog("Directory on "+host+" to mount here (relative to the remote home unless absolute):", "~/")
+			t.report("list "+dir+" on "+t.title(host), err)
+			return inputDialog("Directory on "+t.title(host)+" to mount here (relative to the remote home unless absolute):", "~/")
 		}
 		items := []string{"✓ Mount " + res.Path, "✎ Type a path…"}
 		if res.Path != "/" {
@@ -386,7 +403,7 @@ func (t *tray) remoteDirDialog(host string) (string, bool) {
 				items = append(items, d+"/")
 			}
 		}
-		i, ok := listDialog("Directory on "+host+" to mount here:", items)
+		i, ok := listDialog("Directory on "+t.title(host)+" to mount here:", items)
 		if !ok {
 			return "", false
 		}
@@ -394,7 +411,7 @@ func (t *tray) remoteDirDialog(host string) (string, bool) {
 		case i == 0:
 			return res.Path, true
 		case i == 1:
-			return inputDialog("Directory on "+host+" to mount here (relative to the remote home unless absolute):", res.Path)
+			return inputDialog("Directory on "+t.title(host)+" to mount here (relative to the remote home unless absolute):", res.Path)
 		case items[i] == "↑ ..":
 			dir = path.Dir(res.Path)
 		default:
@@ -421,7 +438,7 @@ func (t *tray) kubeForwardPrompt(host string) error {
 		}
 		names = append(names, tg.Ref()+"   "+strings.Join(ports, ","))
 	}
-	i, ok := listDialog("Forward from Kubernetes (context "+res.Context+", via "+host+"):", names)
+	i, ok := listDialog("Forward from Kubernetes (context "+res.Context+", via "+t.title(host)+"):", names)
 	if !ok {
 		return nil
 	}
@@ -471,7 +488,7 @@ func (t *tray) pvcPrompt(host string) error {
 	if len(pvcs) == 0 {
 		return fmt.Errorf("no claims that can be mounted in context %s", res.Context)
 	}
-	i, ok := listDialog("Mount a Kubernetes claim (context "+res.Context+", via "+host+"):", names)
+	i, ok := listDialog("Mount a Kubernetes claim (context "+res.Context+", via "+t.title(host)+"):", names)
 	if !ok {
 		return nil
 	}
@@ -544,10 +561,10 @@ func (t *tray) mountPrompt(host string, localToRemote bool) error {
 	var ok bool
 	if localToRemote {
 		p.Direction = string(mount.LocalToRemote)
-		if p.Local, ok = directoryDialog("Local directory to mount on "+host, home); !ok {
+		if p.Local, ok = directoryDialog("Local directory to mount on "+t.title(host), home); !ok {
 			return nil
 		}
-		if p.Remote, ok = inputDialog("Mount "+p.Local+" on "+host+" at:", "~/"+filepath.Base(p.Local)); !ok {
+		if p.Remote, ok = inputDialog("Mount "+p.Local+" on "+t.title(host)+" at:", "~/"+filepath.Base(p.Local)); !ok {
 			return nil
 		}
 	} else {
@@ -558,7 +575,7 @@ func (t *tray) mountPrompt(host string, localToRemote bool) error {
 		if base == "~" || base == "." || base == "/" {
 			base = host
 		}
-		if p.Local, ok = inputDialog("Mount "+host+":"+p.Remote+" here at:", "~/mnt/"+base); !ok {
+		if p.Local, ok = inputDialog("Mount "+t.title(host)+":"+p.Remote+" here at:", "~/mnt/"+base); !ok {
 			return nil
 		}
 	}

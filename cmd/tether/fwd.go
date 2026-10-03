@@ -100,7 +100,7 @@ func newFwdLsCmd(g *globalFlags) *cobra.Command {
 						state += " (target unreachable)"
 					}
 					what := cmp.Or(f.Error, f.TargetError, f.Description, f.Resolved)
-					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", h.Name, name, state, dash(f.Address), what)
+					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", h.Title(), name, state, dash(f.Address), what)
 				}
 			}
 			if n == 0 {

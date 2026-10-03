@@ -335,7 +335,7 @@ func (m Model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			case inputShare:
 				return m, m.share(m.inputUSB, value)
 			}
-			return m, m.call("added "+value+" on "+m.inputHost, api.MethodForwardAdd, api.ForwardParams{Host: m.inputHost, Spec: value})
+			return m, m.call("added "+value+" on "+m.title(m.inputHost), api.MethodForwardAdd, api.ForwardParams{Host: m.inputHost, Spec: value})
 		}
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
@@ -484,21 +484,21 @@ func (m Model) toggleUSB(busid string) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) share(d api.USBDevice, host string) tea.Cmd {
-	return m.call("sharing "+d.Title()+" with "+host, api.MethodUSBAttach, api.USBParams{Host: host, Device: d.BusID})
+	return m.call("sharing "+d.Title()+" with "+m.title(host), api.MethodUSBAttach, api.USBParams{Host: host, Device: d.BusID})
 }
 
 func (m Model) up(r row) tea.Cmd {
 	if r.kind == rowProfile {
 		return m.call("activated "+r.name, api.MethodUp, api.TargetParams{Name: r.name, Kind: api.TargetProfile})
 	}
-	return m.call("connecting "+r.host, api.MethodUp, api.TargetParams{Name: r.host, Kind: api.TargetHost})
+	return m.call("connecting "+m.title(r.host), api.MethodUp, api.TargetParams{Name: r.host, Kind: api.TargetHost})
 }
 
 func (m Model) down(r row) tea.Cmd {
 	if r.kind == rowProfile {
 		return m.call("deactivated "+r.name, api.MethodDown, api.TargetParams{Name: r.name, Kind: api.TargetProfile})
 	}
-	return m.call("disconnected "+r.host, api.MethodDown, api.TargetParams{Name: r.host, Kind: api.TargetHost})
+	return m.call("disconnected "+m.title(r.host), api.MethodDown, api.TargetParams{Name: r.host, Kind: api.TargetHost})
 }
 
 // remove takes down what the selection names: an ad-hoc forward or mount,
@@ -534,7 +534,7 @@ func (m Model) remove(r row) (tea.Model, tea.Cmd) {
 	if r.kind == rowHost {
 		// An ad-hoc host that's already down is forgotten.
 		if h := m.hostStatus(r.host); h.AdHoc && h.State == api.StateDown {
-			return m, m.call("removed "+r.host, api.MethodHostRemove, api.HostParams{Name: r.host})
+			return m, m.call("removed "+m.title(r.host), api.MethodHostRemove, api.HostParams{Name: r.host})
 		}
 	}
 	if r.kind != rowForward {
@@ -586,14 +586,14 @@ func (m Model) addMount(value string) (tea.Model, tea.Cmd) {
 	if k := spec.Kube; k != nil {
 		p.Kube = &api.KubeMount{Context: k.Context, Namespace: k.Namespace, PVC: k.PVC}
 	}
-	return m, m.call("mounting "+value+" on "+m.inputHost, api.MethodMountAdd, p)
+	return m, m.call("mounting "+value+" on "+m.title(m.inputHost), api.MethodMountAdd, p)
 }
 
 func (m Model) toggleGPG(host string) tea.Cmd {
 	if m.forwardStatus(host, "gpg-agent").AdHoc {
-		return m.call("stopped gpg-agent on "+host, api.MethodForwardRemove, api.ForwardParams{Host: host, Spec: "gpg-agent"})
+		return m.call("stopped gpg-agent on "+m.title(host), api.MethodForwardRemove, api.ForwardParams{Host: host, Spec: "gpg-agent"})
 	}
-	return m.call("forwarding gpg-agent to "+host, api.MethodForwardAdd, api.ForwardParams{Host: host, Spec: "gpg-agent"})
+	return m.call("forwarding gpg-agent to "+m.title(host), api.MethodForwardAdd, api.ForwardParams{Host: host, Spec: "gpg-agent"})
 }
 
 // claimGPG makes gpg on host use this machine's keys, taking over from
@@ -602,7 +602,7 @@ func (m Model) claimGPG(host string) (tea.Model, tea.Cmd) {
 	h := m.hostStatus(host)
 	switch {
 	case gpgUsedBy(h) != "":
-		return m, m.call("gpg on "+host+" now uses this machine's keys", api.MethodGPGClaim, api.GPGClaimParams{Host: host})
+		return m, m.call("gpg on "+m.title(host)+" now uses this machine's keys", api.MethodGPGClaim, api.GPGClaimParams{Host: host})
 	case gpgOn(h):
 		m.flash = "gpg on " + host + " already uses this machine's keys"
 	default:
@@ -699,6 +699,14 @@ func (m Model) usbDevice(busid string) api.USBDevice {
 	return api.USBDevice{BusID: busid}
 }
 
+// title names a host for people: its display name, or else its name.
+func (m Model) title(host string) string {
+	if t := m.hostStatus(host).DisplayName; t != "" {
+		return t
+	}
+	return host
+}
+
 // sharedUSB is the host's entry for a local device that is shared.
 func (m Model) sharedUSB(d api.USBDevice) api.USBStatus {
 	for _, u := range m.hostStatus(d.Host).USB {
@@ -768,7 +776,7 @@ func (m Model) render() string {
 	}
 	for _, h := range m.status.Hosts {
 		if by := gpgUsedBy(h); by != "" {
-			top = append(top, styleWarn.Render("⇄ gpg on "+h.Name+" uses "+by+"'s keys — select "+h.Name+" and press G to use this machine's"))
+			top = append(top, styleWarn.Render("⇄ gpg on "+h.Title()+" uses "+by+"'s keys — select "+h.Title()+" and press G to use this machine's"))
 		}
 	}
 
@@ -784,7 +792,7 @@ func (m Model) render() string {
 				title += " (read-only)"
 			}
 		case strings.Contains(title, "%s"):
-			title = fmt.Sprintf(title, m.inputHost)
+			title = fmt.Sprintf(title, m.title(m.inputHost))
 		}
 		bottom = append(bottom, title+" (enter to confirm, esc to cancel)", m.input.View())
 	} else if m.mode == modePVC {
@@ -933,7 +941,7 @@ func (m Model) rowLines(height int) []string {
 		w := len(r.name)
 		switch r.kind {
 		case rowHost:
-			w = len(r.host)
+			w = ansi.StringWidth(m.title(r.host))
 		case rowForward:
 			w = len(forwardName(m.forwardStatus(r.host, r.name)))
 		}
@@ -984,7 +992,7 @@ func (m Model) rowLine(r row, selected bool, nameW int) string {
 	switch r.kind {
 	case rowHost:
 		h := m.hostStatus(r.host)
-		state, name, info = h.State, h.Name, "ssh "+h.SSH
+		state, name, info = h.State, h.Title(), "ssh "+h.SSH
 		if h.Local {
 			info = "this machine · K to mount a claim"
 		}
@@ -1018,11 +1026,11 @@ func (m Model) rowLine(r row, selected bool, nameW int) string {
 		state, name, info = api.StateDown, d.BusID, d.Title()
 		if d.Host != "" {
 			state = m.sharedUSB(d).State
-			info += " · on " + d.Host
+			info += " · on " + m.title(d.Host)
 		}
 	case rowProfile:
 		p := m.profileStatus(r.name)
-		state, name, info = p.State, p.Name, "on "+p.Host
+		state, name, info = p.State, p.Name, "on "+m.title(p.Host)
 		if p.Autoconnect {
 			info += " · auto"
 		}
@@ -1119,7 +1127,7 @@ func (m Model) detail() string {
 	switch r.kind {
 	case rowHost:
 		if p := hostProblem(m.hostStatus(r.host)); p != "" {
-			return styleErr.Render(r.host + ": " + p)
+			return styleErr.Render(m.title(r.host) + ": " + p)
 		}
 	case rowForward:
 		f := m.forwardStatus(r.host, r.name)

@@ -126,7 +126,7 @@ func addMount(cmd *cobra.Command, g *globalFlags, params api.MountParams, wait w
 		return err
 	}
 	if h := findHost(st, res.Host); h.State == api.StateError {
-		return fmt.Errorf("%s: %s (the mount is kept and will be made once connected)", res.Host, h.Error)
+		return fmt.Errorf("%s: %s (the mount is kept and will be made once connected)", h.Title(), h.Error)
 	}
 	m := findMount(st, res.Host, res.Key)
 	if m.State == api.StateError {

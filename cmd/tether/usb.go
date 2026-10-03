@@ -64,7 +64,11 @@ func newUSBListCmd(g *globalFlags) *cobra.Command {
 			tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(tw, "BUS ID\tID\tNAME\tSHARED WITH")
 			for _, d := range st.USB {
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", d.BusID, d.ID, d.Name, d.Host)
+				shared := ""
+				if d.Host != "" {
+					shared = findHost(st, d.Host).Title()
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", d.BusID, d.ID, d.Name, shared)
 			}
 			return tw.Flush()
 		},
@@ -114,14 +118,14 @@ func newUSBAttachCmd(g *globalFlags) *cobra.Command {
 				return err
 			}
 			if h := findHost(st, res.Host); h.State == api.StateError {
-				return fmt.Errorf("%s: %s (the device is kept and will be attached once connected)", res.Host, h.Error)
+				return fmt.Errorf("%s: %s (the device is kept and will be attached once connected)", h.Title(), h.Error)
 			}
 			if u := findUSB(st, res.Host, res.Device); u.State == api.StateError {
 				fmt.Fprintf(cmd.OutOrStdout(), "%s: error: %s\n", res.Device, u.Error)
 				fmt.Fprintf(cmd.ErrOrStderr(), "failed devices are kept and retried; remove with `tether usb detach %s %s`\n", args[0], res.Device)
 				return errNotHealthy
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "%s: attached to %s\n", res.Device, res.Host)
+			fmt.Fprintf(cmd.OutOrStdout(), "%s: attached to %s\n", res.Device, findHost(st, res.Host).Title())
 			return nil
 		},
 	}

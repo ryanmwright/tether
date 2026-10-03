@@ -163,10 +163,14 @@ func printTarget(w io.Writer, st api.Status, r api.TargetResult) bool {
 	if state == api.StateError && h.RetryAt != nil {
 		detail += fmt.Sprintf(" (retrying in %s)", untilRounded(*h.RetryAt))
 	}
+	name := r.Name
+	if r.Kind != api.TargetProfile {
+		name = h.Title()
+	}
 	if detail != "" {
-		fmt.Fprintf(w, "%s: %s: %s\n", r.Name, state, detail)
+		fmt.Fprintf(w, "%s: %s: %s\n", name, state, detail)
 	} else {
-		fmt.Fprintf(w, "%s: %s\n", r.Name, state)
+		fmt.Fprintf(w, "%s: %s\n", name, state)
 	}
 	return state == api.StateUp
 }

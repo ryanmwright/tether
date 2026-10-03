@@ -142,6 +142,37 @@ func TestBuild(t *testing.T) {
 	}
 }
 
+// TestDisplayName checks that a host with a display name is shown by it,
+// while actions still name the host by its name.
+func TestDisplayName(t *testing.T) {
+	st := sample
+	st.Hosts = append([]api.HostStatus{}, sample.Hosts...)
+	st.Hosts[2].DisplayName = "Scratch VM" // scratch, at me@10.0.0.5
+	st.USB = []api.USBDevice{{BusID: "1-2", ID: "046d:c52b", Name: "Logitech Receiver"}}
+	items := Build(st)
+	scratch := find(items, "host:scratch")
+	if scratch == nil || scratch.Title != "○ Scratch VM" {
+		t.Fatalf("host = %+v", scratch)
+	}
+	if it := find(items, "host:scratch:up"); it.Action.Params != (api.TargetParams{Name: "scratch", Kind: api.TargetHost}) || it.Action.Done != "connect Scratch VM" {
+		t.Errorf("connect = %+v", it.Action)
+	}
+	if it := find(items, "host:scratch:add:local"); it == nil || !strings.Contains(it.Title, "on Scratch VM") || it.Action.Host != "scratch" {
+		t.Errorf("add = %+v", it)
+	}
+	if it := find(items, "usb:1-2:scratch"); it == nil || it.Title != "Share with Scratch VM" {
+		t.Errorf("usb = %+v", it)
+	}
+	// Notifications name it the same way.
+	shown := make(chan Notice, 1)
+	c := newConnAlerts(func(n Notice) { shown <- n })
+	c.first = time.Millisecond
+	c.update(api.Status{Hosts: []api.HostStatus{{Name: "scratch", DisplayName: "Scratch VM", State: api.StateError, Error: "No route to host"}}})
+	if n := <-shown; n.Summary != "Scratch VM: not connected" || n.Key != "host:scratch" {
+		t.Errorf("notice = %+v", n)
+	}
+}
+
 func TestBuildUSB(t *testing.T) {
 	st := api.Status{
 		Hosts: []api.HostStatus{
@@ -412,7 +443,7 @@ func TestNotifier(t *testing.T) {
 	defer n.Close()
 
 	// A notice with a button runs its action when the button is clicked.
-	claim := gpgClaimAction("dev")
+	claim := gpgClaimAction(api.HostStatus{Name: "dev"})
 	if err := n.Show(Notice{Key: "host:dev:gpg", Summary: "gpg on dev: in use by office", Button: "Use this machine's keys", Action: claim}); err != nil {
 		t.Fatal(err)
 	}
