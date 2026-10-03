@@ -20,15 +20,36 @@ var iconColors = map[Look]color.NRGBA{
 
 var (
 	iconMu    sync.Mutex
-	iconCache = map[Look][]byte{}
+	iconCache = map[Look]*image.NRGBA{}
 )
 
 // Icon returns a PNG for a look: two linked rings (a tether) in its color.
 func Icon(state Look) []byte {
+	var buf bytes.Buffer
+	png.Encode(&buf, iconImage(state))
+	return buf.Bytes()
+}
+
+// IconPixmap is the icon for a look as a StatusNotifierItem shows it:
+// ARGB32 pixels, not premultiplied, in network byte order.
+func IconPixmap(state Look) (width, height int, argb []byte) {
+	img := iconImage(state)
+	b := img.Bounds()
+	argb = make([]byte, 0, 4*b.Dx()*b.Dy())
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			c := img.NRGBAAt(x, y)
+			argb = append(argb, c.A, c.R, c.G, c.B)
+		}
+	}
+	return b.Dx(), b.Dy(), argb
+}
+
+func iconImage(state Look) *image.NRGBA {
 	iconMu.Lock()
 	defer iconMu.Unlock()
-	if b, ok := iconCache[state]; ok {
-		return b
+	if img, ok := iconCache[state]; ok {
+		return img
 	}
 	c, ok := iconColors[state]
 	if !ok {
@@ -52,8 +73,6 @@ func Icon(state Look) []byte {
 			}
 		}
 	}
-	var buf bytes.Buffer
-	png.Encode(&buf, img)
-	iconCache[state] = buf.Bytes()
-	return iconCache[state]
+	iconCache[state] = img
+	return img
 }

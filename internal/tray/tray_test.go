@@ -195,61 +195,29 @@ func TestBuildUSB(t *testing.T) {
 	}
 }
 
-func TestFit(t *testing.T) {
-	plain, sep := Item{ID: "p"}, Item{ID: "s", Separator: true}
-	for _, c := range []struct {
-		slots, items []Item
-		want         []int // nil: doesn't fit
-	}{
-		{[]Item{plain, sep, plain}, []Item{plain, sep, plain}, []int{0, 1, 2}},
-		{[]Item{plain, sep, plain}, []Item{plain}, []int{0}},   // the separator trails
-		{[]Item{plain, sep, plain}, []Item{plain, plain}, nil}, // it would show between
-		{[]Item{plain, sep, plain, sep, plain}, []Item{plain, sep, plain}, []int{0, 1, 2}},
-		{[]Item{plain, sep, plain, sep, plain}, []Item{plain, sep, plain, plain}, nil},
-		{[]Item{sep, plain, sep, sep, plain}, []Item{plain, sep, plain}, []int{1, 2, 4}},
-		{[]Item{{Checkable: true}}, []Item{plain}, nil},
-		{[]Item{{Children: []Item{plain}}}, []Item{{Children: []Item{plain, plain}}}, nil},
-		{[]Item{{Children: []Item{plain, plain}}}, []Item{{Children: []Item{plain}}}, []int{0}},
-	} {
-		got, ok := fit(slotsFor(c.slots), c.items)
-		if ok != (c.want != nil) || ok && !reflect.DeepEqual(got, c.want) {
-			t.Errorf("fit(%v, %v) = %v, %t; want %v", c.slots, c.items, got, ok, c.want)
-		}
-	}
-}
-
-// TestSlotsStable checks that once the tray has shown two menus, switching
-// between them again fits the slots it has, so it doesn't rebuild.
-func TestSlotsStable(t *testing.T) {
-	down := sample
-	down.Hosts = append([]api.HostStatus{}, sample.Hosts...)
-	down.Hosts[0] = api.HostStatus{Name: "dev", SSH: "devbox", State: api.StateDown}
-	more := sample
-	more.Hosts = append([]api.HostStatus{}, sample.Hosts...)
-	more.Hosts[0].Forwards = append(more.Hosts[0].Forwards, api.ForwardStatus{Spec: "D:1080", AdHoc: true, State: api.StateUp, Address: "127.0.0.1:1080"})
-	fewer := sample
-	fewer.Hosts = sample.Hosts[:1]
-	fewer.Profiles = nil
-	standby := sample
-	standby.Hosts = append([]api.HostStatus{}, sample.Hosts...)
-	standby.Hosts[0].Forwards = append([]api.ForwardStatus{}, sample.Hosts[0].Forwards...)
-	standby.Hosts[0].Forwards[1].UsedBy = "office"
-	menus := map[string][]Item{
-		"sample": Build(sample), "down": Build(down), "more": Build(more), "fewer": Build(fewer), "gpg standby": Build(standby),
-		"daemon gone": DisconnectedMenu(),
-	}
-	for from, a := range menus {
-		for to, b := range menus {
-			slots := slotsFor(a)
-			if _, ok := fit(slots, b); !ok {
-				slots = merge(slots, b)
-			}
-			for name, items := range map[string][]Item{from: a, to: b} {
-				if _, ok := fit(slots, items); !ok {
-					t.Errorf("%s → %s: %s doesn't fit the merged slots", from, to, name)
+// TestUniqueIDs checks that no two entries share an ID: the menu keeps an
+// entry's place by it.
+func TestUniqueIDs(t *testing.T) {
+	st := sample
+	st.Hosts = append([]api.HostStatus{}, sample.Hosts...)
+	st.Hosts[0].Forwards = append(st.Hosts[0].Forwards, api.ForwardStatus{Spec: "D:1080", AdHoc: true, State: api.StateUp, Address: "127.0.0.1:1080", UsedBy: "office"})
+	st.Hosts[0].USB = []api.USBStatus{{Device: "1-1", BusID: "1-1", AdHoc: true, State: api.StateUp}}
+	st.Hosts[0].RecentForwards = []api.RecentForward{{Spec: "8080"}}
+	st.USB = []api.USBDevice{{BusID: "1-1", ID: "1050:0407", Host: "dev"}, {BusID: "1-2", ID: "046d:c52b"}}
+	st.ConfigError = "bad"
+	for name, items := range map[string][]Item{"status": Build(st), "daemon gone": DisconnectedMenu()} {
+		seen := map[string]bool{}
+		var walk func([]Item)
+		walk = func(items []Item) {
+			for _, it := range items {
+				if seen[it.ID] {
+					t.Errorf("%s: ID %q used twice", name, it.ID)
 				}
+				seen[it.ID] = true
+				walk(it.Children)
 			}
 		}
+		walk(items)
 	}
 }
 
@@ -311,6 +279,10 @@ func TestIcon(t *testing.T) {
 		}
 		if _, _, _, a := img.At(0, 0).RGBA(); a != 0 {
 			t.Errorf("%s: corner not transparent", state)
+		}
+		w, h, argb := IconPixmap(state)
+		if px := argb[4*(32*w+7):][:4]; w != 64 || h != 64 || len(argb) != 4*w*h || px[0] == 0 || px[1] != want.R || px[2] != want.G || px[3] != want.B {
+			t.Errorf("%s: pixmap %dx%d, ring pixel %v", state, w, h, px)
 		}
 	}
 }

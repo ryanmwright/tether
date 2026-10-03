@@ -16,7 +16,7 @@ import (
 	"syscall"
 	"time"
 
-	"fyne.io/systray"
+	"github.com/godbus/dbus/v5"
 
 	"github.com/ryanmwright/tether/internal/api"
 	"github.com/ryanmwright/tether/internal/mount"
@@ -43,22 +43,22 @@ type Options struct {
 type tray struct {
 	opts     Options
 	notifier *Notifier
+	item     *statusItem
+	menu     *menu
+	quit     context.CancelFunc
 
 	mu      sync.Mutex
 	client  *rpc.Client
-	actions map[string]*Action
 	claimed map[string]time.Time // when this tray last took each host's gpg sockets
-
-	// Only touched by the goroutine running loop.
-	slots []*slot
-	built chan struct{} // closed when the slots are replaced
 
 	startDaemon chan struct{}
 }
 
 // Run shows the tray icon until ctx is cancelled or the user quits it.
 func Run(ctx context.Context, opts Options) error {
-	t := &tray{opts: opts, actions: map[string]*Action{}, claimed: map[string]time.Time{}, startDaemon: make(chan struct{}, 1)}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	t := &tray{opts: opts, quit: cancel, claimed: map[string]time.Time{}, startDaemon: make(chan struct{}, 1)}
 	if opts.Notify {
 		n, err := NewNotifier(func(a *Action) { go t.run(a) })
 		if err != nil {
@@ -68,18 +68,23 @@ func Run(ctx context.Context, opts Options) error {
 			defer n.Close()
 		}
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go func() {
-		<-ctx.Done()
-		systray.Quit()
-	}()
-	systray.Run(func() {
-		systray.SetTitle("tether")
-		systray.SetOnTapped(func() { t.run(&Action{Local: localOpenTUI}) })
-		t.render(DisconnectedMenu(), LookIdle, "tether: connecting to the daemon…")
-		go t.loop(ctx)
-	}, nil)
+	conn, err := dbus.ConnectSessionBus()
+	if err != nil {
+		return fmt.Errorf("connecting to the session bus: %w", err)
+	}
+	defer conn.Close()
+	if t.menu, err = newMenu(conn, func(a *Action) { go t.run(a) }, opts.Log); err != nil {
+		return err
+	}
+	if t.item, err = newStatusItem(conn, func() { go t.run(&Action{Local: localOpenTUI}) }, opts.Log); err != nil {
+		return err
+	}
+	t.render(DisconnectedMenu(), LookIdle, "tether: connecting to the daemon…")
+	if err := t.item.Show(); err != nil {
+		return err
+	}
+	go t.loop(ctx)
+	<-ctx.Done()
 	return nil
 }
 
@@ -158,140 +163,11 @@ func (t *tray) setClient(c *rpc.Client) {
 	t.mu.Unlock()
 }
 
-// render shows items, in the slots already made if they fit (so an open
-// menu doesn't jump and KDE's copy of each submenu stays good), making new
-// ones otherwise.
+// render shows a status: the icon's look, its tooltip and the menu.
 func (t *tray) render(items []Item, look Look, tooltip string) {
-	systray.SetIcon(Icon(look))
-	systray.SetTooltip(tooltip)
-
-	t.mu.Lock()
-	clear(t.actions)
-	collectActions(items, t.actions)
-	t.mu.Unlock()
-
-	assign, ok := fit(t.slots, items)
-	if !ok {
-		slots := merge(t.slots, items)
-		if assign, ok = fit(slots, items); !ok {
-			slots = slotsFor(items)
-			assign, _ = fit(slots, items)
-		}
-		if t.built != nil {
-			close(t.built)
-		}
-		systray.ResetMenu()
-		t.slots, t.built = slots, make(chan struct{})
-		t.make(nil, slots)
-	}
-	t.show(t.slots, items, assign)
-}
-
-func collectActions(items []Item, into map[string]*Action) {
-	for _, it := range items {
-		if it.Action != nil {
-			into[it.ID] = it.Action
-		}
-		collectActions(it.Children, into)
-	}
-}
-
-// make adds slots to the menu, or to parent's submenu.
-func (t *tray) make(parent *systray.MenuItem, slots []*slot) {
-	for _, s := range slots {
-		check := s.kind == kindCheck || s.kind == kindCheckMenu
-		switch {
-		case s.kind == kindSeparator && parent == nil:
-			systray.AddSeparator()
-			continue
-		case s.kind == kindSeparator:
-			parent.AddSeparator()
-			continue
-		case parent == nil && check:
-			s.mi = systray.AddMenuItemCheckbox("", "", false)
-		case parent == nil:
-			s.mi = systray.AddMenuItem("", "")
-		case check:
-			s.mi = parent.AddSubMenuItemCheckbox("", "", false)
-		default:
-			s.mi = parent.AddSubMenuItem("", "")
-		}
-		s.enabled, s.visible = true, true
-		go t.watch(s, t.built)
-		t.make(s.mi, s.children)
-	}
-}
-
-// show puts items in the slots assign gives them and hides the other slots,
-// changing only what differs: each change makes KDE fetch the menu again.
-func (t *tray) show(slots []*slot, items []Item, assign []int) {
-	next := 0
-	for j, s := range slots {
-		if next < len(items) && assign[next] == j {
-			it := items[next]
-			next++
-			if s.mi == nil {
-				continue // a separator
-			}
-			t.mu.Lock()
-			s.id = it.ID
-			t.mu.Unlock()
-			if s.title != it.Title {
-				s.mi.SetTitle(it.Title)
-				s.title = it.Title
-			}
-			if s.enabled != it.Enabled {
-				if it.Enabled {
-					s.mi.Enable()
-				} else {
-					s.mi.Disable()
-				}
-				s.enabled = it.Enabled
-			}
-			if (s.kind == kindCheck || s.kind == kindCheckMenu) && s.checked != it.Checked {
-				if it.Checked {
-					s.mi.Check()
-				} else {
-					s.mi.Uncheck()
-				}
-				s.checked = it.Checked
-			}
-			if !s.visible {
-				s.mi.Show()
-				s.visible = true
-			}
-			if len(s.children) > 0 {
-				sub, _ := fit(s.children, it.Children)
-				t.show(s.children, it.Children, sub)
-			}
-			continue
-		}
-		if s.mi != nil && s.visible {
-			t.mu.Lock()
-			s.id = ""
-			t.mu.Unlock()
-			s.mi.Hide()
-			s.visible = false
-		}
-	}
-}
-
-// watch runs the action of the item a slot shows on each click, until the
-// menu is rebuilt.
-func (t *tray) watch(s *slot, done chan struct{}) {
-	for {
-		select {
-		case <-s.mi.ClickedCh:
-			t.mu.Lock()
-			a := t.actions[s.id]
-			t.mu.Unlock()
-			if a != nil {
-				go t.run(a)
-			}
-		case <-done:
-			return
-		}
-	}
+	t.item.SetIcon(look)
+	t.item.SetToolTip(tooltip)
+	t.menu.Update(items)
 }
 
 func (t *tray) run(a *Action) {
@@ -302,7 +178,7 @@ func (t *tray) run(a *Action) {
 	}
 	switch a.Local {
 	case localQuit:
-		systray.Quit()
+		t.quit()
 		return
 	case localStartDaemon:
 		poke(t.startDaemon)
