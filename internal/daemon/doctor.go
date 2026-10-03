@@ -164,7 +164,31 @@ func (dr *doctor) checkLocal(ctx context.Context) {
 			detail += ", SSH socket " + sshSock
 		}
 		dr.add("local", "gpg-agent", api.CheckOK, detail, "")
+		dr.checkPinentry(ctx)
 	}
+}
+
+// checkPinentry checks that the local agent can ask for a PIN or passphrase
+// for a remote's request. Such requests can't say where to ask, so the
+// agent uses its default environment, which needs a display (the tray keeps
+// one there).
+func (dr *doctor) checkPinentry(ctx context.Context) {
+	const name = "PIN prompts"
+	env, err := gpg.StartupEnv(ctx)
+	if err != nil {
+		dr.add("local", name, api.CheckWarn, "couldn't check: "+err.Error(), "")
+		return
+	}
+	if d := gpg.PromptDisplay(env); d != "" {
+		dr.add("local", name, api.CheckOK, "for "+dr.host+"'s requests, shown on display "+d, "")
+		return
+	}
+	detail := "gpg-agent has no display to ask for a PIN or passphrase on; " + dr.host + "'s requests that need one fail with \"Inappropriate ioctl for device\""
+	if tty := env["GPG_TTY"]; tty != "" {
+		detail = "gpg-agent has no display to ask for a PIN or passphrase on; for " + dr.host + "'s requests it asks in terminal " + tty + ", or fails with \"Inappropriate ioctl for device\""
+	}
+	dr.add("local", name, api.CheckWarn, detail,
+		"run the tether tray, which keeps a display there, or run in a terminal on your desktop: gpg-connect-agent updatestartuptty /bye")
 }
 
 func (dr *doctor) checkRemote(ctx context.Context, m *openssh.Master) {

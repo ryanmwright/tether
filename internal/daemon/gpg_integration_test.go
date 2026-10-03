@@ -96,6 +96,18 @@ func (g *gpgHarness) remote(t *testing.T, command string) (string, error) {
 	return string(out), err
 }
 
+// setAgentStartupEnv sets the local agent's default environment to vars,
+// with no display unless vars has one, as a shell's startup hook would.
+func (g *gpgHarness) setAgentStartupEnv(t *testing.T, vars ...string) {
+	t.Helper()
+	env := []string{"GNUPGHOME=" + g.localHome, "PATH=" + os.Getenv("PATH")}
+	cmd := exec.Command("gpg-connect-agent", "--no-autostart", "UPDATESTARTUPTTY", "/bye")
+	cmd.Env = append(env, vars...)
+	if out, err := cmd.CombinedOutput(); err != nil || strings.Contains(string(out), "ERR") {
+		t.Fatalf("updatestartuptty: %v: %s", err, out)
+	}
+}
+
 func TestGPGForwarding(t *testing.T) {
 	g := startGPG(t, "[profiles.work]\nhost = \"dev\"\ngpg = true\ngpg_ssh = true\n")
 
@@ -109,6 +121,18 @@ func TestGPGForwarding(t *testing.T) {
 		if c := findCheck(res, name); c.Status != api.CheckOK {
 			t.Errorf("%s check = %+v", name, c)
 		}
+	}
+
+	// PIN prompts need a display in the agent's default environment.
+	g.setAgentStartupEnv(t, "GPG_TTY=/dev/pts/9")
+	g.call(t, api.MethodDoctor, api.DoctorParams{Host: "dev"}, &res)
+	if c := findCheck(res, "PIN prompts"); c.Status != api.CheckWarn || !strings.Contains(c.Detail, "/dev/pts/9") || !strings.Contains(c.Fix, "updatestartuptty") {
+		t.Errorf("PIN prompts check without a display = %+v", c)
+	}
+	g.setAgentStartupEnv(t, "WAYLAND_DISPLAY=wayland-1")
+	g.call(t, api.MethodDoctor, api.DoctorParams{Host: "dev"}, &res)
+	if c := findCheck(res, "PIN prompts"); c.Status != api.CheckOK || !strings.Contains(c.Detail, "wayland-1") {
+		t.Errorf("PIN prompts check with a display = %+v", c)
 	}
 
 	g.importPublicKey(t)

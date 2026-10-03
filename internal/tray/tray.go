@@ -10,15 +10,18 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/godbus/dbus/v5"
 
 	"github.com/ryanmwright/tether/internal/api"
+	"github.com/ryanmwright/tether/internal/gpg"
 	"github.com/ryanmwright/tether/internal/mount"
 	"github.com/ryanmwright/tether/internal/rpc"
 )
@@ -26,6 +29,9 @@ import (
 const (
 	reconnectInterval = 3 * time.Second
 	callTimeout       = 60 * time.Second
+	// pinentryInterval is how often, while gpg is forwarded, the local agent
+	// is checked for a display to show PIN prompts on.
+	pinentryInterval = 30 * time.Second
 )
 
 type Options struct {
@@ -53,13 +59,15 @@ type tray struct {
 	claimed map[string]time.Time // when this tray last took each host's gpg sockets
 
 	startDaemon chan struct{}
+	gpgOn       atomic.Bool   // this machine's gpg-agent is forwarded somewhere
+	gpgStarted  chan struct{} // gpgOn just became true
 }
 
 // Run shows the tray icon until ctx is cancelled or the user quits it.
 func Run(ctx context.Context, opts Options) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	t := &tray{opts: opts, quit: cancel, claimed: map[string]time.Time{}, startDaemon: make(chan struct{}, 1)}
+	t := &tray{opts: opts, quit: cancel, claimed: map[string]time.Time{}, startDaemon: make(chan struct{}, 1), gpgStarted: make(chan struct{}, 1)}
 	if opts.Notify {
 		n, err := NewNotifier(func(a *Action) { go t.run(a) })
 		if err != nil {
@@ -86,6 +94,7 @@ func Run(ctx context.Context, opts Options) error {
 		return err
 	}
 	go t.loop(ctx)
+	go t.keepPinentry(ctx)
 	<-ctx.Done()
 	return nil
 }
@@ -138,6 +147,9 @@ func (t *tray) follow(c *rpc.Client) {
 		if t.alerts != nil {
 			t.alerts.update(st)
 		}
+		if on := slices.ContainsFunc(st.Hosts, gpgOn); on != t.gpgOn.Swap(on) && on {
+			poke(t.gpgStarted)
+		}
 		if prev != nil && t.notifier != nil {
 			for _, notice := range Changes(*prev, st) {
 				if !t.justClaimed(notice) {
@@ -152,6 +164,34 @@ func (t *tray) follow(c *rpc.Client) {
 func (t *tray) notify(notice Notice) {
 	if err := t.notifier.Show(notice); err != nil {
 		t.opts.Log.Warn("notification failed", "err", err)
+	}
+}
+
+// keepPinentry makes sure, while gpg is forwarded, that the local agent can
+// show a PIN prompt for a remote's request on this desktop, where the tray
+// runs: see gpg.DesktopPinentry.
+func (t *tray) keepPinentry(ctx context.Context) {
+	tick := time.NewTicker(pinentryInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		case <-t.gpgStarted:
+		}
+		if !t.gpgOn.Load() {
+			continue
+		}
+		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		changed, err := gpg.DesktopPinentry(cctx, os.Environ())
+		cancel()
+		switch {
+		case err != nil:
+			t.opts.Log.Debug("checking gpg-agent's display", "err", err)
+		case changed:
+			t.opts.Log.Info("gpg-agent had no display for PIN prompts; gave it this desktop's")
+		}
 	}
 }
 
