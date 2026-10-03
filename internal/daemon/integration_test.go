@@ -236,6 +236,25 @@ func TestReloadChangesForwardsLive(t *testing.T) {
 	}
 }
 
+// TestReconnectWhenReachable checks that a host whose SSH port wasn't
+// answering (a VM still booting) is reconnected as soon as it answers, not
+// at the end of a long backoff.
+func TestReconnectWhenReachable(t *testing.T) {
+	srv := sshtest.Start(t)
+	h := start(t, fmt.Sprintf("[defaults]\nreconnect_backoff = \"30s..60s\"\n[hosts.dev]\nssh = %q\n", sshtest.HostAlias),
+		openssh.Options{ConfigFile: srv.ConfigFile})
+	sh := &sshHarness{harness: h, srv: srv, c: h.client(t)}
+
+	srv.Stop()
+	sh.call(t, api.MethodUp, api.TargetParams{Name: "dev"}, nil)
+	st := sh.waitFor(t, "error", func(st api.Status) bool { return host(st, "dev").State == api.StateError })
+	if at := host(st, "dev").RetryAt; at == nil || time.Until(*at) < 20*time.Second {
+		t.Fatalf("retry at %v, want the 30s backoff", at)
+	}
+	srv.Restart(t)
+	sh.waitFor(t, "reconnected before the backoff ended", func(st api.Status) bool { return host(st, "dev").State == api.StateUp })
+}
+
 func TestConnectFailure(t *testing.T) {
 	srv := sshtest.Start(t)
 	h := start(t, fmt.Sprintf("[defaults]\nreconnect_backoff = \"1s..5s\"\n[hosts.dev]\nssh = %q\n", sshtest.HostAlias),

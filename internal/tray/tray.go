@@ -43,6 +43,7 @@ type Options struct {
 type tray struct {
 	opts     Options
 	notifier *Notifier
+	alerts   *connAlerts // nil without a notifier
 	item     *statusItem
 	menu     *menu
 	quit     context.CancelFunc
@@ -65,6 +66,7 @@ func Run(ctx context.Context, opts Options) error {
 			opts.Log.Warn("desktop notifications unavailable", "err", err)
 		} else {
 			t.notifier = n
+			t.alerts = newConnAlerts(t.notify)
 			defer n.Close()
 		}
 	}
@@ -113,6 +115,9 @@ func (t *tray) loop(ctx context.Context) {
 		t.setClient(c)
 		t.follow(c)
 		t.setClient(nil)
+		if t.alerts != nil {
+			t.alerts.update(api.Status{}) // a new daemon starts over
+		}
 		c.Close()
 	}
 }
@@ -130,17 +135,23 @@ func (t *tray) follow(c *rpc.Client) {
 		}
 		look, summary := Summary(st)
 		t.render(Build(st), look, "tether: "+summary)
+		if t.alerts != nil {
+			t.alerts.update(st)
+		}
 		if prev != nil && t.notifier != nil {
 			for _, notice := range Changes(*prev, st) {
-				if t.justClaimed(notice) {
-					continue
-				}
-				if err := t.notifier.Show(notice); err != nil {
-					t.opts.Log.Warn("notification failed", "err", err)
+				if !t.justClaimed(notice) {
+					t.notify(notice)
 				}
 			}
 		}
 		prev = &st
+	}
+}
+
+func (t *tray) notify(notice Notice) {
+	if err := t.notifier.Show(notice); err != nil {
+		t.opts.Log.Warn("notification failed", "err", err)
 	}
 }
 

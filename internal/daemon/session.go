@@ -28,6 +28,11 @@ const (
 	controlTimeout       = 10 * time.Second
 	probeTimeout         = 10 * time.Second
 	forwardRetryInterval = 15 * time.Second
+	// While a reconnect waits at least watchMinDelay, the host's SSH port
+	// is dialled every watchInterval to reconnect as soon as it answers.
+	watchMinDelay = 4 * time.Second
+	watchInterval = 2 * time.Second
+	watchTimeout  = 2 * time.Second
 )
 
 // want is what the daemon wants from one host's connection.
@@ -269,8 +274,10 @@ func (s *session) run(ctx context.Context) {
 		fwdRetry *time.Timer
 		gpgRT    gpgRuntime
 		gpgTick  = time.NewTicker(gpgCheckInterval)
+		unwatch  = func() {} // stops watchReachable
 	)
 	defer gpgTick.Stop()
+	defer func() { unwatch() }()
 	go s.checkLoop(ctx)
 	defer func() {
 		if m != nil {
@@ -302,6 +309,12 @@ func (s *session) run(ctx context.Context) {
 		delay = nextDelay(delay, w.backoff)
 		retry = time.NewTimer(delay)
 		s.setState(api.StateError, reason, time.Now().Add(delay))
+		unwatch()
+		if delay >= watchMinDelay && w.dest != openssh.LocalDest {
+			var wctx context.Context
+			wctx, unwatch = context.WithCancel(ctx)
+			go s.watchReachable(wctx, w.dest)
+		}
 	}
 
 	for {
@@ -314,8 +327,10 @@ func (s *session) run(ctx context.Context) {
 		case w.dest == "":
 			stopTimer(retry)
 			retry, delay = nil, 0
+			unwatch()
 			s.setState(api.StateDown, "", time.Time{})
 		case m == nil && retry == nil:
+			unwatch()
 			s.setState(api.StatePending, "", time.Time{})
 			s.log.Info("connecting", "dest", w.dest)
 			var err error
@@ -394,6 +409,42 @@ func (s *session) run(ctx context.Context) {
 				}
 				cancel()
 			}
+		}
+	}
+}
+
+// watchReachable retries a failed connection as soon as dest's SSH port,
+// which isn't accepting connections, starts to, rather than at the end of
+// the backoff: a machine coming up (a VM booting, a laptop waking) is
+// reconnected within seconds. It stops at the first connection the port
+// accepts, so one that already accepts (the failure was something else,
+// such as authentication) isn't dialled over and over.
+func (s *session) watchReachable(ctx context.Context, dest string) {
+	addr, err := openssh.Address(ctx, s.ssh, dest)
+	if err != nil || addr == "" {
+		return // e.g. behind a ProxyJump: wait for the backoff
+	}
+	var d net.Dialer
+	for refused := false; ; {
+		dctx, cancel := context.WithTimeout(ctx, watchTimeout)
+		c, err := d.DialContext(dctx, "tcp", addr)
+		cancel()
+		if ctx.Err() != nil {
+			return
+		}
+		if err == nil {
+			c.Close()
+			if refused {
+				s.log.Info("ssh port answering, reconnecting now", "addr", addr)
+				s.retryNow()
+			}
+			return
+		}
+		refused = true
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(watchInterval):
 		}
 	}
 }

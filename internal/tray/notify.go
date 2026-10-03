@@ -3,6 +3,7 @@ package tray
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 
@@ -21,12 +22,10 @@ type Notice struct {
 	Action *Action
 }
 
-// Changes lists what's worth telling the user between two snapshots: hosts
-// losing or regaining their connection, and forwards, mounts or USB
-// devices failing.
-// Things the user just asked for (connecting, going down) aren't news. So
-// is which machine's keys gpg on a host uses, with a button to use this
-// one's.
+// Changes lists what's worth telling the user between two snapshots:
+// forwards, mounts or USB devices failing, and which machine's keys gpg on
+// a host uses, with a button to use this one's. Hosts' connections are
+// connAlerts' job.
 func Changes(prev, cur api.Status) []Notice {
 	before := map[string]api.HostStatus{}
 	for _, h := range prev.Hosts {
@@ -39,16 +38,6 @@ func Changes(prev, cur api.Status) []Notice {
 			continue
 		}
 		key := "host:" + h.Name
-		switch {
-		case h.State == api.StateError && old.State != api.StateError:
-			msg := h.Error
-			if old.State == api.StateUp || old.State == api.StateDegraded {
-				msg = "Connection lost: " + h.Error
-			}
-			notices = append(notices, Notice{Key: key, Summary: h.Name + ": not connected", Body: msg + "\nRetrying in the background.", Urgent: true})
-		case (h.State == api.StateUp || h.State == api.StateDegraded) && old.State == api.StateError:
-			notices = append(notices, Notice{Key: key, Summary: h.Name + ": connected again"})
-		}
 
 		if by, was := gpgUsedBy(h), gpgUsedBy(old); by != was {
 			switch {
@@ -91,6 +80,111 @@ func Changes(prev, cur api.Status) []Notice {
 		}
 	}
 	return notices
+}
+
+// How long a host must stay unconnected before the user is told: longer for
+// one that hasn't connected yet, which may be a VM still booting along with
+// this machine.
+const (
+	firstConnectGrace = 2 * time.Minute
+	reconnectGrace    = 20 * time.Second
+)
+
+// connAlerts tells the user about hosts that stay unconnected, not about
+// each failed attempt: a host is reported once it has been failing for a
+// grace period, and its coming back only if it was reported.
+type connAlerts struct {
+	show         func(Notice)
+	first, again time.Duration // grace periods
+
+	mu    sync.Mutex
+	hosts map[string]*connAlert
+}
+
+type connAlert struct {
+	up    bool        // connected, last it was settled
+	lost  bool        // it was connected when it started failing
+	err   string      // the latest error
+	timer *time.Timer // running while it fails, until it's reported
+	gen   int         // which timer is current
+	told  bool        // reported as not connected
+}
+
+func newConnAlerts(show func(Notice)) *connAlerts {
+	return &connAlerts{show: show, first: firstConnectGrace, again: reconnectGrace, hosts: map[string]*connAlert{}}
+}
+
+// update follows a status; an empty one forgets every host.
+func (c *connAlerts) update(st api.Status) {
+	var notices []Notice
+	c.mu.Lock()
+	seen := map[string]bool{}
+	for _, h := range st.Hosts {
+		seen[h.Name] = true
+		a := c.hosts[h.Name]
+		if a == nil {
+			a = &connAlert{}
+			c.hosts[h.Name] = a
+		}
+		switch h.State {
+		case api.StateUp, api.StateDegraded:
+			a.stop()
+			if a.told {
+				notices = append(notices, Notice{Key: "host:" + h.Name, Summary: h.Name + ": connected again"})
+			}
+			a.up, a.told = true, false
+		case api.StateError:
+			a.err = h.Error
+			if a.timer == nil && !a.told {
+				grace := c.first
+				if a.up {
+					grace = c.again
+				}
+				a.lost, a.up = a.up, false
+				a.gen++
+				name, gen := h.Name, a.gen
+				a.timer = time.AfterFunc(grace, func() { c.expire(name, gen) })
+			}
+		case api.StateDown: // disconnected on purpose
+			a.stop()
+			a.up, a.told = false, false
+		}
+		// Pending: connecting, or retrying while failing; wait and see.
+	}
+	for name, a := range c.hosts {
+		if !seen[name] {
+			a.stop()
+			delete(c.hosts, name)
+		}
+	}
+	c.mu.Unlock()
+	for _, n := range notices {
+		c.show(n)
+	}
+}
+
+// expire reports a host whose grace period, timer gen, ran out.
+func (c *connAlerts) expire(name string, gen int) {
+	c.mu.Lock()
+	a := c.hosts[name]
+	if a == nil || a.timer == nil || a.gen != gen {
+		c.mu.Unlock()
+		return
+	}
+	a.timer, a.told = nil, true
+	n := Notice{Key: "host:" + name, Summary: name + ": not connected", Body: a.err + "\nRetrying in the background.", Urgent: true}
+	if a.lost {
+		n.Summary = name + ": connection lost"
+	}
+	c.mu.Unlock()
+	c.show(n)
+}
+
+func (a *connAlert) stop() {
+	if a.timer != nil {
+		a.timer.Stop()
+		a.timer = nil
+	}
 }
 
 // Notifier shows notices through the freedesktop notification service.

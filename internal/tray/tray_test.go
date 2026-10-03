@@ -227,27 +227,9 @@ func TestChanges(t *testing.T) {
 	}
 	st := func(hs ...api.HostStatus) api.Status { return api.Status{Hosts: hs} }
 
-	lost := Changes(st(host("dev", api.StateUp, "")), st(host("dev", api.StateError, "Broken pipe")))
-	if len(lost) != 1 || !lost[0].Urgent || !strings.Contains(lost[0].Body, "Connection lost: Broken pipe") {
-		t.Errorf("lost = %+v", lost)
-	}
-	failed := Changes(st(host("dev", api.StatePending, "")), st(host("dev", api.StateError, "Permission denied")))
-	if len(failed) != 1 || strings.Contains(failed[0].Body, "Connection lost") {
-		t.Errorf("first connect failing = %+v", failed)
-	}
-	back := Changes(st(host("dev", api.StateError, "x")), st(host("dev", api.StateUp, "")))
-	if len(back) != 1 || back[0].Summary != "dev: connected again" || back[0].Key != lost[0].Key {
-		t.Errorf("back = %+v", back)
-	}
-	// Routine transitions aren't news.
-	for _, pair := range [][2]api.State{{api.StateDown, api.StatePending}, {api.StatePending, api.StateUp}, {api.StateUp, api.StateDown}, {api.StateError, api.StateError}} {
-		if n := Changes(st(host("dev", pair[0], "")), st(host("dev", pair[1], ""))); len(n) != 0 {
-			t.Errorf("%s -> %s notified: %+v", pair[0], pair[1], n)
-		}
-	}
-	// A new host (just added) isn't news either.
-	if n := Changes(st(), st(host("new", api.StateError, "x"))); len(n) != 0 {
-		t.Errorf("new host notified: %+v", n)
+	// Hosts' connections are connAlerts' job.
+	if n := Changes(st(host("dev", api.StateUp, "")), st(host("dev", api.StateError, "Broken pipe"))); len(n) != 0 {
+		t.Errorf("connection lost notified by Changes: %+v", n)
 	}
 
 	prev := st(api.HostStatus{Name: "dev", State: api.StateUp, Forwards: []api.ForwardStatus{{Spec: "D:1080", State: api.StateUp}}})
@@ -261,6 +243,77 @@ func TestChanges(t *testing.T) {
 	if n := Changes(prev, cur); len(n) != 1 || n[0].Summary != "dev: USB device 1-1 failed" || n[0].Body != "device unplugged" {
 		t.Errorf("USB failure = %+v", n)
 	}
+}
+
+func TestConnAlerts(t *testing.T) {
+	shown := make(chan Notice, 10)
+	c := newConnAlerts(func(n Notice) { shown <- n })
+	c.first, c.again = 300*time.Millisecond, 100*time.Millisecond
+	st := func(state api.State, errMsg string) api.Status {
+		return api.Status{Hosts: []api.HostStatus{{Name: "vm", State: state, Error: errMsg}}}
+	}
+	expect := func(what string, wait time.Duration, summary string) {
+		t.Helper()
+		select {
+		case n := <-shown:
+			if summary == "" || n.Summary != summary {
+				t.Errorf("%s: got %+v, want %q", what, n, summary)
+			}
+		case <-time.After(wait):
+			if summary != "" {
+				t.Errorf("%s: nothing shown, want %q", what, summary)
+			}
+		}
+	}
+
+	// Booting along with this machine: failed attempts, then connected,
+	// within the grace period, is nothing to report.
+	for range 3 {
+		c.update(st(api.StatePending, ""))
+		c.update(st(api.StateError, "No route to host"))
+		time.Sleep(50 * time.Millisecond)
+	}
+	c.update(st(api.StateUp, ""))
+	expect("connected during the grace period", 400*time.Millisecond, "")
+
+	// A dropped connection that comes back quickly isn't either.
+	c.update(st(api.StateError, "connection lost: Broken pipe"))
+	c.update(st(api.StatePending, ""))
+	c.update(st(api.StateUp, ""))
+	expect("quick reconnect", 200*time.Millisecond, "")
+
+	// One that stays down is, once, with the latest error; then its return.
+	c.update(st(api.StateError, "connection lost: Broken pipe"))
+	c.update(st(api.StatePending, ""))
+	c.update(st(api.StateError, "Connection refused"))
+	select {
+	case n := <-shown:
+		if n.Summary != "vm: connection lost" || !strings.Contains(n.Body, "Connection refused") || !n.Urgent {
+			t.Errorf("lost = %+v", n)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lost connection not reported")
+	}
+	c.update(st(api.StatePending, ""))
+	c.update(st(api.StateError, "Connection refused"))
+	expect("still down", 200*time.Millisecond, "")
+	c.update(st(api.StateUp, ""))
+	expect("back", 100*time.Millisecond, "vm: connected again")
+
+	// Disconnecting on purpose cancels a pending report, and isn't news.
+	c.update(st(api.StateError, "connection lost: Broken pipe"))
+	c.update(st(api.StateDown, ""))
+	expect("disconnected", 200*time.Millisecond, "")
+
+	// Never connected: the longer grace period.
+	c.update(st(api.StateError, "No route to host"))
+	expect("first connect, before its grace period", 200*time.Millisecond, "")
+	expect("first connect", 300*time.Millisecond, "vm: not connected")
+
+	// The daemon going away forgets hosts, reported or not.
+	c.update(api.Status{})
+	c.update(st(api.StateUp, ""))
+	expect("after the daemon restarted", 100*time.Millisecond, "")
 }
 
 func TestIcon(t *testing.T) {
