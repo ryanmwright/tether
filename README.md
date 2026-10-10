@@ -724,6 +724,27 @@ authorized_keys = [
 `tether down c-into-b` takes it out again. The key can also be given in the
 config (`key = "ssh-ed25519 AAAA…"`) or as a file here (`file = "~/c.pub"`).
 
+With home-manager, the same goes in `programs.tether.settings`, which takes
+the config file's contents as Nix:
+
+```nix
+programs.tether.settings = {
+  hosts.b = { ssh = "b"; };
+  profiles.c-into-b = {
+    host = "b";
+    authorized_keys = [
+      { host = "c"; from = "10.0.0.7"; restrict = true; }  # read from c over ssh
+      # { host = "c"; path = "~/.ssh/id_ecdsa.pub"; }      # a particular key on c
+      # { file = "~/.ssh/c.pub"; }                         # a key file here
+      # { key = "ssh-ed25519 AAAA… me@c"; }                # the key itself
+    ];
+  };
+};
+```
+
+Add `autoconnect = true` to the profile to lend the key whenever the daemon
+runs.
+
 ```console
 $ tether status
 …
@@ -751,7 +772,20 @@ lock when `flock` is available.
 home-manager, say), tether refuses to change it. Before OpenSSH 9.1 sshd
 reads expiry times in the system's standard time, and tether writes them that
 way; with 9.1 and later they're in UTC. `tether doctor b` checks all of this,
-and that each key can be read.
+and that each key can be read. The script tether runs there uses `awk`,
+`mktemp`, `date` and, if present, `flock`.
+
+**NixOS remotes.** Nothing to enable: `tether.remote` isn't needed for this,
+and NixOS's sshd reads `~/.ssh/authorized_keys` by default. Two things to
+avoid on `b`:
+
+- `services.openssh.authorizedKeysInHomedir = false;` makes sshd ignore
+  `~/.ssh/authorized_keys`, so lent keys would have no effect. Keys declared
+  in `users.users.<name>.openssh.authorizedKeys.keys` live in
+  `/etc/ssh/authorized_keys.d/<name>` instead and don't get in the way.
+- Managing `~/.ssh/authorized_keys` with home-manager (`home.file`) makes it
+  a symlink into the Nix store, which tether won't change. Declare your
+  permanent keys in `users.users` instead.
 
 ## Kubernetes volumes
 
