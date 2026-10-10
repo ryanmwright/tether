@@ -78,6 +78,15 @@ func Changes(prev, cur api.Status) []Notice {
 				notices = append(notices, Notice{Key: key + ":usb:" + u.Device, Summary: h.Title() + ": USB device " + u.Device + " failed", Body: u.Error})
 			}
 		}
+		oldKey := map[string]api.AuthKeyStatus{}
+		for _, k := range old.AuthorizedKeys {
+			oldKey[k.Name()] = k
+		}
+		for _, k := range h.AuthorizedKeys {
+			if k.State == api.StateError && oldKey[k.Name()].State != api.StateError {
+				notices = append(notices, Notice{Key: key + ":key:" + k.Name(), Summary: h.Title() + ": lending key " + k.Source + " failed", Body: k.Error})
+			}
+		}
 	}
 	return notices
 }

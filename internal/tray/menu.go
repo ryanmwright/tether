@@ -234,7 +234,7 @@ func hostItem(h api.HostStatus, usb []api.USBDevice) Item {
 		children = append(children, action(id+":retry", "Retry now", &Action{Method: api.MethodUp, Params: target, Done: "reconnect " + h.Title()}))
 	}
 
-	if len(h.Forwards) > 0 || len(h.Mounts) > 0 || len(h.USB) > 0 {
+	if len(h.Forwards) > 0 || len(h.Mounts) > 0 || len(h.USB) > 0 || len(h.AuthorizedKeys) > 0 {
 		children = append(children, separator(id+":sep-items"))
 	}
 	gpgAdHoc := false
@@ -270,6 +270,13 @@ func hostItem(h api.HostStatus, usb []api.USBDevice) Item {
 			title += " — " + u.Name
 		}
 		children = append(children, label(id+":usb:"+u.Device, title))
+	}
+	for _, k := range h.AuthorizedKeys {
+		title := stateMark[k.State] + " Key " + k.Name()
+		if d := k.Detail(); d != "" {
+			title += " — " + d
+		}
+		children = append(children, label(id+":key:"+k.Name(), title))
 	}
 
 	children = append(children, separator(id+":sep-actions"), addItem(id, h, usb))

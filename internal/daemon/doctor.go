@@ -5,13 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/ryanmwright/tether/internal/api"
+	"github.com/ryanmwright/tether/internal/authkeys"
+	"github.com/ryanmwright/tether/internal/config"
 	"github.com/ryanmwright/tether/internal/gpg"
 	"github.com/ryanmwright/tether/internal/kube"
 	"github.com/ryanmwright/tether/internal/mount"
@@ -35,6 +39,8 @@ type doctor struct {
 	kubeTargets    []kube.Source // claims mounted from the host
 	useUSB         bool          // USB devices shared with the host
 	usbHelper      func(context.Context) (int, error)
+	authKeys       []config.AuthorizedKey // keys lent to the host, File absolute
+	ssh            openssh.Options        // for reading lent keys from other machines
 	checks         []api.Check
 }
 
@@ -50,7 +56,7 @@ func (d *Daemon) handleDoctor(ctx context.Context, params json.RawMessage) (any,
 	d.mu.Lock()
 	host, ok := d.host(p.Host)
 	var s *session
-	dr := &doctor{host: p.Host, dest: host.SSH, local: host.Local, usbHelper: d.usb.Port}
+	dr := &doctor{host: p.Host, dest: host.SSH, local: host.Local, usbHelper: d.usb.Port, ssh: d.opts.SSH}
 	if ok {
 		s = d.sessions[p.Host].s
 		dr.gpgID = s.gpgID
@@ -93,6 +99,14 @@ func (d *Daemon) handleDoctor(ctx context.Context, params json.RawMessage) (any,
 		dr.useUSB = len(d.adhocUSB[p.Host]) > 0
 		for _, prof := range d.cfg.Profiles {
 			dr.useUSB = dr.useUSB || prof.Host == p.Host && len(prof.USB) > 0
+		}
+		for _, pname := range slices.Sorted(maps.Keys(d.cfg.Profiles)) {
+			if prof := d.cfg.Profiles[pname]; prof.Host == p.Host {
+				keys := profileAuthKeys(prof, d.home)
+				for _, id := range slices.Sorted(maps.Keys(keys)) {
+					dr.authKeys = append(dr.authKeys, keys[id].src)
+				}
+			}
 		}
 	}
 	d.mu.Unlock()
@@ -196,6 +210,62 @@ func (dr *doctor) checkRemote(ctx context.Context, m *openssh.Master) {
 	dr.checkRemoteMounts(ctx, m)
 	dr.checkRemoteUSB(ctx, m)
 	dr.checkRemoteGPG(ctx, m)
+	dr.checkAuthKeys(ctx, m)
+}
+
+// checkAuthKeys checks that each lent key can be read, and that the remote
+// can take lent keys: an sshd with expiry-time, and an authorized_keys
+// tether may rewrite.
+func (dr *doctor) checkAuthKeys(ctx context.Context, m *openssh.Master) {
+	if len(dr.authKeys) == 0 {
+		return
+	}
+	for _, a := range dr.authKeys {
+		var (
+			k   authkeys.Key
+			err error
+		)
+		if a.Host != "" {
+			var out []byte
+			if out, err = openssh.RunOnce(ctx, dr.ssh, a.Host, authkeys.FetchCommand(a.Path)); err == nil {
+				k, err = authkeys.Parse(string(out))
+			}
+		} else {
+			k, err = resolveAuthKey(a, nil)
+		}
+		if err != nil {
+			fix := ""
+			if a.Host != "" {
+				fix = "check that `ssh " + a.Host + "` works without prompting, and the path"
+			}
+			dr.add("lent keys", a.Source(), api.CheckFail, err.Error(), fix)
+			continue
+		}
+		dr.add("lent keys", a.Source(), api.CheckOK, strings.TrimSpace(k.Fingerprint+" "+k.Comment), "")
+	}
+
+	out, err := m.Run(ctx, authkeys.Script, authkeys.CheckCommand(dr.gpgID))
+	if err != nil {
+		dr.add("remote", "authorized_keys", api.CheckFail, "inspecting the remote failed: "+err.Error(), "")
+		return
+	}
+	c := authkeys.ParseCheck(string(out))
+	switch {
+	case c.Version == "":
+		dr.add("remote", "authorized_keys", api.CheckFail, "OpenSSH not found on "+dr.host,
+			"lending keys needs OpenSSH >= "+authkeys.MinOpenSSH+" as the remote's sshd")
+	case !authkeys.VersionOK(c.Version):
+		dr.add("remote", "authorized_keys", api.CheckFail, "OpenSSH "+c.Version+" on "+dr.host+" has no expiry-time",
+			"upgrade it to OpenSSH >= "+authkeys.MinOpenSSH)
+	case c.Writable == "symlink":
+		dr.add("remote", "authorized_keys", api.CheckFail, "~/.ssh/authorized_keys on "+dr.host+" is a symlink, managed elsewhere",
+			"make it a regular file, or authorize the keys where it's managed instead")
+	case c.Writable != "yes":
+		dr.add("remote", "authorized_keys", api.CheckFail, "~/.ssh/authorized_keys on "+dr.host+" isn't writable", "")
+	default:
+		detail := fmt.Sprintf("OpenSSH %s; %d key(s) lent from this machine", c.Version, c.Ours)
+		dr.add("remote", "authorized_keys", api.CheckOK, detail, "")
+	}
 }
 
 // checkLocalUSB checks that the USB/IP helper answers.

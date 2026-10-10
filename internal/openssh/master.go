@@ -281,6 +281,24 @@ func (m *Master) Run(ctx context.Context, stdin, command string) ([]byte, error)
 	return stdout.Bytes(), nil
 }
 
+// RunOnce runs command on dest over a connection of its own, made for it
+// and closed after, and returns its standard output. On failure the error
+// carries the first line of its standard error.
+func RunOnce(ctx context.Context, opts Options, dest, command string) ([]byte, error) {
+	args := append(opts.baseArgs(), probeOptions...)
+	args = append(args, "-o", "ClearAllForwardings=yes", "--", dest, command)
+	cmd := exec.CommandContext(ctx, opts.binary(), args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return nil, errors.New(firstLine(msg))
+		}
+		return nil, err
+	}
+	return stdout.Bytes(), nil
+}
+
 // Command returns an unstarted `ssh [opts] dest [remote...]` that runs over
 // the connection, e.g. Command([]string{"-s"}, "sftp") for a subsystem. It
 // dies with the daemon. On a local Master the remote words are run by the

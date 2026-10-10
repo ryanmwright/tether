@@ -56,6 +56,7 @@ const (
 	rowForward
 	rowMount
 	rowUSB // a device shared with a host
+	rowKey // a public key lent to a host
 	rowProfile
 	rowUSBDevice // a device plugged in here
 )
@@ -65,7 +66,7 @@ const (
 type row struct {
 	kind rowKind
 	host string
-	name string // forward spec, mount key, USB device, profile name or bus ID
+	name string // forward spec, mount key, USB device, lent key, profile name or bus ID
 }
 
 type Model struct {
@@ -265,6 +266,9 @@ func (m *Model) setStatus(st api.Status) {
 		}
 		for _, u := range h.USB {
 			m.rows = append(m.rows, row{kind: rowUSB, host: h.Name, name: u.Device})
+		}
+		for _, k := range h.AuthorizedKeys {
+			m.rows = append(m.rows, row{kind: rowKey, host: h.Name, name: k.Name()})
 		}
 	}
 	for _, p := range st.Profiles {
@@ -517,6 +521,10 @@ func (m Model) remove(r row) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, m.call("stopped sharing "+r.name, api.MethodUSBDetach, api.USBParams{Host: r.host, Device: r.name})
+	case rowKey:
+		k := m.keyStatus(r.host, r.name)
+		m.flash, m.flashErr = fmt.Sprintf("key %s comes from profile %s; deactivate the profile to take it back", k.Source, strings.Join(k.Profiles, ", ")), true
+		return m, nil
 	}
 	if r.kind == rowMount {
 		mt := m.mountStatus(r.host, r.name)
@@ -688,6 +696,15 @@ func (m Model) usbStatus(host, device string) api.USBStatus {
 		}
 	}
 	return api.USBStatus{Device: device}
+}
+
+func (m Model) keyStatus(host, name string) api.AuthKeyStatus {
+	for _, k := range m.hostStatus(host).AuthorizedKeys {
+		if k.Name() == name {
+			return k
+		}
+	}
+	return api.AuthKeyStatus{Source: name}
 }
 
 func (m Model) usbDevice(busid string) api.USBDevice {
@@ -1021,6 +1038,10 @@ func (m Model) rowLine(r row, selected bool, nameW int) string {
 		if extra == "" && u.Name != "" {
 			extra = u.Name
 		}
+	case rowKey:
+		k := m.keyStatus(r.host, r.name)
+		state, name, info = k.State, "  key "+r.name, source(k.Profiles, false)
+		extra = k.Detail()
 	case rowUSBDevice:
 		d := m.usbDevice(r.name)
 		state, name, info = api.StateDown, d.BusID, d.Title()
@@ -1154,6 +1175,10 @@ func (m Model) detail() string {
 	case rowUSB:
 		if e := m.usbStatus(r.host, r.name).Error; e != "" {
 			return styleErr.Render("USB " + r.name + ": " + e)
+		}
+	case rowKey:
+		if e := m.keyStatus(r.host, r.name).Error; e != "" {
+			return styleErr.Render("key " + r.name + ": " + e)
 		}
 	case rowUSBDevice:
 		if d := m.usbDevice(r.name); d.Host != "" {

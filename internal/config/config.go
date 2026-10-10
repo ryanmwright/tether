@@ -15,6 +15,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"github.com/ryanmwright/tether/internal/authkeys"
 	"github.com/ryanmwright/tether/internal/forward"
 	"github.com/ryanmwright/tether/internal/kube"
 	"github.com/ryanmwright/tether/internal/mount"
@@ -110,8 +111,8 @@ func (d *Duration) UnmarshalText(text []byte) error {
 
 func (d Duration) MarshalText() ([]byte, error) { return []byte(time.Duration(d).String()), nil }
 
-// Profile is a named bundle of forwards, gpg, mounts and USB devices on one
-// host.
+// Profile is a named bundle of forwards, gpg, mounts, USB devices and lent
+// keys on one host.
 type Profile struct {
 	Host        string   `toml:"host"`
 	Autoconnect bool     `toml:"autoconnect"`
@@ -120,6 +121,84 @@ type Profile struct {
 	Forwards    []string `toml:"forwards"`
 	Mounts      []Mount  `toml:"mounts"`
 	USB         []string `toml:"usb"` // devices to share: bus IDs or vendor:product
+	// AuthorizedKeys are public keys the host accepts while the profile is
+	// up: lines tether adds to its ~/.ssh/authorized_keys and removes again.
+	AuthorizedKeys []AuthorizedKey `toml:"authorized_keys"`
+}
+
+// AuthorizedKey is a public key to lend a host, from exactly one of Key,
+// File or Host.
+type AuthorizedKey struct {
+	Key  string `toml:"key"`  // the key itself, "ssh-ed25519 AAAA… comment"
+	File string `toml:"file"` // a .pub file here
+	// Host is an ssh destination to read the key from, at Path there
+	// (default: the first of ~/.ssh/id_ed25519.pub, id_ecdsa.pub, id_rsa.pub).
+	Host string `toml:"host"`
+	Path string `toml:"path"`
+	// From restricts where the key may log in from (sshd's from="…").
+	From string `toml:"from"`
+	// Restrict turns off forwarding, agent, X11 and pty for the key (sshd's
+	// restrict).
+	Restrict bool `toml:"restrict"`
+}
+
+// Source names where the key comes from, e.g. "file:~/c.pub".
+func (a AuthorizedKey) Source() string {
+	switch {
+	case a.Key != "":
+		if k, err := authkeys.Parse(a.Key); err == nil {
+			return "key:" + k.Fingerprint
+		}
+		return "key"
+	case a.File != "":
+		return "file:" + a.File
+	case a.Path != "":
+		return "host:" + a.Host + ":" + a.Path
+	default:
+		return "host:" + a.Host
+	}
+}
+
+// ID tells the key apart from others on a host: its source and options.
+func (a AuthorizedKey) ID() string {
+	id := a.Source()
+	if a.From != "" {
+		id += " from=" + a.From
+	}
+	if a.Restrict {
+		id += " restrict"
+	}
+	return id
+}
+
+func (a AuthorizedKey) validate() error {
+	n := 0
+	for _, s := range []string{a.Key, a.File, a.Host} {
+		if s != "" {
+			n++
+		}
+	}
+	if n != 1 {
+		return errors.New("needs exactly one of key, file or host")
+	}
+	if a.Path != "" && a.Host == "" {
+		return errors.New("path is only for host")
+	}
+	if a.Key != "" {
+		if _, err := authkeys.Parse(a.Key); err != nil {
+			return err
+		}
+	}
+	if a.Host != "" && !validDest(a.Host) {
+		return fmt.Errorf("invalid ssh destination %q", a.Host)
+	}
+	if a.Path != "" && strings.ContainsFunc(a.Path, unicode.IsControl) {
+		return fmt.Errorf("invalid path %q", a.Path)
+	}
+	if a.From != "" {
+		return authkeys.ValidateFrom(a.From)
+	}
+	return nil
 }
 
 type Direction = mount.Direction
@@ -255,14 +334,18 @@ func ValidateHost(name string, h Host) error {
 	if h.Local {
 		return errors.Join(errs...)
 	}
-	// The destination is passed to ssh as an argument, so it must not be
-	// mistaken for an option.
-	if h.SSH == "" || strings.HasPrefix(h.SSH, "-") || strings.ContainsFunc(h.SSH, func(r rune) bool {
-		return unicode.IsSpace(r) || unicode.IsControl(r)
-	}) {
+	if !validDest(h.SSH) {
 		errs = append(errs, fmt.Errorf("hosts.%s.ssh: invalid destination %q", name, h.SSH))
 	}
 	return errors.Join(errs...)
+}
+
+// validDest checks an ssh destination. It is passed to ssh as an argument,
+// so it must not be mistaken for an option.
+func validDest(dest string) bool {
+	return dest != "" && !strings.HasPrefix(dest, "-") && !strings.ContainsFunc(dest, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	})
 }
 
 func validateMount(m Mount, h Host, home string) error {
@@ -307,7 +390,7 @@ func (c *Config) Validate() error {
 		} else if !known {
 			errs = append(errs, fmt.Errorf("profiles.%s.host: unknown host %q", name, p.Host))
 		}
-		if host.Local && (p.GPG || p.GPGSSH || len(p.USB) > 0) {
+		if host.Local && (p.GPG || p.GPGSSH || len(p.USB) > 0 || len(p.AuthorizedKeys) > 0) {
 			errs = append(errs, fmt.Errorf("profiles.%s: host %q is local, so it can only have PVC mounts and Kubernetes forwards", name, p.Host))
 		}
 		for i, f := range p.Forwards {
@@ -327,6 +410,11 @@ func (c *Config) Validate() error {
 		for i, u := range p.USB {
 			if _, err := usbip.ParseSpec(u); err != nil {
 				errs = append(errs, fmt.Errorf("profiles.%s.usb[%d]: %w", name, i, err))
+			}
+		}
+		for i, a := range p.AuthorizedKeys {
+			if err := a.validate(); err != nil {
+				errs = append(errs, fmt.Errorf("profiles.%s.authorized_keys[%d]: %w", name, i, err))
 			}
 		}
 	}

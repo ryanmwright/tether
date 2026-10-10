@@ -182,6 +182,19 @@ func printStatus(out io.Writer, st *api.Status) {
 		}
 	}
 
+	var keys bool
+	for _, h := range st.Hosts {
+		keys = keys || len(h.AuthorizedKeys) > 0
+	}
+	if keys {
+		fmt.Fprintln(tw, "\nLENT KEY\tHOST\tFROM\tSTATE\tDETAIL")
+		for _, h := range st.Hosts {
+			for _, k := range h.AuthorizedKeys {
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", k.Name(), h.Title(), source(k.Profiles, false), k.State, k.Detail())
+			}
+		}
+	}
+
 	if len(st.Profiles) > 0 {
 		fmt.Fprintln(tw, "\nPROFILE\tHOST\tAUTO\tSTATE\tDETAIL")
 		for _, p := range st.Profiles {

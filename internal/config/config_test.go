@@ -27,6 +27,11 @@ host = "devbox"
 gpg = true
 forwards = ["L:5432:db.internal:5432", "D:1080"]
 
+authorized_keys = [
+  { key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl me@c" },
+  { host = "c", from = "10.0.0.7", restrict = true },
+]
+
 [[profiles.work.mounts]]
 direction = "remote-to-local"
 remote = "~/src"
@@ -50,6 +55,9 @@ local = "~/mnt/src"
 	p := c.Profiles["work"]
 	if !p.GPG || len(p.Forwards) != 2 || len(p.Mounts) != 1 || p.Mounts[0].Direction != RemoteToLocal {
 		t.Errorf("work = %+v", p)
+	}
+	if ak := p.AuthorizedKeys; len(ak) != 2 || !strings.HasPrefix(ak[0].ID(), "key:SHA256:") || ak[1].ID() != "host:c from=10.0.0.7 restrict" {
+		t.Errorf("authorized keys = %+v", ak)
 	}
 }
 
@@ -82,6 +90,11 @@ func TestParseErrors(t *testing.T) {
 		{"unknown host", "[profiles.p]\nhost = \"nope\"", []string{`unknown host "nope"`}},
 		{"bad mount", "[hosts.h]\n[profiles.p]\nhost = \"h\"\n[[profiles.p.mounts]]\ndirection = \"sideways\"\nremote = \"x\"\nlocal = \"rel/path\"\n", []string{"mounts[0]: direction must be"}},
 		{"bad usb", "[hosts.h]\n[profiles.p]\nhost = \"h\"\nusb = [\"1-1\", \"yubikey\"]\n", []string{`profiles.p.usb[1]: invalid USB device "yubikey"`}},
+		{"authorized key with two sources", "[hosts.h]\n[profiles.p]\nhost = \"h\"\nauthorized_keys = [{ file = \"~/c.pub\", host = \"c\" }]\n", []string{"profiles.p.authorized_keys[0]: needs exactly one of key, file or host"}},
+		{"authorized key not a key", "[hosts.h]\n[profiles.p]\nhost = \"h\"\nauthorized_keys = [{ key = \"ssh-ed25519 nope\" }]\n", []string{"profiles.p.authorized_keys[0]: not a public key"}},
+		{"authorized key option injection", "[hosts.h]\n[profiles.p]\nhost = \"h\"\nauthorized_keys = [{ host = \"-oProxyCommand=evil\" }]\n", []string{"authorized_keys[0]: invalid ssh destination"}},
+		{"authorized key bad from", "[hosts.h]\n[profiles.p]\nhost = \"h\"\nauthorized_keys = [{ host = \"c\", from = \"a\\\"b\" }]\n", []string{"authorized_keys[0]: invalid from pattern"}},
+		{"authorized key path without host", "[hosts.h]\n[profiles.p]\nhost = \"h\"\nauthorized_keys = [{ file = \"~/c.pub\", path = \"x\" }]\n", []string{"authorized_keys[0]: path is only for host"}},
 		{"relative mount", "[hosts.h]\n[profiles.p]\nhost = \"h\"\n[[profiles.p.mounts]]\ndirection = \"remote-to-local\"\nremote = \"x\"\nlocal = \"rel/path\"\n", []string{"must be absolute or start with ~/"}},
 	}
 	for _, tt := range tests {

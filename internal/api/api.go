@@ -115,6 +115,9 @@ type HostStatus struct {
 	Forwards       []ForwardStatus `json:"forwards"`
 	Mounts         []MountStatus   `json:"mounts"`
 	USB            []USBStatus     `json:"usb"`
+	// AuthorizedKeys are public keys lent to the host: in its
+	// authorized_keys while wanted.
+	AuthorizedKeys []AuthKeyStatus `json:"authorized_keys,omitempty"`
 }
 
 // Title names the host for people: its display name, or else its name.
@@ -134,6 +137,46 @@ type USBStatus struct {
 	AdHoc    bool     `json:"adhoc,omitempty"`
 	State    State    `json:"state"`
 	Error    string   `json:"error,omitempty"`
+}
+
+// AuthKeyStatus is a public key lent to a host.
+type AuthKeyStatus struct {
+	Source      string   `json:"source"`                // e.g. "host:c", "file:~/c.pub"
+	Options     string   `json:"options,omitempty"`     // e.g. "from=10.0.0.7 restrict"
+	Fingerprint string   `json:"fingerprint,omitempty"` // once the key is known
+	Comment     string   `json:"comment,omitempty"`
+	Profiles    []string `json:"profiles,omitempty"`
+	// State is up once the host accepts the key. Present says it does
+	// because the user's own line has it, so tether left that alone.
+	State   State  `json:"state"`
+	Present bool   `json:"present,omitempty"`
+	Error   string `json:"error,omitempty"`
+	// Expires is when the host stops accepting the key unless the lease is
+	// renewed, by the host's clock.
+	Expires *time.Time `json:"expires,omitempty"`
+}
+
+// Name tells the key apart from others lent to its host, for people: its
+// source, and options if any.
+func (k AuthKeyStatus) Name() string {
+	if k.Options != "" {
+		return k.Source + " " + k.Options
+	}
+	return k.Source
+}
+
+// Detail is a line about the key's state: its error, that the user's own
+// line has it, or when its lease ends.
+func (k AuthKeyStatus) Detail() string {
+	switch {
+	case k.Error != "":
+		return k.Error
+	case k.Present:
+		return "already authorized by you; left alone"
+	case k.Expires != nil:
+		return "lease until " + k.Expires.Local().Format(time.TimeOnly)
+	}
+	return ""
 }
 
 type MountStatus struct {

@@ -35,7 +35,8 @@ func Start(t *testing.T) *Server {
 }
 
 // StartWithConfig is Start with extra sshd_config lines, e.g. SetEnv to give
-// remote sessions their own environment.
+// remote sessions their own environment. {dir} in them stands for the
+// server's directory.
 func StartWithConfig(t *testing.T, sshdExtra string) *Server {
 	t.Helper()
 	sshd := findSSHD()
@@ -77,7 +78,7 @@ StreamLocalBindUnlink yes
 LogLevel ERROR
 Subsystem sftp %[3]s
 %[4]s
-`, s.Port, dir, findSFTPServer(sshd), sshdExtra))
+`, s.Port, dir, findSFTPServer(sshd), strings.ReplaceAll(sshdExtra, "{dir}", dir)))
 	u, _ := user.Current()
 	write(t, s.ConfigFile, fmt.Sprintf(`Host %s
   HostName 127.0.0.1

@@ -76,6 +76,7 @@ type Daemon struct {
 	autoSeen   map[string]bool                   // "host/x", "profile/x" -> autoconnect as last applied
 	sessions   map[string]*sessionHandle
 	usb        *localUSB
+	keys       *keyFetcher // lent keys read from other machines
 	recent     recentItems // claims and forwards added lately
 
 	gen    atomic.Uint64 // see api.Status.Generation
@@ -119,6 +120,13 @@ func Run(ctx context.Context, opts Options) error {
 		d.usb.helper.Socket = usbip.DefaultHelperSocket
 	}
 	defer d.usb.helper.Close()
+	d.keys = newKeyFetcher(opts.SSH, func() {
+		d.mu.Lock()
+		for _, h := range d.sessions {
+			poke(h.s.wake)
+		}
+		d.mu.Unlock()
+	})
 	d.home, _ = os.UserHomeDir()
 	_, noKubectl := exec.LookPath("kubectl")
 	d.kubectl = noKubectl == nil && !opts.NoLocalHost
@@ -346,6 +354,7 @@ func (d *Daemon) hostNames() []string {
 func (d *Daemon) startSession(name string) {
 	ctlPath := filepath.Join(filepath.Dir(d.opts.SocketPath), "ctl", name)
 	s := newSession(name, ctlPath, d.opts.SSH, d.usb, d.log, d.notify)
+	s.keys = d.keys
 	s.gpgID = d.opts.GPGMachine
 	if s.gpgID == "" {
 		s.gpgID = gpg.MachineID()
@@ -365,7 +374,8 @@ func (d *Daemon) recompute() {
 	for name, h := range d.sessions {
 		host, _ := d.host(name)
 		w := want{backoff: d.cfg.Defaults.ReconnectBackoff, checkTargets: d.cfg.Defaults.CheckTargets,
-			forwards: map[string]wantForward{}, mounts: map[string]wantMount{}, usb: map[string]wantUSB{}}
+			forwards: map[string]wantForward{}, mounts: map[string]wantMount{}, usb: map[string]wantUSB{},
+			authKeys: map[string]wantAuthKey{}}
 		wanted := d.upHosts[name]
 		for _, pname := range slices.Sorted(maps.Keys(d.active)) {
 			p := d.cfg.Profiles[pname]
@@ -385,6 +395,10 @@ func (d *Daemon) recompute() {
 			for key, wu := range profileUSB(p) {
 				wu.profiles = append(w.usb[key].profiles, pname)
 				w.usb[key] = wu
+			}
+			for key, wk := range profileAuthKeys(p, d.home) {
+				wk.profiles = append(w.authKeys[key].profiles, pname)
+				w.authKeys[key] = wk
 			}
 		}
 		for key, wu := range d.adhocUSB[name] {
@@ -408,7 +422,7 @@ func (d *Daemon) recompute() {
 		if wanted {
 			w.dest = host.Dest()
 		} else {
-			w.forwards, w.mounts, w.usb = nil, nil, nil
+			w.forwards, w.mounts, w.usb, w.authKeys = nil, nil, nil, nil
 		}
 		h.s.setWant(w)
 	}

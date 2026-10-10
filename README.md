@@ -11,6 +11,9 @@ your SSH connections to dev machines up and manages what flows over them:
   local directory on the remote (sshfs over the same connection)
 - **USB devices** plugged in here, shared with a remote (USB/IP over the
   same connection): a security key, a board you're flashing, a serial adapter
+- **Lent SSH keys**: let one remote log in to another while a profile is up,
+  with the key removed afterwards (and expiring on its own if this machine
+  goes away)
 - **Kubernetes volumes** (PersistentVolumeClaims) mounted here, with
   `kubectl` running on your jump box or on this machine
 
@@ -20,7 +23,7 @@ tokens, `known_hosts`) works as it already does.
 
 > **Status: early development.** Connections, port forwards (`L`/`R`/`D`,
 > TCP and Unix sockets), automatic reconnects, gpg-agent forwarding, directory
-> mounts, USB sharing, Kubernetes volume mounts, profiles, `tether doctor`, the CLI, the terminal UI and
+> mounts, USB sharing, lent SSH keys, Kubernetes volume mounts, profiles, `tether doctor`, the CLI, the terminal UI and
 > the tray icon work today. See [PLAN.md](PLAN.md) for the roadmap.
 
 ## Contents
@@ -36,6 +39,7 @@ tokens, `known_hosts`) works as it already does.
 - [gpg-agent forwarding](#gpg-agent-forwarding)
 - [Directory mounts](#directory-mounts)
 - [USB devices](#usb-devices)
+- [Lending SSH keys](#lending-ssh-keys)
 - [Kubernetes volumes](#kubernetes-volumes)
 - [Terminal UI](#terminal-ui)
 - [Tray icon](#tray-icon)
@@ -356,8 +360,8 @@ digits, `.`, `_` and `-`.
 | `local` | bool | `false` | This machine, with no SSH: only Kubernetes volume mounts, `kubectl` run here. |
 | `kube` | table | | How to run `kubectl` there and what helper pods look like. See [Kubernetes volumes](#kubernetes-volumes). |
 
-**`[profiles.<name>]`**: a named bundle of forwards, gpg, mounts and USB
-devices on one host. Several profiles on the same host share one SSH connection.
+**`[profiles.<name>]`**: a named bundle of forwards, gpg, mounts, USB
+devices and lent keys on one host. Several profiles on the same host share one SSH connection.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -368,6 +372,7 @@ devices on one host. Several profiles on the same host share one SSH connection.
 | `forwards` | list of strings | `[]` | Forwards and proxies: specs, shorthands or names, each optionally `LABEL=` first. See below and [Forwarding and proxies](#forwarding-and-proxies). |
 | `mounts` | list of tables | `[]` | Directory mounts; see below. |
 | `usb` | list of strings | `[]` | USB devices to share: bus IDs (`"1-2"`) or `vendor:product` (`"1050:0407"`). See [USB devices](#usb-devices). |
+| `authorized_keys` | list of tables | `[]` | Public keys the host accepts while the profile is up; see below and [Lending SSH keys](#lending-ssh-keys). |
 
 **Forward specs** (`forwards`):
 
@@ -393,6 +398,18 @@ Shorthands (`5432`, `8080:3000`, `db.internal:5432`), the names `socks`,
 | `options` | list of strings | Extra `sshfs -o` options, e.g. `["ro"]`. |
 | `pvc` | string | Instead of `direction` and `remote`: a Kubernetes claim to mount here, `[CONTEXT/]NAMESPACE/CLAIM`. `local` is then optional. See [Kubernetes volumes](#kubernetes-volumes). |
 | `read_only`, `sub_path` | bool, string | For `pvc`: mount it read-only, or only a directory inside it. |
+
+**`profiles.<name>.authorized_keys`** entries (exactly one of `key`, `file`,
+`host`):
+
+| Key | Type | Description |
+|---|---|---|
+| `key` | string | The public key itself: `"ssh-ed25519 AAAA… comment"`. |
+| `file` | string | A `.pub` file on this machine: absolute, or starting with `~/`. Read each time the key is lent. |
+| `host` | string | An ssh destination (alias or `user@host`; it needn't be a tether host) to read the key from, over a short connection of its own. |
+| `path` | string | With `host`: the key's path there. Default: the first of `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub`, `id_rsa.pub`. |
+| `from` | string | Only accept the key from these addresses or names (sshd's `from="…"`), e.g. `"10.0.0.7"`. |
+| `restrict` | bool | No port, agent or X11 forwarding and no pty for the key (sshd's `restrict`). |
 
 Unknown keys are errors (so typos are caught), and every problem is reported
 at once. Check a file without touching the daemon:
@@ -686,6 +703,55 @@ profile down unmounts cleanly, lazily if something is still using it.
 On a non-NixOS machine where Nix provides your tools, install `sshfs` and
 `fuse3` from the distribution anyway: FUSE mounts need the distribution's
 setuid `fusermount3`, which a Nix-built one isn't.
+
+## Lending SSH keys
+
+Let one of your hosts log in to another for as long as a profile is up. Say
+you reach `c` and `b` from here, and want `c` to be able to `ssh b`
+(to `git pull` from it, or `rsync` between them) without leaving `c`'s key in
+`b`'s `authorized_keys` for good:
+
+```toml
+[profiles.c-into-b]
+host = "b"
+authorized_keys = [
+  { host = "c", from = "10.0.0.7", restrict = true },
+]
+```
+
+`tether up c-into-b` reads `c`'s public key (`ssh c cat ~/.ssh/id_ed25519.pub`;
+`c` needs nothing installed) and adds it to `~/.ssh/authorized_keys` on `b`;
+`tether down c-into-b` takes it out again. The key can also be given in the
+config (`key = "ssh-ed25519 AAAA…"`) or as a file here (`file = "~/c.pub"`).
+
+```console
+$ tether status
+…
+LENT KEY                              HOST  FROM       STATE  DETAIL
+host:c from=10.0.0.7 restrict         b     c-into-b   up     lease until 14:32:10
+```
+
+**It never outlives tether.** Each line tether adds carries an OpenSSH
+`expiry-time` 15 minutes ahead, renewed every 5 minutes while the profile is
+up. If this machine crashes, sleeps or loses the network, `b` stops accepting
+the key within 15 minutes on its own; tether cleans up the expired line the
+next time it connects. Bringing the profile down, disconnecting, or stopping
+the daemon removes the line at once.
+
+**Your own keys are left alone.** If `b`'s `authorized_keys` already has the
+key (you put it there yourself), tether doesn't add or remove anything, and
+status shows it as "already authorized by you". tether only touches lines it
+added, which end in `tether:<this machine>:…`; lines another machine's tether
+lent are kept until they expire. The file is rewritten atomically, under a
+lock when `flock` is available.
+
+**What the remote needs.** OpenSSH 8.2 or newer as its sshd (for
+`expiry-time`), and sshd reading `~/.ssh/authorized_keys` (the default
+`AuthorizedKeysFile`). If `authorized_keys` is a symlink (managed by
+home-manager, say), tether refuses to change it. Before OpenSSH 9.1 sshd
+reads expiry times in the system's standard time, and tether writes them that
+way; with 9.1 and later they're in UTC. `tether doctor b` checks all of this,
+and that each key can be read.
 
 ## Kubernetes volumes
 

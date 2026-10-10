@@ -41,6 +41,7 @@ type want struct {
 	forwards map[string]wantForward
 	mounts   map[string]wantMount
 	usb      map[string]wantUSB
+	authKeys map[string]wantAuthKey
 	backoff  config.Backoff
 	// checkTargets checks that forwards' targets answer.
 	checkTargets bool
@@ -82,6 +83,7 @@ type session struct {
 	ctlPath string
 	ssh     openssh.Options
 	usb     usbBackend
+	keys    *keyFetcher // reads lent keys from other machines
 	log     *slog.Logger
 	changed func()
 
@@ -101,6 +103,7 @@ type session struct {
 	forwards       map[string]*forwardState
 	mounts         map[string]*mountState
 	usbStates      map[string]*usbState
+	authKeyStates  map[string]*authKeyState
 	checks         map[string]forward.Spec // forwards whose targets to check, as applied
 	master         *openssh.Master         // the live connection, if any
 	gpgClaim       bool                    // claim the gpg sockets at the next sync: the user asked for this host
@@ -110,22 +113,23 @@ type session struct {
 
 func newSession(name, ctlPath string, ssh openssh.Options, usb usbBackend, log *slog.Logger, changed func()) *session {
 	return &session{
-		name:      name,
-		ctlPath:   ctlPath,
-		ssh:       ssh,
-		usb:       usb,
-		log:       log.With("host", name),
-		changed:   changed,
-		wake:      make(chan struct{}, 1),
-		kick:      make(chan struct{}, 1),
-		netChange: make(chan struct{}, 1),
-		mountDied: make(chan struct{}, 1),
-		fwdDied:   make(chan struct{}, 1),
-		checkNow:  make(chan struct{}, 1),
-		state:     api.StateDown,
-		forwards:  map[string]*forwardState{},
-		mounts:    map[string]*mountState{},
-		usbStates: map[string]*usbState{},
+		name:          name,
+		ctlPath:       ctlPath,
+		ssh:           ssh,
+		usb:           usb,
+		log:           log.With("host", name),
+		changed:       changed,
+		wake:          make(chan struct{}, 1),
+		kick:          make(chan struct{}, 1),
+		netChange:     make(chan struct{}, 1),
+		mountDied:     make(chan struct{}, 1),
+		fwdDied:       make(chan struct{}, 1),
+		checkNow:      make(chan struct{}, 1),
+		state:         api.StateDown,
+		forwards:      map[string]*forwardState{},
+		mounts:        map[string]*mountState{},
+		usbStates:     map[string]*usbState{},
+		authKeyStates: map[string]*authKeyState{},
 	}
 }
 
@@ -160,6 +164,11 @@ func (s *session) setWant(w want) {
 			delete(s.usbStates, key)
 		}
 	}
+	for key := range s.authKeyStates {
+		if _, ok := w.authKeys[key]; !ok {
+			delete(s.authKeyStates, key)
+		}
+	}
 	if w.dest != "" {
 		for key := range w.forwards {
 			if s.forwards[key] == nil {
@@ -174,6 +183,11 @@ func (s *session) setWant(w want) {
 		for key := range w.usb {
 			if s.usbStates[key] == nil {
 				s.usbStates[key] = &usbState{state: api.StatePending}
+			}
+		}
+		for key := range w.authKeys {
+			if s.authKeyStates[key] == nil {
+				s.authKeyStates[key] = &authKeyState{state: api.StatePending}
 			}
 		}
 		if s.state == api.StateDown {
@@ -274,16 +288,21 @@ func (s *session) run(ctx context.Context) {
 		fwdRetry *time.Timer
 		gpgRT    gpgRuntime
 		gpgTick  = time.NewTicker(gpgCheckInterval)
+		keyRT    authKeyRuntime
+		keyTick  = time.NewTicker(authKeyRenew)
 		unwatch  = func() {} // stops watchReachable
 	)
 	defer gpgTick.Stop()
+	defer keyTick.Stop()
 	defer func() { unwatch() }()
 	go s.checkLoop(ctx)
 	defer func() {
 		if m != nil {
-			// Shutting down: hand the gpg sockets on while still connected.
+			// Shutting down: hand the gpg sockets on and take lent keys
+			// back while still connected.
 			rctx, cancel := context.WithTimeout(context.Background(), controlTimeout)
 			s.releaseGPG(rctx, m, applied)
+			s.releaseAuthKeys(rctx, m, &keyRT)
 			cancel()
 		}
 		s.stopForwards(applied)
@@ -297,6 +316,7 @@ func (s *session) run(ctx context.Context) {
 	disconnect := func() {
 		if m != nil {
 			s.releaseGPG(ctx, m, applied)
+			s.releaseAuthKeys(ctx, m, &keyRT)
 			s.stopUSB(m, usbRT) // detach and unmount cleanly while still connected
 			s.stopMounts(running)
 			s.stopForwards(applied)
@@ -356,7 +376,8 @@ func (s *session) run(ctx context.Context) {
 			fwdFailed = s.syncGPG(ctx, m, w, applied, claim, &gpgRT) || fwdFailed
 			mountFailed := s.syncMounts(ctx, m, w, running)
 			usbFailed := s.syncUSB(ctx, m, w, usbRT)
-			if (fwdFailed || mountFailed || usbFailed) && fwdRetry == nil {
+			keyFailed := s.syncAuthKeys(ctx, m, w, &keyRT)
+			if (fwdFailed || mountFailed || usbFailed || keyFailed) && fwdRetry == nil {
 				fwdRetry = time.NewTimer(forwardRetryInterval)
 			}
 		}
@@ -375,6 +396,7 @@ func (s *session) run(ctx context.Context) {
 		case <-timerC(fwdRetry):
 			fwdRetry = nil
 		case <-gpgTick.C:
+		case <-keyTick.C:
 		case <-s.mountDied:
 			if s.reapMounts(running) && fwdRetry == nil {
 				fwdRetry = time.NewTimer(forwardRetryInterval)
@@ -392,6 +414,9 @@ func (s *session) run(ctx context.Context) {
 			s.stopMounts(running) // they die with the connection; clean up after them
 			s.stopUSB(nil, usbRT)
 			s.stopForwards(applied)
+			// Lent keys can't be taken back now; their lease runs out, and
+			// the first sync on the next connection replaces them.
+			keyRT = authKeyRuntime{}
 			s.setMaster(nil)
 			m = nil
 			scheduleRetry(w, fmt.Sprintf("connection lost: %v", err))
@@ -617,6 +642,7 @@ func (s *session) status(host config.Host) api.HostStatus {
 	}
 	hs.Mounts = s.mountStatuses()
 	hs.USB = s.usbStatuses()
+	hs.AuthorizedKeys = s.authKeyStatuses()
 	if hs.State == api.StateUp {
 		for _, f := range hs.Forwards {
 			if f.State == api.StateError {
@@ -630,6 +656,11 @@ func (s *session) status(host config.Host) api.HostStatus {
 		}
 		for _, us := range hs.USB {
 			if us.State == api.StateError {
+				hs.State = api.StateDegraded
+			}
+		}
+		for _, ks := range hs.AuthorizedKeys {
+			if ks.State == api.StateError {
 				hs.State = api.StateDegraded
 			}
 		}
